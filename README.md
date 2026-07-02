@@ -1,7 +1,7 @@
 # ymir-agent-sidebar
 
 A tmux sidebar that lets you switch between windows **and** keep an eye on your
-running AI coding agents — Claude Code and Codex — from one full-screen popup.
+running AI coding agents (Claude Code and Codex) from one full-screen popup.
 
 Press <kbd>Ctrl</kbd>+<kbd>n</kbd> and you get a list of every window across all
 your sessions on the left, a live preview of the selected window on the right,
@@ -9,11 +9,11 @@ and a status badge on any pane running an agent: **Working**, **Blocked**
 (waiting on you), or **Idle** (done). Jump straight to the agent that needs you.
 
 > [!NOTE]
-> Detection is **100% passive** — see [How it works](#how-it-works). The plugin
-> never wraps, shims, or launches your agents. You run `claude`/`codex` exactly
-> as you do today; the sidebar just observes tmux and the process table.
+> Detection is **fully passive** (see [How it works](#how-it-works)). The plugin
+> never wraps, shims, or launches your agents. You run `claude`/`codex` as usual;
+> the sidebar reads tmux and the process table.
 
-<!-- TODO: add a demo GIF here — this is the single highest-leverage thing for adoption. -->
+<!-- TODO: add a demo GIF here (biggest win for adoption). -->
 
 ## Features
 
@@ -31,10 +31,10 @@ and a status badge on any pane running an agent: **Working**, **Blocked**
 
 - **tmux ≥ 3.3** (for `display-popup -B -e`)
 - **bash** and **ps** (present on macOS and Linux)
-- One or more agents (`claude`, `codex`) running inside tmux panes — that's all
-  detection needs; you launch them however you like.
+- One or more agents (`claude`, `codex`) running inside tmux panes. That's all
+  detection needs; launch them however you like.
 - To build from source: a **Rust toolchain** (only needed if no prebuilt binary
-  is available for your platform — see below).
+  exists for your platform; see below).
 
 ## Install
 
@@ -96,11 +96,11 @@ Set `@agent_sidebar_nav 'off'` if you already bind
 
 ## How it works
 
-The plugin observes; it never intercepts. Agent state is derived entirely from:
+The plugin observes; it never intercepts. Agent state comes from:
 
-- `tmux` pane metadata — `pane_current_command` and the OSC pane title,
-- `tmux capture-pane` — the visible screen text, and
-- a `ps` process-tree snapshot to attribute agents to panes.
+- `tmux` pane metadata: `pane_current_command` and the OSC pane title,
+- `tmux capture-pane`: the visible screen text, and
+- a `ps` process-tree snapshot that attributes agents to panes.
 
 **Working** is inferred from the agent's activity spinner, **Blocked** from an
 on-screen prompt/selection awaiting input, and **Idle** once activity settles
@@ -122,8 +122,8 @@ cargo build --release
 ```
 
 The `bin/ymir-agent-sidebar` launcher prefers an existing release binary,
-otherwise downloads a prebuilt one, otherwise builds from source — so editing
-`src/` and reopening the sidebar picks up your changes automatically.
+otherwise downloads a prebuilt one, otherwise builds from source. Editing
+`src/` and reopening the sidebar picks up your changes.
 
 ## Roadmap / release checklist
 
