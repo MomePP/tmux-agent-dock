@@ -1,2 +1,150 @@
 # ymir-agent-sidebar
-Tmux sidebar plugin for managing agents
+
+A tmux sidebar that lets you switch between windows **and** keep an eye on your
+running AI coding agents — Claude Code and Codex — from one full-screen popup.
+
+Press <kbd>Ctrl</kbd>+<kbd>n</kbd> and you get a list of every window across all
+your sessions on the left, a live preview of the selected window on the right,
+and a status badge on any pane running an agent: **Working**, **Blocked**
+(waiting on you), or **Idle** (done). Jump straight to the agent that needs you.
+
+> [!NOTE]
+> Detection is **100% passive** — see [How it works](#how-it-works). The plugin
+> never wraps, shims, or launches your agents. You run `claude`/`codex` exactly
+> as you do today; the sidebar just observes tmux and the process table.
+
+<!-- TODO: add a demo GIF here — this is the single highest-leverage thing for adoption. -->
+
+## Features
+
+- **Cross-session window switcher** in a full-screen popup with a live, scaled
+  preview of the highlighted window.
+- **Agent monitoring**: each pane running Claude Code or Codex is tagged
+  Working / Blocked / Idle, with a run timer, so you can see at a glance which
+  agent is waiting on input.
+- **Vim-aware navigation**: <kbd>Ctrl</kbd>+<kbd>h/j/k/l</kbd> move between panes
+  and windows but pass through to Vim/Neovim when it's focused.
+- **No daemon to babysit**: a lightweight background poller starts itself the
+  first time you open the sidebar and keeps agent state fresh.
+
+## Requirements
+
+- **tmux ≥ 3.3** (for `display-popup -B -e`)
+- **bash** and **ps** (present on macOS and Linux)
+- One or more agents (`claude`, `codex`) running inside tmux panes — that's all
+  detection needs; you launch them however you like.
+- To build from source: a **Rust toolchain** (only needed if no prebuilt binary
+  is available for your platform — see below).
+
+## Install
+
+### With [TPM](https://github.com/tmux-plugins/tpm) (recommended)
+
+Add to `~/.tmux.conf` (or `~/.config/tmux/tmux.conf`):
+
+```tmux
+set -g @plugin 'Ymirke/ymir-agent-sidebar'
+```
+
+Then press <kbd>prefix</kbd> + <kbd>I</kbd> to install. On first use the plugin
+downloads a prebuilt binary for your platform (falling back to a source build if
+you have Rust and no prebuilt exists).
+
+### Manual
+
+```sh
+git clone https://github.com/Ymirke/ymir-agent-sidebar \
+  ~/.tmux/plugins/ymir-agent-sidebar
+```
+
+Add to your tmux config and reload:
+
+```tmux
+run-shell "~/.tmux/plugins/ymir-agent-sidebar/ymir-agent-sidebar.tmux"
+```
+
+See [`examples/tmux.conf`](examples/tmux.conf) for a manual keybinding snippet.
+
+### From source (cargo)
+
+```sh
+cargo install --git https://github.com/Ymirke/ymir-agent-sidebar
+```
+
+## Usage
+
+| Key | Action |
+| --- | --- |
+| <kbd>Ctrl</kbd>+<kbd>n</kbd> | Open the sidebar |
+| <kbd>Ctrl</kbd>+<kbd>j</kbd> / <kbd>Ctrl</kbd>+<kbd>k</kbd> | Open the sidebar pre-moved down / up (pass through to Vim if focused) |
+| <kbd>Ctrl</kbd>+<kbd>h</kbd> / <kbd>Ctrl</kbd>+<kbd>l</kbd> | Move panes / wrap to prev/next window (pass through to Vim if focused) |
+
+Inside the sidebar: move the selection to a window and press <kbd>Enter</kbd> to
+jump to it. Press <kbd>?</kbd> for help.
+
+## Configuration
+
+Set these **before** the plugin loads:
+
+```tmux
+set -g @agent_sidebar_key 'C-n'   # key that opens the sidebar (default: C-n)
+set -g @agent_sidebar_nav 'on'    # vim-aware C-h/C-j/C-k/C-l nav (default: on)
+```
+
+Set `@agent_sidebar_nav 'off'` if you already bind
+<kbd>Ctrl</kbd>+<kbd>h/j/k/l</kbd> yourself or want to keep those keys.
+
+## How it works
+
+The plugin observes; it never intercepts. Agent state is derived entirely from:
+
+- `tmux` pane metadata — `pane_current_command` and the OSC pane title,
+- `tmux capture-pane` — the visible screen text, and
+- a `ps` process-tree snapshot to attribute agents to panes.
+
+**Working** is inferred from the agent's activity spinner, **Blocked** from an
+on-screen prompt/selection awaiting input, and **Idle** once activity settles
+(with debouncing so a single stray sample can't flash a false "done"). There are
+no wrappers, shims, PID files, FIFOs, `LD_PRELOAD`, or log scraping around your
+agents.
+
+> [!WARNING]
+> Because detection reads the agents' on-screen output, it is **heuristic and
+> version-sensitive**: a Claude/Codex UI change, a custom theme, or a non-English
+> locale can throw off state classification. It's best-effort and expected to
+> need occasional upkeep as the agent CLIs evolve.
+
+## Development
+
+```sh
+cargo test          # unit tests
+cargo build --release
+```
+
+The `bin/ymir-agent-sidebar` launcher prefers an existing release binary,
+otherwise downloads a prebuilt one, otherwise builds from source — so editing
+`src/` and reopening the sidebar picks up your changes automatically.
+
+## Roadmap / release checklist
+
+Tracking the path to a trustworthy first release. Checked items are done in this
+repo; unchecked ones need a published release or external accounts.
+
+- [x] Scope to the shippable product (Rust crate + launchers + tmux entry point); leave personal dotfiles and superseded scripts out
+- [x] Neutralize hardcoded personal paths in test fixtures
+- [x] TPM entry point (`ymir-agent-sidebar.tmux`) with a tmux-version guard and configurable keys
+- [x] Launcher prefers a prebuilt binary, downloads on first run, falls back to `cargo build`
+- [x] Release workflow builds per-platform binaries (macOS arm64/x86_64, Linux musl x86_64/aarch64) and attaches them to GitHub Releases
+- [x] `LICENSE` (MIT)
+- [x] README with install, usage, requirements, and the detection caveat
+- [x] Keybindings overridable via `@agent_sidebar_*` options
+- [x] CI runs `cargo test` on macOS + Linux
+- [ ] Add a demo GIF to the README
+- [ ] Headless smoke test of the status daemon in CI
+- [ ] Tag `v0.1.0` and verify `prefix + I` on a clean machine with **no Rust toolchain**, on both macOS arm64 and Linux
+- [ ] Publish to crates.io and add a Homebrew tap as alternate install channels
+- [ ] Expose detection patterns (agent names, Working/Blocked phrases) as config for other locales / agent-UI versions
+
+## License
+
+[MIT](LICENSE).

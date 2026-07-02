@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Opens the agent sidebar in a full-screen tmux popup.
+#
+# Usage: ymir-agent-sidebar-popup <window_id> <session_name> [down|up]
+#
+# The optional direction pre-moves the list selection as the switcher opens, so a
+# key binding can drop straight into navigating (e.g. Ctrl+j opens it already
+# moved one down). window_id/session_name are passed in already expanded by tmux
+# so the popup highlights the window the key was pressed from.
+set -euo pipefail
+
+window_id="${1:-}"
+session_name="${2:-}"
+direction="${3:-}"
+
+args=(
+  -B -E -w 100% -h 100%
+  -e "YMIR_AGENT_SIDEBAR_CURRENT=${window_id}"
+  -e "YMIR_AGENT_SIDEBAR_SESSION=${session_name}"
+)
+if [[ -n "${direction}" ]]; then
+  args+=(-e "YMIR_AGENT_SIDEBAR_INITIAL_MOVE=${direction}")
+fi
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec tmux display-popup "${args[@]}" "${script_dir}/ymir-agent-sidebar"

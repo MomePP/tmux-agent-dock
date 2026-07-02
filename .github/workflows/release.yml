@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  # Pushing a tag does not create a GitHub Release; create it first so the
+  # per-target upload jobs have something to attach binaries to (otherwise they
+  # all race and fail with "release not found").
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create release for the tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes \
+              --verify-tag
+          fi
+
+  upload:
+    needs: create-release
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      # Builds for the target (using cross when needed), tars up the binary, and
+      # attaches it to the GitHub Release as ymir-agent-sidebar-<target>.tar.gz —
+      # the exact name bin/ymir-agent-sidebar-fetch downloads.
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: ymir-agent-sidebar
+          target: ${{ matrix.target }}
+          archive: ymir-agent-sidebar-$target
+          token: ${{ secrets.GITHUB_TOKEN }}

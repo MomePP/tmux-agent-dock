@@ -1,0 +1,22 @@
+[package]
+name = "ymir-agent-sidebar"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "A tmux sidebar that switches windows and monitors running AI coding agents (Claude Code, Codex) by passive observation."
+authors = ["Ymir Egilson <36711026+Ymirke@users.noreply.github.com>"]
+license = "MIT"
+repository = "https://github.com/Ymirke/ymir-agent-sidebar"
+homepage = "https://github.com/Ymirke/ymir-agent-sidebar"
+readme = "README.md"
+keywords = ["tmux", "tui", "agents", "claude", "codex"]
+categories = ["command-line-utilities"]
+exclude = ["/.github", "/examples", "/*.tmux"]
+
+[dependencies]
+anyhow = "1"
+crossterm = "0.27"
+ratatui = "0.26"
+
+[dev-dependencies]
+tempfile = "3"
