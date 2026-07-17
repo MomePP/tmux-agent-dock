@@ -43,7 +43,7 @@ const PALETTE_BOTTOM_PERCENT: u16 = 55;
 /// separator rule under it.
 const SEARCH_BAR_ROWS: u16 = 2;
 const SEARCH_PLACEHOLDER: &str = "type to filter";
-const KEYS_PLACEHOLDER: &str = "[n]j/k · [n]J/K: open";
+const KEYS_PLACEHOLDER: &str = "j/k move · [n]j/k open";
 // Shown in the modal top bar; the short form fits beside "[?] Help" within
 // the narrow sidebar's width.
 const SWITCHER_NAME: &str = "agent-switcher";
@@ -1223,8 +1223,8 @@ fn push_movement_count(count: &mut Option<usize>, ch: char) -> bool {
 
 fn take_counted_open_motion(count: &mut Option<usize>, ch: char) -> Option<(Direction, usize)> {
     let direction = match ch {
-        'J' => Direction::Down,
-        'K' => Direction::Up,
+        'j' | 'J' => Direction::Down,
+        'k' | 'K' => Direction::Up,
         _ => return None,
     };
     Some((direction, count.take()?))
@@ -2639,7 +2639,7 @@ fn run_tui_loop(
             );
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
-            // A Vim-style count survives until it is consumed by j/k or J/K.
+            // A Vim-style count survives until j/k consumes it and opens the target.
             let keys_count_key = input == InputMode::Keys
                 && !ctrl
                 && matches!(key.code, KeyCode::Char(ch) if ch.is_ascii_digit());
@@ -2860,25 +2860,7 @@ fn run_tui_loop(
                             navigation_height,
                         );
                     }
-                    'j' => {
-                        move_compact_selection_by(
-                            &mut state,
-                            &filtered,
-                            Direction::Down,
-                            movement_count.take().unwrap_or(1),
-                            navigation_height,
-                        );
-                    }
-                    'k' => {
-                        move_compact_selection_by(
-                            &mut state,
-                            &filtered,
-                            Direction::Up,
-                            movement_count.take().unwrap_or(1),
-                            navigation_height,
-                        );
-                    }
-                    'J' | 'K' => {
+                    'j' | 'k' | 'J' | 'K' => {
                         if let Some((direction, count)) =
                             take_counted_open_motion(&mut movement_count, ch)
                         {
@@ -2891,6 +2873,17 @@ fn run_tui_loop(
                             ) {
                                 return Ok(Some(SwitcherAction::Select(card)));
                             }
+                        } else if ch == 'j' || ch == 'k' {
+                            move_compact_selection(
+                                &mut state,
+                                &filtered,
+                                if ch == 'j' {
+                                    Direction::Down
+                                } else {
+                                    Direction::Up
+                                },
+                                navigation_height,
+                            );
                         }
                     }
                     'l' => {
@@ -3661,8 +3654,8 @@ fn render_help(frame: &mut Frame, area: Rect) {
         "tab: search / keys",
         "S-tab: palette/sidebar",
         "search: type filters",
-        "keys: [count]j/k, n/N, q",
-        "count+J/K: move & open",
+        "keys: j/k move, n/N, q",
+        "count+j/k: move & open",
         "H/L: previous/next edge",
         "↑/↓: move, C-j/C-k: open",
         "←/→: switch session",
@@ -4909,7 +4902,7 @@ mod tests {
                 row.contains("tab:")
                     || row.contains("search:")
                     || row.contains("keys:")
-                    || row.contains("count+J/K:")
+                    || row.contains("count+j/k:")
                     || row.contains("H/L:")
                     || row.contains("C-j/C-k")
                     || row.contains("←/→")
@@ -4932,10 +4925,10 @@ mod tests {
             .any(|row| row.contains("search: type filters")));
         assert!(help_rows
             .iter()
-            .any(|row| row.contains("keys: [count]j/k, n/N, q")));
+            .any(|row| row.contains("keys: j/k move, n/N, q")));
         assert!(help_rows
             .iter()
-            .any(|row| row.contains("count+J/K: move & open")));
+            .any(|row| row.contains("count+j/k: move & open")));
         assert!(help_rows
             .iter()
             .any(|row| row.contains("H/L: previous/next edge")));
@@ -5623,7 +5616,7 @@ mod tests {
     }
 
     #[test]
-    fn counted_uppercase_motion_selects_the_relative_target_for_opening() {
+    fn counted_lowercase_motion_selects_the_relative_target_for_opening() {
         let groups = group_cards_by_session(vec![
             test_card("work", "1"),
             test_card("work", "2"),
@@ -5636,7 +5629,7 @@ mod tests {
 
         let mut down_count = Some(2);
         assert_eq!(
-            take_counted_open_motion(&mut down_count, 'J'),
+            take_counted_open_motion(&mut down_count, 'j'),
             Some((Direction::Down, 2))
         );
         assert_eq!(down_count, None);
@@ -5645,12 +5638,14 @@ mod tests {
         assert_eq!(down.window_id, "@ops-1");
         assert_eq!((state.selected_row, state.selected_column), (1, 0));
 
-        let up = select_compact_relative(&mut state, &groups, Direction::Up, 2, 8).unwrap();
+        let mut up_count = Some(2);
+        let (up_direction, up_count) = take_counted_open_motion(&mut up_count, 'k').unwrap();
+        let up = select_compact_relative(&mut state, &groups, up_direction, up_count, 8).unwrap();
         assert_eq!(up.window_id, "@work-2");
         assert_eq!((state.selected_row, state.selected_column), (0, 1));
 
         let mut no_count = None;
-        assert_eq!(take_counted_open_motion(&mut no_count, 'K'), None);
+        assert_eq!(take_counted_open_motion(&mut no_count, 'k'), None);
     }
 
     #[test]

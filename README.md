@@ -88,11 +88,10 @@ window directly, <kbd>Enter</kbd> jumps to the selected window, and
 <kbd>Esc</kbd> clears the filter, then closes.
 
 - <kbd>Tab</kbd> toggles the input mode: **search** (default; typing filters) or
-  **keys** (Vim-style bindings: <kbd>j/k</kbd> move, a numeric count such as
-  <kbd>4j</kbd>/<kbd>4k</kbd> moves several windows, <kbd>n</kbd>/<kbd>N</kbd> new
-  window/session, <kbd>q</kbd> closes).
-- A counted uppercase motion such as <kbd>4J</kbd>/<kbd>4K</kbd> moves down or
-  up by that relative number and immediately opens the target window.
+  **keys** (Vim-style bindings: bare <kbd>j/k</kbd> moves the highlight, while a
+  count such as <kbd>4j</kbd>/<kbd>4k</kbd> immediately opens the window at that
+  relative number; <kbd>n</kbd>/<kbd>N</kbd> creates a window/session and
+  <kbd>q</kbd> closes).
 - <kbd>H</kbd>/<kbd>L</kbd> move between session edges: first and last in the
   current session, then first and last in the previous or next session.
 - Window rows use Vim-style relative numbers: the selected window is
