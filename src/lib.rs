@@ -9,7 +9,10 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+        MouseEventKind,
+    },
     execute,
     style::force_color_output,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -28,13 +31,37 @@ const SIDEBAR_WIDTH_PERCENT: u16 = 25;
 const SIDEBAR_MIN_WIDTH: u16 = 28;
 const SIDEBAR_MAX_WIDTH: u16 = 64;
 const FLOATING_LIST_INSET: u16 = 2;
-const SWITCHER_NAME: &str = "ymir-agent-sidebar";
+const PALETTE_WIDTH_PERCENT: u16 = 55;
+const PALETTE_MIN_WIDTH: u16 = 44;
+const PALETTE_MAX_WIDTH: u16 = 80;
+const PALETTE_TOP_MARGIN: u16 = 1;
+/// Where the palette box's bottom edge sits, as a percentage of the screen
+/// height. The search prompt lives on that edge, a bit above center, and the
+/// list grows upward from it.
+const PALETTE_BOTTOM_PERCENT: u16 = 55;
+/// Rows the search bar occupies at the top of the list: the prompt line plus a
+/// separator rule under it.
+const SEARCH_BAR_ROWS: u16 = 2;
+const SEARCH_PLACEHOLDER: &str = "type to filter";
+const KEYS_PLACEHOLDER: &str = "[n]j/k · [n]J/K: open";
+// Shown in the modal top bar; the short form fits beside "[?] Help" within
+// the narrow sidebar's width.
+const SWITCHER_NAME: &str = "agent-switcher";
 const HELP_LABEL: &str = "[?] Help";
-const HELP_LINE_COUNT: u16 = 9;
+const HELP_LINE_COUNT: u16 = 13;
 const PREVIEW_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
 const CARD_REFRESH_INTERVAL: Duration = Duration::from_millis(300);
+/// How often the whole screen is forcibly repainted. Ratatui only rewrites
+/// cells it believes changed, so anything that scribbles on the terminal
+/// behind its back — tmux compositing glitches while a busy pane redraws
+/// under the popup, wide glyphs in mirrored pane content nudging the cursor —
+/// would otherwise stay smeared across the modal until that cell happens to
+/// change. A periodic full redraw self-heals within half a second.
+const FULL_REDRAW_INTERVAL: Duration = Duration::from_millis(500);
 const TUI_TICK_INTERVAL: Duration = Duration::from_millis(50);
 const STATUS_DAEMON_INTERVAL: Duration = Duration::from_millis(300);
+const STATUS_DAEMON_OWNERSHIP_CHECK_POLLS: u32 = 10;
+const STATUS_CAPTURE_LINES: usize = 25;
 /// Consecutive idle polls required before committing a Working/Blocked -> Idle
 /// transition, so a single stray sample can't flash a spurious "done" or reset
 /// the run timer. At STATUS_DAEMON_INTERVAL this is roughly a 1s settle window.
@@ -43,12 +70,15 @@ const IDLE_DEBOUNCE_POLLS: u32 = 4;
 /// state, so a single stray Working/Blocked sample can't wipe a committed "done"
 /// or restart its timer. Kept short so real work still shows promptly.
 const BUSY_DEBOUNCE_POLLS: u32 = 2;
-const STATUS_DAEMON_PID_OPTION: &str = "@ymir_agent_sidebar_status_daemon_pid";
-const STATUS_AGENT_OPTION: &str = "@ymir_agent_sidebar_agent";
-const STATUS_STATE_OPTION: &str = "@ymir_agent_sidebar_state";
-const STATUS_SEEN_OPTION: &str = "@ymir_agent_sidebar_seen";
-const STATUS_RUN_STARTED_OPTION: &str = "@ymir_agent_sidebar_run_started_at";
-const STATUS_UPDATED_OPTION: &str = "@ymir_agent_sidebar_updated";
+const STATUS_DAEMON_PID_OPTION: &str = "@tmux_agent_switcher_status_daemon_pid";
+const STATUS_AGENT_OPTION: &str = "@tmux_agent_switcher_agent";
+const STATUS_STATE_OPTION: &str = "@tmux_agent_switcher_state";
+const STATUS_SEEN_OPTION: &str = "@tmux_agent_switcher_seen";
+const STATUS_RUN_STARTED_OPTION: &str = "@tmux_agent_switcher_run_started_at";
+const STATUS_UPDATED_OPTION: &str = "@tmux_agent_switcher_updated";
+const STATUS_WINDOW_ICON_OPTION: &str = "@tmux_agent_switcher_window_icon";
+const VIEW_MODE_OPTION: &str = "@tmux_agent_switcher_view";
+const INPUT_MODE_OPTION: &str = "@tmux_agent_switcher_input";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AgentKind {
@@ -244,6 +274,77 @@ pub enum Direction {
     Right,
 }
 
+/// Where the window list sits: docked to the left or right edge with the
+/// preview beside it (Sidebar / SidebarRight), or floating around the upper
+/// middle of the screen with the preview filling the whole screen behind it,
+/// like an editor command palette (Palette).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ViewMode {
+    Sidebar,
+    SidebarRight,
+    Palette,
+}
+
+impl ViewMode {
+    fn toggled(self) -> Self {
+        match self {
+            ViewMode::Sidebar => ViewMode::SidebarRight,
+            ViewMode::SidebarRight => ViewMode::Palette,
+            ViewMode::Palette => ViewMode::Sidebar,
+        }
+    }
+}
+
+fn parse_view_mode(value: &str) -> Option<ViewMode> {
+    match value {
+        "sidebar" | "left" => Some(ViewMode::Sidebar),
+        "sidebar-right" | "right" => Some(ViewMode::SidebarRight),
+        "palette" | "center" => Some(ViewMode::Palette),
+        _ => None,
+    }
+}
+
+fn format_view_mode(view: ViewMode) -> &'static str {
+    match view {
+        ViewMode::Sidebar => "sidebar",
+        ViewMode::SidebarRight => "sidebar-right",
+        ViewMode::Palette => "palette",
+    }
+}
+
+/// How keystrokes are interpreted, toggled with Tab: Search (the default)
+/// sends typed characters to the filter query, telescope-style; Keys restores
+/// Vim-style single-key bindings (j/k movement with optional counts, n/N, q).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InputMode {
+    Search,
+    Keys,
+}
+
+impl InputMode {
+    fn toggled(self) -> Self {
+        match self {
+            InputMode::Search => InputMode::Keys,
+            InputMode::Keys => InputMode::Search,
+        }
+    }
+}
+
+fn parse_input_mode(value: &str) -> Option<InputMode> {
+    match value {
+        "search" => Some(InputMode::Search),
+        "keys" => Some(InputMode::Keys),
+        _ => None,
+    }
+}
+
+fn format_input_mode(input: InputMode) -> &'static str {
+    match input {
+        InputMode::Search => "search",
+        InputMode::Keys => "keys",
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum PromptKind {
     NewWindow { session_name: String },
@@ -361,7 +462,7 @@ fn select_key_action(
     sessions: &[SessionGroup],
 ) -> Option<SwitcherAction> {
     match key.code {
-        KeyCode::Enter | KeyCode::Char(' ') => state
+        KeyCode::Enter => state
             .selected_card(sessions)
             .cloned()
             .map(SwitcherAction::Select),
@@ -645,6 +746,177 @@ pub fn group_cards_by_session(cards: Vec<WindowCard>) -> Vec<SessionGroup> {
     sessions
 }
 
+/// Case-insensitive subsequence match, telescope-style. Returns a score —
+/// higher is better — or None when `query` isn't a subsequence of `haystack`.
+/// Scored over the best alignment (not the leftmost): each hit counts 1, a hit
+/// right after the previous one +2, a hit at a word start +3, and a small
+/// length penalty makes tighter names win ties. The lists involved are tiny,
+/// so the O(query × haystack²) dynamic program is fine.
+fn fuzzy_score(haystack: &str, query: &str) -> Option<i32> {
+    let hay: Vec<char> = haystack.to_lowercase().chars().collect();
+    let needle: Vec<char> = query.to_lowercase().chars().collect();
+    if needle.is_empty() {
+        return Some(0);
+    }
+
+    let at_word_start = |position: usize| {
+        position == 0
+            || matches!(
+                hay.get(position - 1),
+                Some(' ' | '-' | '_' | '/' | '.' | ':')
+            )
+    };
+
+    // previous[j]: best score matching the needle so far with its last hit on
+    // hay[j]; rebuilt for each needle char.
+    let mut previous: Vec<Option<i32>> = vec![None; hay.len()];
+    for (needle_index, &needle_char) in needle.iter().enumerate() {
+        let mut current: Vec<Option<i32>> = vec![None; hay.len()];
+        // Best previous[k] over all k < j, maintained as j advances.
+        let mut best_prior: Option<i32> = None;
+        for (position, &hay_char) in hay.iter().enumerate() {
+            if hay_char == needle_char {
+                let base = if needle_index == 0 {
+                    Some(0)
+                } else {
+                    let consecutive = position
+                        .checked_sub(1)
+                        .and_then(|prior| previous[prior])
+                        .map(|score| score + 2);
+                    match (best_prior, consecutive) {
+                        (Some(any), Some(run)) => Some(any.max(run)),
+                        (any, run) => any.or(run),
+                    }
+                };
+                if let Some(base) = base {
+                    let mut score = base + 1;
+                    if at_word_start(position) {
+                        score += 3;
+                    }
+                    current[position] = Some(score);
+                }
+            }
+            if let Some(score) = previous[position] {
+                best_prior = Some(best_prior.map_or(score, |best| best.max(score)));
+            }
+        }
+        previous = current;
+    }
+
+    let best = previous.into_iter().flatten().max()?;
+    Some(best.saturating_mul(8) - hay.len().min(i32::MAX as usize) as i32 / 8)
+}
+
+/// The text a window is matched against when filtering: its session, name,
+/// (normalized) process, and the last path segment, so a query can hit any of
+/// the ways a user thinks of a window.
+fn card_filter_haystack(session_name: &str, card: &WindowCard) -> String {
+    let path_base = card.path.rsplit('/').next().unwrap_or("");
+    format!(
+        "{} {} {} {}",
+        session_name,
+        card.window_name,
+        compact_tab_process_text(card),
+        path_base
+    )
+}
+
+/// Prunes the session groups down to windows fuzzy-matching `query`, dropping
+/// sessions with no matches. An empty (or blank) query keeps everything.
+pub fn filter_sessions(sessions: &[SessionGroup], query: &str) -> Vec<SessionGroup> {
+    if query.trim().is_empty() {
+        return sessions.to_vec();
+    }
+
+    sessions
+        .iter()
+        .filter_map(|session| {
+            let cards: Vec<WindowCard> = session
+                .cards
+                .iter()
+                .filter(|card| {
+                    fuzzy_score(&card_filter_haystack(&session.session_name, card), query).is_some()
+                })
+                .cloned()
+                .collect();
+            (!cards.is_empty()).then(|| SessionGroup {
+                session_name: session.session_name.clone(),
+                cards,
+            })
+        })
+        .collect()
+}
+
+/// The (row, column) of the best-scoring card for `query`, or None for a blank
+/// query (where "best" is meaningless and the caller keeps its selection).
+fn best_match_position(sessions: &[SessionGroup], query: &str) -> Option<(usize, usize)> {
+    if query.trim().is_empty() {
+        return None;
+    }
+
+    let mut best: Option<(i32, (usize, usize))> = None;
+    for (row, session) in sessions.iter().enumerate() {
+        for (column, card) in session.cards.iter().enumerate() {
+            let Some(score) =
+                fuzzy_score(&card_filter_haystack(&session.session_name, card), query)
+            else {
+                continue;
+            };
+            if best
+                .map(|(best_score, _)| score > best_score)
+                .unwrap_or(true)
+            {
+                best = Some((score, (row, column)));
+            }
+        }
+    }
+
+    best.map(|(_, position)| position)
+}
+
+/// Re-filters the full session list after the query changed and repositions the
+/// selection: onto the best match while filtering, otherwise back onto the
+/// previously selected window when it survived the change.
+fn apply_query(
+    filtered: &mut Vec<SessionGroup>,
+    state: &mut GridState,
+    sessions: &[SessionGroup],
+    query: &str,
+    terminal_height: u16,
+) {
+    let previous = state
+        .selected_card(filtered)
+        .map(|card| card.window_id.clone());
+    *filtered = filter_sessions(sessions, query);
+
+    if let Some((row, column)) = best_match_position(filtered, query) {
+        state.selected_row = row;
+        state.selected_column = column;
+        state.preferred_column = column;
+    } else if let Some(window_id) = previous.filter(|window_id| {
+        filtered
+            .iter()
+            .flat_map(|session| session.cards.iter())
+            .any(|card| &card.window_id == window_id)
+    }) {
+        *state = GridState::for_window_id(filtered, &window_id);
+    } else {
+        *state = fallback_grid_state(filtered, state.selected_row, state.selected_column);
+    }
+
+    keep_compact_selection_visible(state, filtered, terminal_height);
+}
+
+/// Readline-style Ctrl+W: drop trailing spaces, then the last word.
+fn delete_query_word(query: &mut String) {
+    while query.ends_with(' ') {
+        query.pop();
+    }
+    while query.chars().last().is_some_and(|ch| ch != ' ') {
+        query.pop();
+    }
+}
+
 pub fn detect_agent_from_process_name(name: &str) -> Option<AgentKind> {
     let basename = name.rsplit('/').next().unwrap_or(name);
     if basename == "codex" || basename.starts_with("codex-") {
@@ -685,6 +957,17 @@ pub fn detect_agent_state(agent: AgentKind, evidence: &AgentEvidence) -> AgentSt
     match agent {
         AgentKind::Codex => detect_codex_state(evidence),
         AgentKind::Claude => detect_claude_state(evidence),
+    }
+}
+
+fn detect_agent_state_from_title(agent: AgentKind, title: &str) -> Option<AgentState> {
+    let title = title.trim();
+    match agent {
+        AgentKind::Codex if title.contains("Action Required") => Some(AgentState::Blocked),
+        AgentKind::Codex if starts_with_braille_status(title) => Some(AgentState::Working),
+        AgentKind::Codex if !title.is_empty() => Some(AgentState::Idle),
+        AgentKind::Claude if starts_with_braille_status(title) => Some(AgentState::Working),
+        _ => None,
     }
 }
 
@@ -926,65 +1209,41 @@ fn keep_compact_selection_visible(
     }
 }
 
-fn compact_quick_jump_index(ch: char) -> Option<usize> {
-    ch.to_digit(10)
-        .and_then(|number| (1..=9).contains(&number).then_some(number as usize - 1))
-}
-
-fn select_compact_card(
-    state: &mut GridState,
-    sessions: &[SessionGroup],
-    session_index: usize,
-    card_index: usize,
-    terminal_height: u16,
-) -> Option<WindowCard> {
-    let card = sessions
-        .get(session_index)
-        .and_then(|session| session.cards.get(card_index))
-        .cloned()?;
-
-    state.selected_row = session_index;
-    state.selected_column = card_index;
-    state.preferred_column = card_index;
-    keep_compact_selection_visible(state, sessions, terminal_height);
-    Some(card)
-}
-
-fn handle_compact_quick_jump_digit(
-    state: &mut GridState,
-    sessions: &[SessionGroup],
-    pending_session: &mut Option<usize>,
-    ch: char,
-    terminal_height: u16,
-) -> Option<WindowCard> {
-    let Some(index) = compact_quick_jump_index(ch) else {
-        *pending_session = None;
-        return None;
+fn push_movement_count(count: &mut Option<usize>, ch: char) -> bool {
+    let Some(digit) = ch.to_digit(10).map(|digit| digit as usize) else {
+        return false;
     };
-
-    if let Some(session_index) = pending_session.take() {
-        return select_compact_card(state, sessions, session_index, index, terminal_height);
+    if count.is_none() && digit == 0 {
+        return false;
     }
 
-    if sessions
-        .get(index)
-        .and_then(|session| session.cards.first())
-        .is_some()
-    {
-        state.selected_row = index;
-        state.selected_column = 0;
-        state.preferred_column = 0;
-        keep_compact_selection_visible(state, sessions, terminal_height);
-        *pending_session = Some(index);
-    }
+    *count = Some(count.unwrap_or(0).saturating_mul(10).saturating_add(digit));
+    true
+}
 
-    None
+fn take_counted_open_motion(count: &mut Option<usize>, ch: char) -> Option<(Direction, usize)> {
+    let direction = match ch {
+        'J' => Direction::Down,
+        'K' => Direction::Up,
+        _ => return None,
+    };
+    Some((direction, count.take()?))
 }
 
 pub fn move_compact_selection(
     state: &mut GridState,
     sessions: &[SessionGroup],
     direction: Direction,
+    terminal_height: u16,
+) {
+    move_compact_selection_by(state, sessions, direction, 1, terminal_height);
+}
+
+fn move_compact_selection_by(
+    state: &mut GridState,
+    sessions: &[SessionGroup],
+    direction: Direction,
+    count: usize,
     terminal_height: u16,
 ) {
     if sessions.is_empty() {
@@ -1006,9 +1265,8 @@ pub fn move_compact_selection(
                 })
                 .unwrap_or(0);
             let next = match direction {
-                Direction::Up if current == 0 => positions.len() - 1,
-                Direction::Up => current - 1,
-                Direction::Down => (current + 1) % positions.len(),
+                Direction::Up => current.saturating_sub(count),
+                Direction::Down => current.saturating_add(count).min(positions.len() - 1),
                 Direction::Left | Direction::Right => unreachable!(),
             };
             let (row, column) = positions[next];
@@ -1045,6 +1303,66 @@ pub fn move_compact_selection(
     keep_compact_selection_visible(state, sessions, terminal_height);
 }
 
+fn select_compact_relative(
+    state: &mut GridState,
+    sessions: &[SessionGroup],
+    direction: Direction,
+    count: usize,
+    terminal_height: u16,
+) -> Option<WindowCard> {
+    move_compact_selection_by(state, sessions, direction, count, terminal_height);
+    state.selected_card(sessions).cloned()
+}
+
+fn move_compact_session_edge(
+    state: &mut GridState,
+    sessions: &[SessionGroup],
+    direction: Direction,
+    terminal_height: u16,
+) {
+    let Some(session) = sessions.get(state.selected_row) else {
+        return;
+    };
+    if session.cards.is_empty() {
+        return;
+    }
+
+    match direction {
+        Direction::Down => {
+            let last_column = session.cards.len() - 1;
+            if state.selected_column < last_column {
+                state.selected_column = last_column;
+            } else if let Some((next_row, _)) = sessions
+                .iter()
+                .enumerate()
+                .skip(state.selected_row + 1)
+                .find(|(_, session)| !session.cards.is_empty())
+            {
+                state.selected_row = next_row;
+                state.selected_column = 0;
+            }
+        }
+        Direction::Up => {
+            if state.selected_column > 0 {
+                state.selected_column = 0;
+            } else if let Some((previous_row, previous_session)) = sessions
+                .iter()
+                .enumerate()
+                .take(state.selected_row)
+                .rev()
+                .find(|(_, session)| !session.cards.is_empty())
+            {
+                state.selected_row = previous_row;
+                state.selected_column = previous_session.cards.len() - 1;
+            }
+        }
+        Direction::Left | Direction::Right => return,
+    }
+
+    state.preferred_column = state.selected_column;
+    keep_compact_selection_visible(state, sessions, terminal_height);
+}
+
 pub fn load_cards() -> Result<Vec<WindowCard>> {
     let _ = ensure_status_daemon();
     let windows = parse_windows(&tmux_output(&[
@@ -1057,7 +1375,7 @@ pub fn load_cards() -> Result<Vec<WindowCard>> {
         "list-panes",
         "-a",
         "-F",
-        "#{pane_id}\t#{window_id}\t#{pane_active}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_title}\t#{pane_pid}\t#{@ymir_agent_sidebar_agent}\t#{@ymir_agent_sidebar_state}\t#{@ymir_agent_sidebar_seen}\t#{@ymir_agent_sidebar_run_started_at}\t#{@codex_status_state}\t#{@codex_status_unread}",
+        "#{pane_id}\t#{window_id}\t#{pane_active}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_title}\t#{pane_pid}\t#{@tmux_agent_switcher_agent}\t#{@tmux_agent_switcher_state}\t#{@tmux_agent_switcher_seen}\t#{@tmux_agent_switcher_run_started_at}\t#{@codex_status_state}\t#{@codex_status_unread}",
     ])?)?;
     Ok(build_cards_with_previews(
         &windows,
@@ -1068,7 +1386,7 @@ pub fn load_cards() -> Result<Vec<WindowCard>> {
 }
 
 pub fn current_window_id() -> Option<String> {
-    if let Some(window_id) = env_tmux_value("YMIR_AGENT_SIDEBAR_CURRENT") {
+    if let Some(window_id) = env_tmux_value("TMUX_AGENT_SWITCHER_CURRENT") {
         return Some(window_id);
     }
 
@@ -1394,7 +1712,11 @@ fn ansi_preview_text(output: &str) -> Result<Text<'static>> {
                     None => {}
                 }
             }
-            _ if ch.is_control() && ch != '\t' => {}
+            // A literal tab would make the terminal jump to the next tab stop
+            // while ratatui counts it as one cell, desyncing every cell after
+            // it on the line — smearing content across the modal.
+            '\t' => text.push(' '),
+            _ if ch.is_control() => {}
             _ => text.push(ch),
         }
     }
@@ -1532,7 +1854,11 @@ fn strip_ansi_and_controls(line: &str) -> String {
             continue;
         }
 
-        if ch.is_control() && ch != '\t' {
+        if ch == '\t' {
+            out.push(' ');
+            continue;
+        }
+        if ch.is_control() {
             continue;
         }
 
@@ -1602,21 +1928,12 @@ pub fn clear_unread_for_pane(pane_id: &str) {
 }
 
 pub fn ensure_status_daemon() -> Result<()> {
-    let pid = tmux_output(&["show-option", "-gqv", STATUS_DAEMON_PID_OPTION])
-        .unwrap_or_default()
-        .trim()
-        .to_owned();
-    if !pid.is_empty()
-        && Command::new("kill")
-            .args(["-0", &pid])
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
-    {
+    let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
+    let pid = current_status_daemon_pid();
+    if !pid.is_empty() && status_daemon_process_matches(&pid, &current_exe) {
         return Ok(());
     }
 
-    let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
     let command = format!(
         "{} status-daemon",
         shell_quote(&current_exe.to_string_lossy())
@@ -1635,7 +1952,13 @@ pub fn run_status_daemon() -> Result<()> {
     ]))?;
 
     let mut debounce: HashMap<String, Debounce> = HashMap::new();
+    let mut ownership_check = 0;
     loop {
+        if ownership_check == 0 && current_status_daemon_pid() != pid {
+            break;
+        }
+        ownership_check = (ownership_check + 1) % STATUS_DAEMON_OWNERSHIP_CHECK_POLLS;
+
         if poll_agent_status_once(&mut debounce).is_err() {
             break;
         }
@@ -1653,20 +1976,20 @@ pub fn run_status_daemon() -> Result<()> {
 }
 
 pub fn poll_agent_status_once(debounce: &mut HashMap<String, Debounce>) -> Result<()> {
-    let panes = parse_panes(&tmux_output(&[
+    let mut panes = parse_panes(&tmux_output(&[
         "list-panes",
         "-a",
         "-F",
-        "#{pane_id}\t#{window_id}\t#{pane_active}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_title}\t#{pane_pid}\t#{@ymir_agent_sidebar_agent}\t#{@ymir_agent_sidebar_state}\t#{@ymir_agent_sidebar_seen}\t#{@ymir_agent_sidebar_run_started_at}",
+        "#{pane_id}\t#{window_id}\t#{pane_active}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_title}\t#{pane_pid}\t#{@tmux_agent_switcher_agent}\t#{@tmux_agent_switcher_state}\t#{@tmux_agent_switcher_seen}\t#{@tmux_agent_switcher_run_started_at}",
     ])?)?;
 
     let now = unix_timestamp();
-    let live: HashSet<&str> = panes.iter().map(|pane| pane.pane_id.as_str()).collect();
+    let live: HashSet<String> = panes.iter().map(|pane| pane.pane_id.clone()).collect();
     // Built lazily: only needed when a pane that was an agent no longer reports
     // one as its foreground command, to tell an exit from a foreground subprocess.
     let mut processes: Option<ProcessTree> = None;
 
-    for pane in &panes {
+    for pane in &mut panes {
         let previous = pane.agent_status;
         let agent = match detect_agent_from_process_name(&pane.pane_current_command) {
             Some(agent) => Some(agent),
@@ -1682,13 +2005,15 @@ pub fn poll_agent_status_once(debounce: &mut HashMap<String, Debounce>) -> Resul
             }),
         };
         let next = if let Some(agent) = agent {
-            let evidence = AgentEvidence {
-                screen_tail: capture_pane_tail(&pane.pane_id, 80),
-                osc_title: pane.pane_title.clone(),
-                osc_progress: String::new(),
-                process_exited: false,
-            };
-            let raw = detect_agent_state(agent, &evidence);
+            let raw = detect_agent_state_from_title(agent, &pane.pane_title).unwrap_or_else(|| {
+                let evidence = AgentEvidence {
+                    screen_tail: capture_pane_tail(&pane.pane_id, STATUS_CAPTURE_LINES),
+                    osc_title: pane.pane_title.clone(),
+                    osc_progress: String::new(),
+                    process_exited: false,
+                };
+                detect_agent_state(agent, &evidence)
+            });
             let pane_debounce = debounce
                 .entry(pane.pane_id.clone())
                 .or_insert_with(|| Debounce::new(raw));
@@ -1697,11 +2022,47 @@ pub fn poll_agent_status_once(debounce: &mut HashMap<String, Debounce>) -> Resul
             debounce.remove(&pane.pane_id);
             AgentStatus::unknown()
         };
-        write_agent_status(&pane.pane_id, next)?;
+        write_agent_status(&pane.pane_id, previous, next)?;
+        pane.agent_status = next;
     }
 
-    debounce.retain(|pane_id, _| live.contains(pane_id.as_str()));
+    write_window_status_icons(&panes)?;
+    debounce.retain(|pane_id, _| live.contains(pane_id));
     Ok(())
+}
+
+fn current_status_daemon_pid() -> String {
+    tmux_output(&["show-option", "-gqv", STATUS_DAEMON_PID_OPTION])
+        .unwrap_or_default()
+        .trim()
+        .to_owned()
+}
+
+fn status_daemon_process_matches(pid: &str, current_exe: &Path) -> bool {
+    if !process_exists(pid) {
+        return false;
+    }
+
+    let output = Command::new("ps")
+        .args(["-p", pid, "-o", "command="])
+        .output();
+    let Ok(output) = output else {
+        return true;
+    };
+    if !output.status.success() {
+        return false;
+    }
+
+    let command = String::from_utf8_lossy(&output.stdout);
+    command.contains(" status-daemon") && command.contains(current_exe.to_string_lossy().as_ref())
+}
+
+fn process_exists(pid: &str) -> bool {
+    Command::new("kill")
+        .args(["-0", pid])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 /// A snapshot of the process table used to decide whether an agent is still
@@ -1880,30 +2241,14 @@ fn capture_pane_tail(pane_id: &str, lines: usize) -> String {
     .unwrap_or_default()
 }
 
-fn write_agent_status(pane_id: &str, status: AgentStatus) -> Result<()> {
-    set_pane_option(
-        pane_id,
-        STATUS_AGENT_OPTION,
-        format_agent_kind(status.agent),
-    )?;
-    set_pane_option(
-        pane_id,
-        STATUS_STATE_OPTION,
-        format_agent_state(status.state),
-    )?;
-    set_pane_option(
-        pane_id,
-        STATUS_SEEN_OPTION,
-        if status.seen { "1" } else { "0" },
-    )?;
-    set_pane_option(
-        pane_id,
-        STATUS_RUN_STARTED_OPTION,
-        &status
-            .run_started_at
-            .map(|value| value.to_string())
-            .unwrap_or_default(),
-    )?;
+fn write_agent_status(pane_id: &str, previous: AgentStatus, status: AgentStatus) -> Result<()> {
+    let updates = status_option_updates(previous, status);
+    for (option, value) in &updates {
+        set_pane_option(pane_id, option, value)?;
+    }
+    if updates.is_empty() {
+        return Ok(());
+    }
     set_pane_option(
         pane_id,
         STATUS_UPDATED_OPTION,
@@ -1911,8 +2256,118 @@ fn write_agent_status(pane_id: &str, status: AgentStatus) -> Result<()> {
     )
 }
 
+fn status_option_updates(
+    previous: AgentStatus,
+    status: AgentStatus,
+) -> Vec<(&'static str, String)> {
+    let mut updates = Vec::new();
+    if previous.agent != status.agent {
+        updates.push((
+            STATUS_AGENT_OPTION,
+            format_agent_kind(status.agent).to_owned(),
+        ));
+    }
+    if previous.state != status.state {
+        updates.push((
+            STATUS_STATE_OPTION,
+            format_agent_state(status.state).to_owned(),
+        ));
+    }
+    if previous.seen != status.seen {
+        updates.push((
+            STATUS_SEEN_OPTION,
+            if status.seen { "1" } else { "0" }.to_owned(),
+        ));
+    }
+    if previous.run_started_at != status.run_started_at {
+        updates.push((
+            STATUS_RUN_STARTED_OPTION,
+            status
+                .run_started_at
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        ));
+    }
+    updates
+}
+
 fn set_pane_option(pane_id: &str, option: &str, value: &str) -> Result<()> {
     tmux_status(Command::new("tmux").args(["set-option", "-p", "-q", "-t", pane_id, option, value]))
+}
+
+fn window_status_icons(panes: &[TmuxPane]) -> HashMap<String, &'static str> {
+    let mut statuses: HashMap<&str, Vec<AgentStatus>> = HashMap::new();
+    for pane in panes {
+        statuses
+            .entry(&pane.window_id)
+            .or_default()
+            .push(pane.agent_status);
+    }
+
+    statuses
+        .into_iter()
+        .map(|(window_id, statuses)| {
+            let status = rollup_agent_status(statuses.into_iter());
+            (window_id.to_owned(), tmux_window_status_icon(status))
+        })
+        .collect()
+}
+
+fn tmux_window_status_icon(status: AgentStatus) -> &'static str {
+    if status.agent.is_none() {
+        return "";
+    }
+
+    match status.state {
+        AgentState::Blocked => " #[fg=red,bold]◉#[default]",
+        AgentState::Working => " #[fg=yellow,bold]⠋#[default]",
+        AgentState::Idle if !status.seen => " #[fg=cyan,bold]●#[default]",
+        AgentState::Idle => " #[fg=green]✓#[default]",
+        AgentState::Unknown => " #[fg=colour8]○#[default]",
+    }
+}
+
+fn write_window_status_icons(panes: &[TmuxPane]) -> Result<()> {
+    let desired = window_status_icons(panes);
+    let current = tmux_output(&[
+        "list-windows",
+        "-a",
+        "-F",
+        "#{window_id}\t#{@tmux_agent_switcher_window_icon}",
+    ])?;
+
+    for line in current.lines() {
+        let Some((window_id, current_icon)) = line.split_once('\t') else {
+            continue;
+        };
+        let desired_icon = desired.get(window_id).copied().unwrap_or_default();
+        if desired_icon == current_icon {
+            continue;
+        }
+
+        if desired_icon.is_empty() {
+            tmux_status(Command::new("tmux").args([
+                "set-option",
+                "-w",
+                "-u",
+                "-q",
+                "-t",
+                window_id,
+                STATUS_WINDOW_ICON_OPTION,
+            ]))?;
+        } else {
+            tmux_status(Command::new("tmux").args([
+                "set-option",
+                "-w",
+                "-q",
+                "-t",
+                window_id,
+                STATUS_WINDOW_ICON_OPTION,
+                desired_icon,
+            ]))?;
+        }
+    }
+    Ok(())
 }
 
 fn mark_window_seen(window_id: &str) {
@@ -1970,25 +2425,72 @@ pub fn run_tui(cards: Vec<WindowCard>) -> Result<Option<SwitcherAction>> {
 
     let mut stdout = io::stdout();
     enable_raw_mode()?;
-    execute!(stdout, EnterAlternateScreen)?;
+    // Capture the mouse so wheel scrolls drive the list instead of tmux
+    // scrolling (and redrawing) whatever sits behind the popup.
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let result = run_tui_loop(&mut terminal, cards, current_window_id.as_deref());
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
     result
 }
 
 /// An initial list move to apply as soon as the switcher opens, so a key binding
 /// can drop the user straight into navigating (e.g. Ctrl+j opens moved one down).
-/// Driven by the `YMIR_AGENT_SIDEBAR_INITIAL_MOVE` env var set by the launcher.
+/// Driven by the `TMUX_AGENT_SWITCHER_INITIAL_MOVE` env var set by the launcher.
 fn initial_move_direction() -> Option<Direction> {
-    match env_tmux_value("YMIR_AGENT_SIDEBAR_INITIAL_MOVE").as_deref() {
+    match env_tmux_value("TMUX_AGENT_SWITCHER_INITIAL_MOVE").as_deref() {
         Some("down") => Some(Direction::Down),
         Some("up") => Some(Direction::Up),
         _ => None,
     }
+}
+
+/// The view style the switcher opens with. The launcher passes the configured
+/// (`@agent_switcher_view`) or last-toggled style via the
+/// `TMUX_AGENT_SWITCHER_VIEW` env var.
+fn initial_view_mode() -> ViewMode {
+    env_tmux_value("TMUX_AGENT_SWITCHER_VIEW")
+        .as_deref()
+        .and_then(parse_view_mode)
+        .unwrap_or(ViewMode::Sidebar)
+}
+
+/// Remember a toggled view style for the tmux server's lifetime so the next
+/// open reuses it (the launcher reads this option back). Best-effort: a failure
+/// only loses the stickiness.
+fn persist_view_mode(view: ViewMode) {
+    let _ = tmux_status(Command::new("tmux").args([
+        "set-option",
+        "-g",
+        VIEW_MODE_OPTION,
+        format_view_mode(view),
+    ]));
+}
+
+/// The input mode the switcher opens with: the launcher passes the configured
+/// (`@agent_switcher_input`) or last-toggled mode via `TMUX_AGENT_SWITCHER_INPUT`.
+fn initial_input_mode() -> InputMode {
+    env_tmux_value("TMUX_AGENT_SWITCHER_INPUT")
+        .as_deref()
+        .and_then(parse_input_mode)
+        .unwrap_or(InputMode::Search)
+}
+
+/// Same stickiness as [`persist_view_mode`], for the Tab-toggled input mode.
+fn persist_input_mode(input: InputMode) {
+    let _ = tmux_status(Command::new("tmux").args([
+        "set-option",
+        "-g",
+        INPUT_MODE_OPTION,
+        format_input_mode(input),
+    ]));
 }
 
 fn run_tui_loop(
@@ -1997,40 +2499,80 @@ fn run_tui_loop(
     current_window_id: Option<&str>,
 ) -> Result<Option<SwitcherAction>> {
     let mut sessions = group_cards_by_session(cards);
+    let mut query = String::new();
+    let mut filtered = filter_sessions(&sessions, &query);
+    let mut view = initial_view_mode();
     let mut state = initial_grid_state(
-        &sessions,
+        &filtered,
         current_window_id,
-        compact_navigation_height(terminal.size()?, false),
+        compact_navigation_height(
+            terminal.size()?,
+            false,
+            view,
+            compact_lines(&filtered).len(),
+        ),
     );
     if let Some(direction) = initial_move_direction() {
-        let navigation_height = compact_navigation_height(terminal.size()?, false);
-        move_compact_selection(&mut state, &sessions, direction, navigation_height);
+        let navigation_height = compact_navigation_height(
+            terminal.size()?,
+            false,
+            view,
+            compact_lines(&filtered).len(),
+        );
+        move_compact_selection(&mut state, &filtered, direction, navigation_height);
     }
-    let mut compact_quick_jump_session: Option<usize> = None;
+    let mut input = initial_input_mode();
+    let mut movement_count: Option<usize> = None;
     let mut show_help = false;
     let mut prompt: Option<PromptState> = None;
     let spinner_started_at = Instant::now();
     let mut last_card_refresh = Instant::now();
+    let mut last_full_redraw = Instant::now();
     let mut preview = PreviewMirror::default();
 
     loop {
         let now = Instant::now();
         if now.duration_since(last_card_refresh) >= CARD_REFRESH_INTERVAL {
             if let Ok(cards) = load_cards() {
-                let navigation_height = compact_navigation_height(terminal.size()?, show_help);
-                refresh_sessions_from_cards(&mut sessions, &mut state, cards, navigation_height);
+                let navigation_height = compact_navigation_height(
+                    terminal.size()?,
+                    show_help,
+                    view,
+                    compact_lines(&filtered).len(),
+                );
+                refresh_sessions_from_cards(
+                    &mut sessions,
+                    &mut filtered,
+                    &mut state,
+                    cards,
+                    &query,
+                    navigation_height,
+                );
             }
             last_card_refresh = now;
         }
-        let preview_area = switcher_layout(terminal.size()?, show_help).preview;
-        preview.refresh_for(state.selected_card(&sessions), preview_area, now);
+        let preview_area = switcher_layout(
+            terminal.size()?,
+            show_help,
+            view,
+            compact_lines(&filtered).len(),
+        )
+        .preview;
+        preview.refresh_for(state.selected_card(&filtered), preview_area, now);
+        if now.duration_since(last_full_redraw) >= FULL_REDRAW_INTERVAL {
+            terminal.clear()?;
+            last_full_redraw = now;
+        }
         let spinner_frame = spinner_started_at.elapsed().as_millis() as usize / 120;
         terminal.draw(|frame| {
             draw(
                 frame,
-                &sessions,
+                &filtered,
                 &state,
+                view,
+                input,
                 show_help,
+                &query,
                 prompt.as_ref(),
                 &preview,
                 spinner_frame,
@@ -2041,7 +2583,44 @@ fn run_tui_loop(
             continue;
         }
 
-        if let Event::Key(key) = event::read()? {
+        let key = match event::read()? {
+            Event::Mouse(mouse) if prompt.is_none() => {
+                let navigation_height = compact_navigation_height(
+                    terminal.size()?,
+                    show_help,
+                    view,
+                    compact_lines(&filtered).len(),
+                );
+                match mouse.kind {
+                    MouseEventKind::ScrollDown => {
+                        move_compact_selection(
+                            &mut state,
+                            &filtered,
+                            Direction::Down,
+                            navigation_height,
+                        );
+                    }
+                    MouseEventKind::ScrollUp => {
+                        move_compact_selection(
+                            &mut state,
+                            &filtered,
+                            Direction::Up,
+                            navigation_height,
+                        );
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            Event::Resize(_, _) => {
+                terminal.clear()?;
+                continue;
+            }
+            Event::Key(key) => key,
+            _ => continue,
+        };
+
+        {
             if let Some(active_prompt) = prompt.as_mut() {
                 if let Some(result) = handle_prompt_key(active_prompt, key) {
                     match result {
@@ -2052,78 +2631,306 @@ fn run_tui_loop(
                 continue;
             }
 
-            let compact_quick_jump_digit = matches!(
-                key.code,
-                KeyCode::Char(ch) if compact_quick_jump_index(ch).is_some()
+            let navigation_height = compact_navigation_height(
+                terminal.size()?,
+                show_help,
+                view,
+                compact_lines(&filtered).len(),
             );
-            if !compact_quick_jump_digit {
-                compact_quick_jump_session = None;
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+            // A Vim-style count survives until it is consumed by j/k or J/K.
+            let keys_count_key = input == InputMode::Keys
+                && !ctrl
+                && matches!(key.code, KeyCode::Char(ch) if ch.is_ascii_digit());
+            let keys_count_motion = input == InputMode::Keys
+                && !ctrl
+                && matches!(key.code, KeyCode::Char('j' | 'k' | 'J' | 'K'));
+            if !keys_count_key && !keys_count_motion {
+                movement_count = None;
             }
 
             match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => {
-                    return Ok(None);
-                }
-                KeyCode::Enter | KeyCode::Char(' ') => {
-                    return Ok(select_key_action(key, &state, &sessions));
-                }
-                KeyCode::Char('?') => {
-                    show_help = !show_help;
-                    let navigation_height = compact_navigation_height(terminal.size()?, show_help);
-                    keep_compact_selection_visible(&mut state, &sessions, navigation_height);
-                }
-                KeyCode::Char(ch) if compact_quick_jump_index(ch).is_some() => {
-                    let navigation_height = compact_navigation_height(terminal.size()?, show_help);
-                    if let Some(card) = handle_compact_quick_jump_digit(
+                KeyCode::Esc => {
+                    // Telescope-style: first Esc clears the filter, a second
+                    // one closes the switcher. In Keys mode Esc just closes.
+                    if input == InputMode::Keys || query.is_empty() {
+                        return Ok(None);
+                    }
+                    query.clear();
+                    apply_query(
+                        &mut filtered,
                         &mut state,
                         &sessions,
-                        &mut compact_quick_jump_session,
-                        ch,
-                        navigation_height,
-                    ) {
-                        return Ok(Some(SwitcherAction::Select(card)));
-                    }
-                }
-                KeyCode::Char('n') => {
-                    if let Some(card) = state.selected_card(&sessions) {
-                        show_help = false;
-                        prompt = Some(PromptState::new(PromptKind::NewWindow {
-                            session_name: card.session_name.clone(),
-                        }));
-                    }
-                }
-                KeyCode::Char('N') => {
-                    show_help = false;
-                    prompt = Some(PromptState::new(PromptKind::NewSession));
-                }
-                KeyCode::Char('h') | KeyCode::Left => {
-                    let navigation_height = compact_navigation_height(terminal.size()?, show_help);
-                    move_compact_selection(
-                        &mut state,
-                        &sessions,
-                        Direction::Left,
+                        &query,
                         navigation_height,
                     );
                 }
-                KeyCode::Char('j') | KeyCode::Down => {
-                    let navigation_height = compact_navigation_height(terminal.size()?, show_help);
+                KeyCode::Enter => {
+                    if let Some(action) = select_key_action(key, &state, &filtered) {
+                        return Ok(Some(action));
+                    }
+                }
+                KeyCode::Tab => {
+                    input = input.toggled();
+                    persist_input_mode(input);
+                }
+                KeyCode::BackTab => {
+                    view = view.toggled();
+                    persist_view_mode(view);
+                    let navigation_height = compact_navigation_height(
+                        terminal.size()?,
+                        show_help,
+                        view,
+                        compact_lines(&filtered).len(),
+                    );
+                    keep_compact_selection_visible(&mut state, &filtered, navigation_height);
+                }
+                KeyCode::Backspace => {
+                    if query.pop().is_some() {
+                        apply_query(
+                            &mut filtered,
+                            &mut state,
+                            &sessions,
+                            &query,
+                            navigation_height,
+                        );
+                    }
+                }
+                KeyCode::Down => {
                     move_compact_selection(
                         &mut state,
-                        &sessions,
+                        &filtered,
                         Direction::Down,
                         navigation_height,
                     );
                 }
-                KeyCode::Char('k') | KeyCode::Up => {
-                    let navigation_height = compact_navigation_height(terminal.size()?, show_help);
-                    move_compact_selection(&mut state, &sessions, Direction::Up, navigation_height);
+                KeyCode::Up => {
+                    move_compact_selection(&mut state, &filtered, Direction::Up, navigation_height);
                 }
-                KeyCode::Char('l') | KeyCode::Right => {
-                    let navigation_height = compact_navigation_height(terminal.size()?, show_help);
+                KeyCode::Left => {
                     move_compact_selection(
                         &mut state,
-                        &sessions,
+                        &filtered,
+                        Direction::Left,
+                        navigation_height,
+                    );
+                }
+                KeyCode::Right => {
+                    move_compact_selection(
+                        &mut state,
+                        &filtered,
                         Direction::Right,
+                        navigation_height,
+                    );
+                }
+                KeyCode::Char(ch) if ctrl => match ch {
+                    'c' => return Ok(None),
+                    'j' => {
+                        if let Some(card) = select_compact_relative(
+                            &mut state,
+                            &filtered,
+                            Direction::Down,
+                            1,
+                            navigation_height,
+                        ) {
+                            return Ok(Some(SwitcherAction::Select(card)));
+                        }
+                    }
+                    'k' => {
+                        if let Some(card) = select_compact_relative(
+                            &mut state,
+                            &filtered,
+                            Direction::Up,
+                            1,
+                            navigation_height,
+                        ) {
+                            return Ok(Some(SwitcherAction::Select(card)));
+                        }
+                    }
+                    'n' => {
+                        move_compact_selection(
+                            &mut state,
+                            &filtered,
+                            Direction::Down,
+                            navigation_height,
+                        );
+                    }
+                    'p' => {
+                        move_compact_selection(
+                            &mut state,
+                            &filtered,
+                            Direction::Up,
+                            navigation_height,
+                        );
+                    }
+                    'h' => {
+                        move_compact_selection(
+                            &mut state,
+                            &filtered,
+                            Direction::Left,
+                            navigation_height,
+                        );
+                    }
+                    'l' => {
+                        move_compact_selection(
+                            &mut state,
+                            &filtered,
+                            Direction::Right,
+                            navigation_height,
+                        );
+                    }
+                    'u' => {
+                        query.clear();
+                        apply_query(
+                            &mut filtered,
+                            &mut state,
+                            &sessions,
+                            &query,
+                            navigation_height,
+                        );
+                    }
+                    'w' => {
+                        delete_query_word(&mut query);
+                        apply_query(
+                            &mut filtered,
+                            &mut state,
+                            &sessions,
+                            &query,
+                            navigation_height,
+                        );
+                    }
+                    't' => {
+                        if let Some(card) = state.selected_card(&filtered) {
+                            show_help = false;
+                            prompt = Some(PromptState::new(PromptKind::NewWindow {
+                                session_name: card.session_name.clone(),
+                            }));
+                        }
+                    }
+                    's' => {
+                        show_help = false;
+                        prompt = Some(PromptState::new(PromptKind::NewSession));
+                    }
+                    _ => {}
+                },
+                // Keys mode: Vim-style single-key bindings with optional counts.
+                KeyCode::Char(ch) if input == InputMode::Keys => match ch {
+                    'q' => return Ok(None),
+                    ' ' => {
+                        if let Some(card) = state.selected_card(&filtered) {
+                            return Ok(Some(SwitcherAction::Select(card.clone())));
+                        }
+                    }
+                    '?' => {
+                        show_help = !show_help;
+                        let navigation_height = compact_navigation_height(
+                            terminal.size()?,
+                            show_help,
+                            view,
+                            compact_lines(&filtered).len(),
+                        );
+                        keep_compact_selection_visible(&mut state, &filtered, navigation_height);
+                    }
+                    'n' => {
+                        if let Some(card) = state.selected_card(&filtered) {
+                            show_help = false;
+                            prompt = Some(PromptState::new(PromptKind::NewWindow {
+                                session_name: card.session_name.clone(),
+                            }));
+                        }
+                    }
+                    'N' => {
+                        show_help = false;
+                        prompt = Some(PromptState::new(PromptKind::NewSession));
+                    }
+                    'h' => {
+                        move_compact_selection(
+                            &mut state,
+                            &filtered,
+                            Direction::Left,
+                            navigation_height,
+                        );
+                    }
+                    'H' => {
+                        move_compact_session_edge(
+                            &mut state,
+                            &filtered,
+                            Direction::Up,
+                            navigation_height,
+                        );
+                    }
+                    'j' => {
+                        move_compact_selection_by(
+                            &mut state,
+                            &filtered,
+                            Direction::Down,
+                            movement_count.take().unwrap_or(1),
+                            navigation_height,
+                        );
+                    }
+                    'k' => {
+                        move_compact_selection_by(
+                            &mut state,
+                            &filtered,
+                            Direction::Up,
+                            movement_count.take().unwrap_or(1),
+                            navigation_height,
+                        );
+                    }
+                    'J' | 'K' => {
+                        if let Some((direction, count)) =
+                            take_counted_open_motion(&mut movement_count, ch)
+                        {
+                            if let Some(card) = select_compact_relative(
+                                &mut state,
+                                &filtered,
+                                direction,
+                                count,
+                                navigation_height,
+                            ) {
+                                return Ok(Some(SwitcherAction::Select(card)));
+                            }
+                        }
+                    }
+                    'l' => {
+                        move_compact_selection(
+                            &mut state,
+                            &filtered,
+                            Direction::Right,
+                            navigation_height,
+                        );
+                    }
+                    'L' => {
+                        move_compact_session_edge(
+                            &mut state,
+                            &filtered,
+                            Direction::Down,
+                            navigation_height,
+                        );
+                    }
+                    _ if ch.is_ascii_digit() => {
+                        push_movement_count(&mut movement_count, ch);
+                    }
+                    _ => {}
+                },
+                KeyCode::Char('?') if query.is_empty() => {
+                    show_help = !show_help;
+                    let navigation_height = compact_navigation_height(
+                        terminal.size()?,
+                        show_help,
+                        view,
+                        compact_lines(&filtered).len(),
+                    );
+                    keep_compact_selection_visible(&mut state, &filtered, navigation_height);
+                }
+                KeyCode::Char(ch) => {
+                    query.push(ch);
+                    apply_query(
+                        &mut filtered,
+                        &mut state,
+                        &sessions,
+                        &query,
                         navigation_height,
                     );
                 }
@@ -2133,16 +2940,20 @@ fn run_tui_loop(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw(
     frame: &mut Frame,
     sessions: &[SessionGroup],
     state: &GridState,
+    view: ViewMode,
+    input: InputMode,
     show_help: bool,
+    query: &str,
     prompt: Option<&PromptState>,
     preview: &PreviewMirror,
     spinner_frame: usize,
 ) {
-    let layout = switcher_layout(frame.size(), show_help);
+    let layout = switcher_layout(frame.size(), show_help, view, compact_lines(sessions).len());
 
     render_selected_preview(frame, layout.preview, preview);
     frame.render_widget(Clear, layout.list_overlay);
@@ -2153,7 +2964,12 @@ fn draw(
         layout.list_overlay,
     );
     render_modal_top_bar(frame, layout.list_overlay);
-    render_compact(frame, layout.sessions, sessions, state, spinner_frame);
+    render_search_bar(frame, layout.search, query, input);
+    if sessions.is_empty() && !query.trim().is_empty() {
+        render_no_matches(frame, layout.sessions);
+    } else {
+        render_compact(frame, layout.sessions, sessions, state, spinner_frame);
+    }
     if let Some(help) = layout.help {
         render_help(frame, help);
     }
@@ -2162,49 +2978,167 @@ fn draw(
     }
 }
 
+/// The telescope-style prompt line on the bottom row of the list box, with a
+/// separator rule above it: `❯ query▏`, or a dim hint while the query is
+/// empty. In Keys mode the prompt dims and hints at Tab instead.
+fn render_search_bar(frame: &mut Frame, area: Rect, query: &str, input: InputMode) {
+    if area.width < 4 || area.height == 0 {
+        return;
+    }
+
+    if area.height > 1 {
+        frame.render_widget(
+            Paragraph::new("─".repeat(area.width as usize))
+                .style(Style::default().fg(Color::DarkGray)),
+            Rect { height: 1, ..area },
+        );
+    }
+    let prompt_row = Rect {
+        y: area.y.saturating_add(area.height.saturating_sub(1)),
+        height: 1,
+        ..area
+    };
+
+    // Prompt (2 cells) + cursor block (1 cell); keep the tail of an overlong
+    // query visible, like a real input field.
+    let budget = area.width.saturating_sub(3) as usize;
+    let query_width = query.chars().count();
+    let visible: String = if query_width > budget {
+        let tail: String = query
+            .chars()
+            .skip(query_width + 1 - budget.max(1))
+            .collect();
+        format!("…{tail}")
+    } else {
+        query.to_owned()
+    };
+
+    let prompt_style = match input {
+        InputMode::Search => Style::default()
+            .fg(TMUX_ORANGE)
+            .add_modifier(Modifier::BOLD),
+        InputMode::Keys => Style::default().fg(Color::DarkGray),
+    };
+    let mut spans = vec![Span::styled("❯ ", prompt_style)];
+    if !visible.is_empty() {
+        let query_style = match input {
+            InputMode::Search => Style::default().fg(Color::White),
+            InputMode::Keys => Style::default().fg(Color::Gray),
+        };
+        spans.push(Span::styled(visible.clone(), query_style));
+    }
+    if input == InputMode::Search {
+        spans.push(Span::styled(" ", Style::default().bg(Color::Gray)));
+    }
+    let hint = match (input, visible.is_empty()) {
+        (InputMode::Search, true) => Some(SEARCH_PLACEHOLDER),
+        (InputMode::Keys, true) => Some(KEYS_PLACEHOLDER),
+        (InputMode::Keys, false) => Some("  tab: search"),
+        (InputMode::Search, false) => None,
+    };
+    if let Some(hint) = hint {
+        spans.push(Span::styled(
+            truncate_chars(hint, budget.saturating_sub(visible.chars().count() + 1)),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), prompt_row);
+}
+
+fn render_no_matches(frame: &mut Frame, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    frame.render_widget(
+        Paragraph::new(" no matching windows").style(Style::default().fg(Color::DarkGray)),
+        Rect { height: 1, ..area },
+    );
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SwitcherLayout {
     list_overlay: Rect,
+    search: Rect,
     sessions: Rect,
     help: Option<Rect>,
     preview: Rect,
 }
 
-fn switcher_layout(area: Rect, show_help: bool) -> SwitcherLayout {
-    let sidebar_width = sidebar_width(area.width);
-    let preview = Rect {
-        x: area.x.saturating_add(sidebar_width),
-        y: area.y,
-        width: area.width.saturating_sub(sidebar_width),
-        height: area.height,
+fn switcher_layout(
+    area: Rect,
+    show_help: bool,
+    view: ViewMode,
+    line_count: usize,
+) -> SwitcherLayout {
+    let (list_overlay, preview) = match view {
+        ViewMode::Sidebar => {
+            let sidebar_width = sidebar_width(area.width);
+            let list_overlay = Rect {
+                x: area.x,
+                y: area.y,
+                width: sidebar_width,
+                height: area.height,
+            };
+            let preview = Rect {
+                x: area.x.saturating_add(sidebar_width),
+                y: area.y,
+                width: area.width.saturating_sub(sidebar_width),
+                height: area.height,
+            };
+            (list_overlay, preview)
+        }
+        ViewMode::SidebarRight => {
+            let sidebar_width = sidebar_width(area.width);
+            let preview_width = area.width.saturating_sub(sidebar_width);
+            let list_overlay = Rect {
+                x: area.x.saturating_add(preview_width),
+                y: area.y,
+                width: sidebar_width,
+                height: area.height,
+            };
+            let preview = Rect {
+                x: area.x,
+                y: area.y,
+                width: preview_width,
+                height: area.height,
+            };
+            (list_overlay, preview)
+        }
+        ViewMode::Palette => (palette_overlay(area, show_help, line_count), area),
     };
-    let list_overlay = Rect {
-        x: area.x,
-        y: area.y,
-        width: sidebar_width,
-        height: area.height,
-    };
+    // Bottom-up inside the box: search prompt at the very bottom (fzf-style),
+    // help above it, the session list on top.
+    let list = inset_rect(list_overlay, FLOATING_LIST_INSET);
+    let search_height = list.height.min(SEARCH_BAR_ROWS);
+    let body_height = list.height.saturating_sub(search_height);
     let help_height = if show_help {
-        HELP_LINE_COUNT.min(list_overlay.height.saturating_sub(FLOATING_LIST_INSET * 2))
+        HELP_LINE_COUNT.min(body_height)
     } else {
         0
     };
-    let list = inset_rect(list_overlay, FLOATING_LIST_INSET);
     let sessions = Rect {
         x: list.x,
         y: list.y,
         width: list.width,
-        height: list.height.saturating_sub(help_height),
+        height: body_height.saturating_sub(help_height),
     };
     let help = (help_height > 0).then_some(Rect {
         x: list.x,
-        y: list.y.saturating_add(sessions.height),
+        y: sessions.y.saturating_add(sessions.height),
         width: list.width,
         height: help_height,
     });
+    let search = Rect {
+        x: list.x,
+        y: list.y.saturating_add(body_height),
+        width: list.width,
+        height: search_height,
+    };
 
     SwitcherLayout {
         list_overlay,
+        search,
         sessions,
         help,
         preview,
@@ -2222,8 +3156,43 @@ fn sidebar_width(total_width: u16) -> u16 {
     )
 }
 
-fn compact_navigation_height(terminal_size: Rect, show_help: bool) -> u16 {
-    switcher_layout(terminal_size, show_help)
+/// The floating list box of the palette view: centered horizontally, sized to
+/// its content up to a height cap (past which the list scrolls). The box's
+/// bottom edge — where the search prompt lives — is anchored around the upper
+/// middle of the screen, so the prompt stays put while the list above it grows
+/// and shrinks with the filter.
+fn palette_overlay(area: Rect, show_help: bool, line_count: usize) -> Rect {
+    let width = percentage_length(area.width, PALETTE_WIDTH_PERCENT).clamp(
+        PALETTE_MIN_WIDTH.min(area.width),
+        PALETTE_MAX_WIDTH.min(area.width),
+    );
+    let anchor_bottom = percentage_length(area.height, PALETTE_BOTTOM_PERCENT);
+    let inset = FLOATING_LIST_INSET.saturating_mul(2);
+    let help_height = if show_help { HELP_LINE_COUNT } else { 0 };
+    // At least one body row so the "no matching windows" hint has a home.
+    let height = (line_count.max(1).min(u16::MAX as usize) as u16)
+        .saturating_add(SEARCH_BAR_ROWS)
+        .saturating_add(help_height)
+        .saturating_add(inset)
+        .max(inset.saturating_add(1))
+        .min(anchor_bottom.saturating_sub(PALETTE_TOP_MARGIN.min(anchor_bottom)))
+        .min(area.height);
+
+    Rect {
+        x: area.x.saturating_add(area.width.saturating_sub(width) / 2),
+        y: area.y.saturating_add(anchor_bottom.saturating_sub(height)),
+        width,
+        height,
+    }
+}
+
+fn compact_navigation_height(
+    terminal_size: Rect,
+    show_help: bool,
+    view: ViewMode,
+    line_count: usize,
+) -> u16 {
+    switcher_layout(terminal_size, show_help, view, line_count)
         .sessions
         .height
         .saturating_add(1)
@@ -2231,8 +3200,10 @@ fn compact_navigation_height(terminal_size: Rect, show_help: bool) -> u16 {
 
 fn refresh_sessions_from_cards(
     sessions: &mut Vec<SessionGroup>,
+    filtered: &mut Vec<SessionGroup>,
     state: &mut GridState,
     cards: Vec<WindowCard>,
+    query: &str,
     terminal_height: u16,
 ) {
     if cards.is_empty() {
@@ -2240,7 +3211,7 @@ fn refresh_sessions_from_cards(
     }
 
     let selected_window_id = state
-        .selected_card(sessions)
+        .selected_card(filtered)
         .map(|card| card.window_id.clone());
     let fallback_row = state.selected_row;
     let fallback_column = state.selected_column;
@@ -2249,25 +3220,27 @@ fn refresh_sessions_from_cards(
     if next_sessions.is_empty() {
         return;
     }
+    let next_filtered = filter_sessions(&next_sessions, query);
 
     let mut next_state = if let Some(window_id) = selected_window_id.as_deref() {
-        if next_sessions
+        if next_filtered
             .iter()
             .flat_map(|session| session.cards.iter())
             .any(|card| card.window_id == window_id)
         {
-            GridState::for_window_id(&next_sessions, window_id)
+            GridState::for_window_id(&next_filtered, window_id)
         } else {
-            fallback_grid_state(&next_sessions, fallback_row, fallback_column)
+            fallback_grid_state(&next_filtered, fallback_row, fallback_column)
         }
     } else {
-        fallback_grid_state(&next_sessions, fallback_row, fallback_column)
+        fallback_grid_state(&next_filtered, fallback_row, fallback_column)
     };
     next_state.row_offset = fallback_offset;
 
     *sessions = next_sessions;
+    *filtered = next_filtered;
     *state = next_state;
-    keep_compact_selection_visible(state, sessions, terminal_height);
+    keep_compact_selection_visible(state, filtered, terminal_height);
 }
 
 fn fallback_grid_state(sessions: &[SessionGroup], row: usize, column: usize) -> GridState {
@@ -2319,6 +3292,12 @@ fn render_compact(
     spinner_frame: usize,
 ) {
     let lines = compact_lines(sessions);
+    let card_positions = compact_card_positions(sessions);
+    let selected_position = card_positions
+        .iter()
+        .position(|&(row, column)| row == state.selected_row && column == state.selected_column)
+        .unwrap_or(0);
+    let number_width = card_positions.len().saturating_sub(1).to_string().len();
     let start = state.row_offset.min(lines.len().saturating_sub(1));
     let visible_rows = (area.height as usize).min(lines.len().saturating_sub(start));
     if visible_rows == 0 {
@@ -2331,7 +3310,7 @@ fn render_compact(
     if area.height > 1 {
         if let Some(CompactLine::Card { session_index, .. }) = lines.get(start).copied() {
             if let Some(session) = sessions.get(session_index) {
-                render_compact_session(frame, area, row_y, session, session_index);
+                render_compact_session(frame, area, row_y, session);
                 row_y = row_y.saturating_add(1);
                 rendered_rows += 1;
             }
@@ -2355,7 +3334,7 @@ fn render_compact(
                 let Some(session) = sessions.get(session_index) else {
                     continue;
                 };
-                render_compact_session(frame, row_area, row_area.y, session, session_index);
+                render_compact_session(frame, row_area, row_area.y, session);
             }
             CompactLine::Card {
                 session_index,
@@ -2369,10 +3348,17 @@ fn render_compact(
                 };
                 let selected =
                     session_index == state.selected_row && card_index == state.selected_column;
+                let card_position = card_positions
+                    .iter()
+                    .position(|&(row, column)| row == session_index && column == card_index)
+                    .unwrap_or(0);
+                let relative_number = card_position.abs_diff(selected_position);
                 frame.render_widget(
                     Paragraph::new(compact_tab_line(
                         card,
                         selected,
+                        relative_number,
+                        number_width,
                         row_area.width,
                         spinner_frame,
                     ))
@@ -2400,15 +3386,9 @@ fn compact_bottom_padding(
     }
 }
 
-fn render_compact_session(
-    frame: &mut Frame,
-    area: Rect,
-    y: u16,
-    session: &SessionGroup,
-    session_index: usize,
-) {
+fn render_compact_session(frame: &mut Frame, area: Rect, y: u16, session: &SessionGroup) {
     frame.render_widget(
-        Paragraph::new(compact_session_label(session, session_index)).style(
+        Paragraph::new(compact_session_label(session)).style(
             Style::default()
                 .fg(Color::DarkGray)
                 .add_modifier(Modifier::BOLD),
@@ -2422,12 +3402,8 @@ fn render_compact_session(
     );
 }
 
-fn compact_session_label(session: &SessionGroup, session_index: usize) -> String {
-    format!(
-        "{} {}",
-        session_index + 1,
-        display_session_name(&session.session_name)
-    )
+fn compact_session_label(session: &SessionGroup) -> String {
+    display_session_name(&session.session_name)
 }
 
 fn display_session_name(session_name: &str) -> String {
@@ -2439,7 +3415,7 @@ fn compact_session_label_width<'a>(
     sessions: impl Iterator<Item = (usize, &'a SessionGroup)>,
 ) -> u16 {
     sessions
-        .map(|(session_index, session)| compact_session_label(session, session_index))
+        .map(|(_, session)| compact_session_label(session))
         .map(|label| text_width(&label))
         .max()
         .unwrap_or(0)
@@ -2450,13 +3426,25 @@ fn text_width(text: &str) -> u16 {
 }
 
 #[cfg(test)]
-fn compact_tab_label(card: &WindowCard, width: u16) -> String {
-    compact_tab_label_at(card, width, 0, unix_timestamp())
+fn compact_tab_label(card: &WindowCard, relative_number: usize, width: u16) -> String {
+    compact_tab_label_at(card, relative_number, width, 0, unix_timestamp())
 }
 
 #[cfg(test)]
-fn compact_tab_label_at(card: &WindowCard, width: u16, spinner_frame: usize, now: u64) -> String {
-    let label = compact_tab_left_text_at(card, spinner_frame, now);
+fn compact_tab_label_at(
+    card: &WindowCard,
+    relative_number: usize,
+    width: u16,
+    spinner_frame: usize,
+    now: u64,
+) -> String {
+    let label = compact_tab_left_text_at(
+        card,
+        relative_number,
+        relative_number.to_string().len(),
+        spinner_frame,
+        now,
+    );
     let process = compact_tab_right_text(card, now);
     let label_width = text_width(&label) as usize;
     let process_width = text_width(&process) as usize;
@@ -2477,11 +3465,13 @@ fn compact_tab_label_at(card: &WindowCard, width: u16, spinner_frame: usize, now
 fn compact_tab_line(
     card: &WindowCard,
     selected: bool,
+    relative_number: usize,
+    number_width: usize,
     width: u16,
     spinner_frame: usize,
 ) -> Line<'static> {
     let now = unix_timestamp();
-    let label = compact_tab_left_text_at(card, spinner_frame, now);
+    let label = compact_tab_left_text_at(card, relative_number, number_width, spinner_frame, now);
     let runtime = agent_runtime_cell(card.agent_status, now);
     let process = compact_tab_process_text(card);
     let right_width = text_width(&compact_tab_right_text(card, now)) as usize;
@@ -2499,8 +3489,7 @@ fn compact_tab_line(
     };
 
     Line::from(vec![
-        Span::raw(" "),
-        Span::raw(card.window_index.clone()),
+        Span::raw(format!(" {:>number_width$}", relative_number)),
         Span::raw(" "),
         Span::styled(
             agent_status_icon(card.agent_status, spinner_frame).to_owned(),
@@ -2514,10 +3503,16 @@ fn compact_tab_line(
     ])
 }
 
-fn compact_tab_left_text_at(card: &WindowCard, spinner_frame: usize, _now: u64) -> String {
+fn compact_tab_left_text_at(
+    card: &WindowCard,
+    relative_number: usize,
+    number_width: usize,
+    spinner_frame: usize,
+    _now: u64,
+) -> String {
     format!(
-        " {} {} {}",
-        card.window_index,
+        " {:>number_width$} {} {}",
+        relative_number,
         agent_status_icon(card.agent_status, spinner_frame),
         card.window_name
     )
@@ -2663,14 +3658,18 @@ fn render_help(frame: &mut Frame, area: Rect) {
 
     let lines = [
         "Shortcuts",
-        "j/k or arrows: window",
-        "h/l: session",
-        "1-9: session, then pane",
-        "enter/space: select",
-        "n: new window",
-        "N: new session",
-        "esc/q: close",
-        "?: close help",
+        "tab: search / keys",
+        "S-tab: palette/sidebar",
+        "search: type filters",
+        "keys: [count]j/k, n/N, q",
+        "count+J/K: move & open",
+        "H/L: previous/next edge",
+        "↑/↓: move, C-j/C-k: open",
+        "←/→: switch session",
+        "enter: open selected",
+        "C-t/C-s: new win/sess",
+        "C-u: clear filter",
+        "esc: clear, then close",
     ];
     let text = lines
         .into_iter()
@@ -2698,9 +3697,18 @@ fn render_prompt(frame: &mut Frame, screen: Rect, sidebar: Rect, prompt: &Prompt
         .min(44)
         .max(sidebar.width.saturating_sub(4))
         .max(1);
+    // Hang the prompt right under the list box when it floats (palette view);
+    // when the list spans the full screen height (sidebar view) fall back to
+    // the bottom edge.
+    let below_list = sidebar.y.saturating_add(sidebar.height);
+    let y = if below_list.saturating_add(3) <= screen.y.saturating_add(screen.height) {
+        below_list
+    } else {
+        screen.y.saturating_add(screen.height.saturating_sub(3))
+    };
     let area = Rect {
         x: sidebar.x.saturating_add(2),
-        y: screen.y.saturating_add(screen.height.saturating_sub(3)),
+        y,
         width,
         height: 3,
     };
@@ -2729,19 +3737,23 @@ mod tests {
     };
 
     use crate::{
-        agent_status_icon, ansi_preview_text, build_cards, codex_unread_file,
+        agent_status_icon, ansi_preview_text, best_match_position, build_cards, codex_unread_file,
         compact_selected_line_index, compact_session_label, compact_session_label_width,
         compact_tab_label, compact_tab_label_at, compact_tab_line, compact_tab_style,
         compose_window_preview_text, debounce_state, debounce_threshold,
-        detect_agent_from_process_name, detect_agent_state, draw, env_tmux_value,
-        group_cards_by_session, handle_compact_quick_jump_digit, handle_prompt_key,
-        has_selection_prompt, initial_grid_state, keep_compact_selection_visible,
-        move_compact_selection, normalize_preview_line, parse_panes, parse_window_preview_panes,
-        parse_windows, preview_capture_args, refresh_sessions_from_cards,
-        render_compact, select_key_action, stabilize_agent_status_at, switcher_layout,
-        AgentEvidence, AgentKind, AgentState, AgentStatus, Debounce, Direction, GridState,
-        PreviewMirror, ProcessTree, PromptKind, PromptState, SwitcherAction, WindowCard,
+        detect_agent_from_process_name, detect_agent_state, detect_agent_state_from_title, draw,
+        env_tmux_value, filter_sessions, format_view_mode, fuzzy_score, group_cards_by_session,
+        handle_prompt_key, has_selection_prompt, initial_grid_state,
+        keep_compact_selection_visible, move_compact_selection, move_compact_selection_by,
+        move_compact_session_edge, normalize_preview_line, parse_panes, parse_view_mode,
+        parse_window_preview_panes, parse_windows, preview_capture_args, push_movement_count,
+        refresh_sessions_from_cards, render_compact, select_compact_relative, select_key_action,
+        stabilize_agent_status_at, status_option_updates, switcher_layout,
+        take_counted_open_motion, tmux_window_status_icon, window_status_icons, AgentEvidence,
+        AgentKind, AgentState, AgentStatus, Debounce, Direction, GridState, InputMode,
+        PreviewMirror, ProcessTree, PromptKind, PromptState, SwitcherAction, ViewMode, WindowCard,
         BUSY_DEBOUNCE_POLLS, HELP_LINE_COUNT, IDLE_DEBOUNCE_POLLS, PREVIEW_REFRESH_INTERVAL,
+        STATUS_AGENT_OPTION, STATUS_RUN_STARTED_OPTION, STATUS_SEEN_OPTION, STATUS_STATE_OPTION,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
@@ -2766,7 +3778,8 @@ mod tests {
     #[test]
     fn parses_pane_rows_with_empty_fields() {
         let panes =
-            parse_panes("%1\t@1\t1\tnvim\t/Users/example\t\n%2\t@1\t0\tcodex\t/tmp\tagent\n").unwrap();
+            parse_panes("%1\t@1\t1\tnvim\t/Users/example\t\n%2\t@1\t0\tcodex\t/tmp\tagent\n")
+                .unwrap();
 
         assert_eq!(panes.len(), 2);
         assert_eq!(panes[0].pane_id, "%1");
@@ -2799,6 +3812,74 @@ mod tests {
                 run_started_at: None,
             }
         );
+    }
+
+    #[test]
+    fn status_option_updates_only_includes_changed_fields() {
+        let previous = AgentStatus {
+            agent: Some(AgentKind::Codex),
+            state: AgentState::Working,
+            seen: true,
+            run_started_at: Some(1000),
+        };
+
+        assert!(status_option_updates(previous, previous).is_empty());
+
+        let done = AgentStatus {
+            agent: Some(AgentKind::Codex),
+            state: AgentState::Idle,
+            seen: false,
+            run_started_at: None,
+        };
+        assert_eq!(
+            status_option_updates(previous, done),
+            vec![
+                (STATUS_STATE_OPTION, "idle".to_owned()),
+                (STATUS_SEEN_OPTION, "0".to_owned()),
+                (STATUS_RUN_STARTED_OPTION, String::new()),
+            ]
+        );
+
+        let claude = AgentStatus {
+            agent: Some(AgentKind::Claude),
+            ..previous
+        };
+        assert_eq!(
+            status_option_updates(previous, claude),
+            vec![(STATUS_AGENT_OPTION, "claude".to_owned())]
+        );
+    }
+
+    #[test]
+    fn tmux_tab_icons_match_sidebar_status_meanings() {
+        assert_eq!(tmux_window_status_icon(AgentStatus::unknown()), "");
+        assert_eq!(
+            tmux_window_status_icon(AgentStatus {
+                agent: Some(AgentKind::Codex),
+                state: AgentState::Blocked,
+                seen: true,
+                run_started_at: Some(1000),
+            }),
+            " #[fg=red,bold]◉#[default]"
+        );
+        assert_eq!(
+            tmux_window_status_icon(AgentStatus::done(Some(AgentKind::Claude))),
+            " #[fg=cyan,bold]●#[default]"
+        );
+    }
+
+    #[test]
+    fn tmux_tab_icon_rolls_up_all_panes_in_a_window() {
+        let panes = parse_panes(
+            "%1\t@1\t1\tcodex\t/tmp\tone\t101\tcodex\tworking\t1\t1000\n\
+             %2\t@1\t0\tclaude\t/tmp\ttwo\t102\tclaude\tblocked\t1\t1000\n\
+             %3\t@2\t1\tzsh\t/tmp\tthree\t103\t\tunknown\t1\t\n",
+        )
+        .unwrap();
+
+        let icons = window_status_icons(&panes);
+        assert_eq!(icons.get("@1"), Some(&" #[fg=red,bold]◉#[default]"));
+        assert_eq!(icons.get("@2"), Some(&""));
     }
 
     #[test]
@@ -2895,6 +3976,7 @@ mod tests {
             run_started_at: None,
         };
         let mut sessions = group_cards_by_session(vec![first.clone(), selected.clone()]);
+        let mut filtered = sessions.clone();
         let mut state = GridState::new();
         state.selected_column = 1;
         state.preferred_column = 1;
@@ -2906,11 +3988,42 @@ mod tests {
             run_started_at: Some(1000),
         };
 
-        refresh_sessions_from_cards(&mut sessions, &mut state, vec![first, selected], 20);
+        refresh_sessions_from_cards(
+            &mut sessions,
+            &mut filtered,
+            &mut state,
+            vec![first, selected],
+            "",
+            20,
+        );
 
         assert_eq!(state.selected_row, 0);
         assert_eq!(state.selected_column, 1);
         assert_eq!(sessions[0].cards[1].agent_status.state, AgentState::Blocked);
+        assert_eq!(filtered, sessions);
+    }
+
+    #[test]
+    fn refreshing_sessions_keeps_the_active_filter_applied() {
+        let mut sessions = group_cards_by_session(vec![test_card("work", "1")]);
+        let mut filtered = filter_sessions(&sessions, "ops");
+        let mut state = GridState::new();
+        assert!(filtered.is_empty());
+
+        let mut ops = test_card("ops", "1");
+        ops.window_name = "server".to_owned();
+        refresh_sessions_from_cards(
+            &mut sessions,
+            &mut filtered,
+            &mut state,
+            vec![test_card("work", "1"), ops],
+            "ops",
+            20,
+        );
+
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].session_name, "ops");
     }
 
     #[test]
@@ -2961,6 +4074,30 @@ mod tests {
         assert_eq!(
             detect_agent_state(AgentKind::Claude, &claude),
             AgentState::Working
+        );
+    }
+
+    #[test]
+    fn title_fast_path_detects_unambiguous_agent_states() {
+        assert_eq!(
+            detect_agent_state_from_title(AgentKind::Codex, "[ ! ] Action Required | repo"),
+            Some(AgentState::Blocked)
+        );
+        assert_eq!(
+            detect_agent_state_from_title(AgentKind::Codex, "⠋ working"),
+            Some(AgentState::Working)
+        );
+        assert_eq!(
+            detect_agent_state_from_title(AgentKind::Codex, "repo"),
+            Some(AgentState::Idle)
+        );
+        assert_eq!(
+            detect_agent_state_from_title(AgentKind::Claude, "⠋ thinking"),
+            Some(AgentState::Working)
+        );
+        assert_eq!(
+            detect_agent_state_from_title(AgentKind::Claude, "✳ review this"),
+            None
         );
     }
 
@@ -3082,7 +4219,13 @@ mod tests {
         }
 
         // The threshold sample commits Idle and flags it unseen ("done").
-        let done = debounce_state(working, AgentKind::Claude, AgentState::Idle, &mut debounce, 2000);
+        let done = debounce_state(
+            working,
+            AgentKind::Claude,
+            AgentState::Idle,
+            &mut debounce,
+            2000,
+        );
         assert_eq!(done.state, AgentState::Idle);
         assert!(!done.seen);
         assert_eq!(done.run_started_at, None);
@@ -3100,15 +4243,26 @@ mod tests {
         let mut debounce = Debounce::new(AgentState::Idle);
 
         // A lone stray Working sample must not wipe the done or start a timer.
-        let held = debounce_state(done, AgentKind::Claude, AgentState::Working, &mut debounce, 3000);
+        let held = debounce_state(
+            done,
+            AgentKind::Claude,
+            AgentState::Working,
+            &mut debounce,
+            3000,
+        );
         assert_eq!(held.state, AgentState::Idle);
         assert!(!held.seen);
         assert_eq!(held.run_started_at, None);
 
         // Sustained work reaches the busy threshold and commits a fresh run.
         assert_eq!(BUSY_DEBOUNCE_POLLS, 2);
-        let working =
-            debounce_state(done, AgentKind::Claude, AgentState::Working, &mut debounce, 3005);
+        let working = debounce_state(
+            done,
+            AgentKind::Claude,
+            AgentState::Working,
+            &mut debounce,
+            3005,
+        );
         assert_eq!(working.state, AgentState::Working);
         assert!(working.seen);
         assert_eq!(working.run_started_at, Some(3005));
@@ -3125,14 +4279,25 @@ mod tests {
         let mut debounce = Debounce::new(AgentState::Working);
 
         // One idle blip is held as Working with the timer intact.
-        let held = debounce_state(working, AgentKind::Claude, AgentState::Idle, &mut debounce, 510);
+        let held = debounce_state(
+            working,
+            AgentKind::Claude,
+            AgentState::Idle,
+            &mut debounce,
+            510,
+        );
         assert_eq!(held.state, AgentState::Working);
         assert_eq!(held.run_started_at, Some(500));
         assert!(held.seen);
 
         // Work resumes before the streak completes: no "done" is ever committed.
-        let resumed =
-            debounce_state(working, AgentKind::Claude, AgentState::Working, &mut debounce, 520);
+        let resumed = debounce_state(
+            working,
+            AgentKind::Claude,
+            AgentState::Working,
+            &mut debounce,
+            520,
+        );
         assert_eq!(resumed.state, AgentState::Working);
         assert!(resumed.seen);
         assert_eq!(resumed.run_started_at, Some(500));
@@ -3159,8 +4324,13 @@ mod tests {
             run_started_at: Some(100),
         };
         let mut debounce = Debounce::new(AgentState::Working);
-        let blocked =
-            debounce_state(working, AgentKind::Claude, AgentState::Blocked, &mut debounce, 150);
+        let blocked = debounce_state(
+            working,
+            AgentKind::Claude,
+            AgentState::Blocked,
+            &mut debounce,
+            150,
+        );
         assert_eq!(blocked.state, AgentState::Blocked);
         assert_eq!(blocked.run_started_at, Some(100));
     }
@@ -3231,6 +4401,16 @@ mod tests {
             normalize_preview_line("before\u{1b}]0;title\u{7}after"),
             "beforeafter"
         );
+    }
+
+    #[test]
+    fn preview_tabs_become_spaces_so_cells_stay_aligned() {
+        // A raw tab would move the real cursor to the next tab stop while
+        // ratatui budgets one cell, desyncing everything after it.
+        assert_eq!(normalize_preview_line("col1\tcol2"), "col1 col2");
+
+        let text = ansi_preview_text("a\tb").unwrap();
+        assert_eq!(preview_text_lines(&text)[0], "a b");
     }
 
     #[test]
@@ -3373,7 +4553,20 @@ mod tests {
         let backend = TestBackend::new(100, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw(frame, &groups, &state, false, None, &test_preview(), 0))
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &groups,
+                    &state,
+                    ViewMode::Sidebar,
+                    InputMode::Search,
+                    false,
+                    "",
+                    None,
+                    &test_preview(),
+                    0,
+                )
+            })
             .unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -3384,8 +4577,8 @@ mod tests {
             .map(|x| buffer.get(x, 39).symbol())
             .collect::<String>();
 
-        assert!(modal_top.contains("ymir-agent-sidebar"));
-        assert!(!footer.contains("ymir-agent-sidebar"));
+        assert!(modal_top.contains("agent-switcher"));
+        assert!(!footer.contains("agent-switcher"));
         assert!(!footer.contains("j/k=window"));
     }
 
@@ -3396,7 +4589,20 @@ mod tests {
         let backend = TestBackend::new(100, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw(frame, &groups, &state, true, None, &test_preview(), 0))
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &groups,
+                    &state,
+                    ViewMode::Sidebar,
+                    InputMode::Search,
+                    true,
+                    "",
+                    None,
+                    &test_preview(),
+                    0,
+                )
+            })
             .unwrap();
 
         let rendered = terminal
@@ -3408,7 +4614,7 @@ mod tests {
             .collect::<String>();
 
         assert!(rendered.contains("Shortcuts"));
-        assert!(rendered.contains("j/k or"));
+        assert!(rendered.contains("tab: search / keys"));
         assert!(rendered.contains("enter"));
     }
 
@@ -3421,8 +4627,8 @@ mod tests {
             height: 40,
         };
 
-        let closed = switcher_layout(area, false);
-        let open = switcher_layout(area, true);
+        let closed = switcher_layout(area, false, ViewMode::Sidebar, 2);
+        let open = switcher_layout(area, true, ViewMode::Sidebar, 2);
 
         assert_eq!(closed.list_overlay.x, 0);
         assert_eq!(closed.list_overlay.y, 0);
@@ -3437,13 +4643,63 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_right_docks_list_to_right_edge_with_preview_on_left() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 40,
+        };
+
+        let left = switcher_layout(area, false, ViewMode::Sidebar, 2);
+        let right = switcher_layout(area, false, ViewMode::SidebarRight, 2);
+
+        assert_eq!(right.list_overlay.width, left.list_overlay.width);
+        assert_eq!(right.list_overlay.height, left.list_overlay.height);
+        assert_eq!(right.list_overlay.x, area.width - right.list_overlay.width);
+        assert_eq!(right.preview.x, 0);
+        assert_eq!(right.preview.width, area.width - right.list_overlay.width);
+        assert_eq!(right.preview.height, area.height);
+    }
+
+    #[test]
+    fn view_mode_toggle_cycles_through_all_three_positions() {
+        assert_eq!(ViewMode::Sidebar.toggled(), ViewMode::SidebarRight);
+        assert_eq!(ViewMode::SidebarRight.toggled(), ViewMode::Palette);
+        assert_eq!(ViewMode::Palette.toggled(), ViewMode::Sidebar);
+    }
+
+    #[test]
+    fn view_mode_round_trips_through_parse_and_format() {
+        for view in [ViewMode::Sidebar, ViewMode::SidebarRight, ViewMode::Palette] {
+            assert_eq!(parse_view_mode(format_view_mode(view)), Some(view));
+        }
+        assert_eq!(parse_view_mode("left"), Some(ViewMode::Sidebar));
+        assert_eq!(parse_view_mode("right"), Some(ViewMode::SidebarRight));
+        assert_eq!(parse_view_mode("center"), Some(ViewMode::Palette));
+    }
+
+    #[test]
     fn sidebar_sessions_are_pushed_to_bottom_when_content_is_short() {
         let groups = group_cards_by_session(vec![test_card("work", "1")]);
         let state = GridState::new();
         let backend = TestBackend::new(100, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw(frame, &groups, &state, false, None, &test_preview(), 0))
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &groups,
+                    &state,
+                    ViewMode::Sidebar,
+                    InputMode::Search,
+                    false,
+                    "",
+                    None,
+                    &test_preview(),
+                    0,
+                )
+            })
             .unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -3451,9 +4707,172 @@ mod tests {
         assert_eq!(buffer.get(27, 0).symbol(), "┐");
         assert_eq!(buffer.get(0, 39).symbol(), "└");
         assert_eq!(buffer.get(27, 39).symbol(), "┘");
-        assert_eq!(buffer.get(2, 36).symbol(), "1");
-        assert_eq!(buffer.get(3, 37).symbol(), "1");
-        assert_eq!(buffer.get(5, 37).symbol(), "○");
+        // List sits just above the bottom search bar (separator + prompt).
+        assert_eq!(buffer.get(2, 34).symbol(), "w");
+        assert_eq!(buffer.get(3, 35).symbol(), "0");
+        assert_eq!(buffer.get(5, 35).symbol(), "○");
+        assert_eq!(buffer.get(2, 36).symbol(), "─");
+        assert_eq!(buffer.get(2, 37).symbol(), "❯");
+    }
+
+    #[test]
+    fn palette_layout_anchors_its_bottom_prompt_above_screen_middle() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 40,
+        };
+
+        // Two compact lines: one session header + one window row. The box's
+        // bottom edge sits at 55% of the height (row 22) and grows upward.
+        let layout = switcher_layout(area, false, ViewMode::Palette, 2);
+
+        assert_eq!(layout.preview, area);
+        assert_eq!(
+            layout.list_overlay,
+            Rect {
+                x: 22,
+                y: 14,
+                width: 55,
+                height: 8,
+            }
+        );
+        assert_eq!(
+            layout.sessions,
+            Rect {
+                x: 24,
+                y: 16,
+                width: 51,
+                height: 2,
+            }
+        );
+        // Search bar at the bottom of the box: separator row + prompt row.
+        assert_eq!(
+            layout.search,
+            Rect {
+                x: 24,
+                y: 18,
+                width: 51,
+                height: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn palette_layout_caps_height_so_long_lists_scroll() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 40,
+        };
+
+        let layout = switcher_layout(area, false, ViewMode::Palette, 100);
+
+        // Capped one row below the bottom anchor (55% of 40 = 22).
+        assert_eq!(layout.list_overlay.height, 21);
+        assert_eq!(layout.list_overlay.y, 1);
+        assert_eq!(layout.sessions.height, 15);
+    }
+
+    #[test]
+    fn palette_help_extends_the_floating_box() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 40,
+        };
+
+        let closed = switcher_layout(area, false, ViewMode::Palette, 2);
+        let open = switcher_layout(area, true, ViewMode::Palette, 2);
+
+        assert_eq!(
+            open.list_overlay.height,
+            closed.list_overlay.height + HELP_LINE_COUNT
+        );
+        assert_eq!(open.sessions.height, closed.sessions.height);
+        assert_eq!(open.help.unwrap().height, HELP_LINE_COUNT);
+    }
+
+    #[test]
+    fn draw_renders_palette_box_over_fullscreen_preview() {
+        let groups = group_cards_by_session(vec![test_card("work", "1")]);
+        let state = GridState::new();
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &groups,
+                    &state,
+                    ViewMode::Palette,
+                    InputMode::Search,
+                    false,
+                    "",
+                    None,
+                    &test_preview(),
+                    0,
+                )
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        // The preview fills the screen behind the palette, from the top-left.
+        assert_eq!(buffer.get(0, 0).symbol(), "p");
+        // The palette floats centered, bottom edge anchored above mid-screen.
+        assert_eq!(buffer.get(22, 14).symbol(), "┌");
+        assert_eq!(buffer.get(76, 14).symbol(), "┐");
+        assert_eq!(buffer.get(22, 21).symbol(), "└");
+        assert_eq!(buffer.get(76, 21).symbol(), "┘");
+        // List content on top: session header, then window row.
+        assert_eq!(buffer.get(24, 16).symbol(), "w");
+        assert_eq!(buffer.get(25, 17).symbol(), "0");
+        // Search bar at the bottom: separator rule, then the prompt.
+        assert_eq!(buffer.get(24, 18).symbol(), "─");
+        assert_eq!(buffer.get(24, 19).symbol(), "❯");
+
+        let box_top = (22..77)
+            .map(|x| buffer.get(x, 14).symbol())
+            .collect::<String>();
+        assert!(box_top.contains("agent-switcher"));
+    }
+
+    #[test]
+    fn draw_renders_query_text_and_no_matches_hint() {
+        let groups = group_cards_by_session(Vec::new());
+        let state = GridState::new();
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &groups,
+                    &state,
+                    ViewMode::Palette,
+                    InputMode::Search,
+                    false,
+                    "zzz",
+                    None,
+                    &test_preview(),
+                    0,
+                )
+            })
+            .unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("❯ zzz"));
+        assert!(rendered.contains("no matching windows"));
     }
 
     #[test]
@@ -3463,7 +4882,20 @@ mod tests {
         let backend = TestBackend::new(100, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw(frame, &groups, &state, true, None, &test_preview(), 0))
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &groups,
+                    &state,
+                    ViewMode::Sidebar,
+                    InputMode::Search,
+                    true,
+                    "",
+                    None,
+                    &test_preview(),
+                    0,
+                )
+            })
             .unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -3474,26 +4906,51 @@ mod tests {
                     .collect::<String>()
             })
             .filter(|row| {
-                row.contains("j/k")
-                    || row.contains("h/l")
-                    || row.contains("1-9")
-                    || row.contains("n:")
-                    || row.contains("N:")
-                    || row.contains("enter")
-                    || row.contains("esc/q")
-                    || row.contains("?:")
+                row.contains("tab:")
+                    || row.contains("search:")
+                    || row.contains("keys:")
+                    || row.contains("count+J/K:")
+                    || row.contains("H/L:")
+                    || row.contains("C-j/C-k")
+                    || row.contains("←/→")
+                    || row.contains("enter:")
+                    || row.contains("C-t/C-s:")
+                    || row.contains("C-u:")
+                    || row.contains("esc:")
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(help_rows.len(), 8);
-        assert!(help_rows.iter().any(|row| row.contains("j/k or arrows")));
-        assert!(help_rows.iter().any(|row| row.contains("h/l")));
-        assert!(help_rows.iter().any(|row| row.contains("1-9")));
-        assert!(help_rows.iter().any(|row| row.contains("n: new window")));
-        assert!(help_rows.iter().any(|row| row.contains("N: new session")));
-        assert!(help_rows.iter().any(|row| row.contains("enter")));
-        assert!(help_rows.iter().any(|row| row.contains("esc/q")));
-        assert!(help_rows.iter().any(|row| row.contains("?:")));
+        assert_eq!(help_rows.len(), 12);
+        assert!(help_rows
+            .iter()
+            .any(|row| row.contains("tab: search / keys")));
+        assert!(help_rows
+            .iter()
+            .any(|row| row.contains("S-tab: palette/sidebar")));
+        assert!(help_rows
+            .iter()
+            .any(|row| row.contains("search: type filters")));
+        assert!(help_rows
+            .iter()
+            .any(|row| row.contains("keys: [count]j/k, n/N, q")));
+        assert!(help_rows
+            .iter()
+            .any(|row| row.contains("count+J/K: move & open")));
+        assert!(help_rows
+            .iter()
+            .any(|row| row.contains("H/L: previous/next edge")));
+        assert!(help_rows.iter().any(|row| row.contains("C-j/C-k: open")));
+        assert!(help_rows
+            .iter()
+            .any(|row| row.contains("←/→: switch session")));
+        assert!(help_rows.iter().any(|row| row.contains("enter: open")));
+        assert!(help_rows
+            .iter()
+            .any(|row| row.contains("C-t/C-s: new win/sess")));
+        assert!(help_rows
+            .iter()
+            .any(|row| row.contains("C-u: clear filter")));
+        assert!(help_rows.iter().any(|row| row.contains("esc: clear")));
     }
 
     #[test]
@@ -3548,15 +5005,20 @@ mod tests {
     }
 
     #[test]
-    fn space_selects_the_highlighted_card_like_enter() {
+    fn only_enter_selects_now_that_typing_filters() {
         let cards = vec![test_card("work", "1"), test_card("work", "2")];
         let sessions = group_cards_by_session(cards);
         let mut state = GridState::new();
         state.selected_column = 1;
 
         assert_eq!(
-            select_key_action(key(KeyCode::Char(' ')), &state, &sessions),
+            select_key_action(key(KeyCode::Enter), &state, &sessions),
             Some(SwitcherAction::Select(test_card("work", "2")))
+        );
+        // Space is query input, not a select key.
+        assert_eq!(
+            select_key_action(key(KeyCode::Char(' ')), &state, &sessions),
+            None
         );
     }
 
@@ -3577,7 +5039,10 @@ mod tests {
                     frame,
                     &groups,
                     &state,
+                    ViewMode::Sidebar,
+                    InputMode::Search,
                     false,
+                    "",
                     Some(&prompt),
                     &test_preview(),
                     0,
@@ -3600,8 +5065,8 @@ mod tests {
     fn selected_compact_tab_label_is_a_plain_highlight_span() {
         let card = test_card("work", "2");
 
-        assert_eq!(compact_tab_label(&card, 24), " 2 ○ window-2        zsh");
-        assert_eq!(compact_tab_label(&card, 0), " 2 ○ window-2     zsh");
+        assert_eq!(compact_tab_label(&card, 0, 24), " 0 ○ window-2        zsh");
+        assert_eq!(compact_tab_label(&card, 0, 0), " 0 ○ window-2     zsh");
     }
 
     #[test]
@@ -3609,7 +5074,7 @@ mod tests {
         let mut card = test_card("work", "2");
         card.command = "codex-aarch64-a".to_owned();
 
-        assert_eq!(compact_tab_label(&card, 24), " 2 ○ window-2      codex");
+        assert_eq!(compact_tab_label(&card, 0, 24), " 0 ○ window-2      codex");
     }
 
     #[test]
@@ -3617,7 +5082,7 @@ mod tests {
         let mut card = test_card("work", "2");
         card.command = "2.1.197".to_owned();
 
-        assert_eq!(compact_tab_label(&card, 24), " 2 ○ window-2     claude");
+        assert_eq!(compact_tab_label(&card, 0, 24), " 0 ○ window-2     claude");
     }
 
     #[test]
@@ -3631,8 +5096,8 @@ mod tests {
         };
 
         assert_eq!(
-            compact_tab_label_at(&card, 32, 0, 1000),
-            " 2 ⠋ window-2            2m  zsh"
+            compact_tab_label_at(&card, 0, 32, 0, 1000),
+            " 0 ⠋ window-2            2m  zsh"
         );
     }
 
@@ -3647,8 +5112,8 @@ mod tests {
         };
 
         assert_eq!(
-            compact_tab_label_at(&card, 32, 0, 1000),
-            " 2 ⠋ window-2            0m  zsh"
+            compact_tab_label_at(&card, 0, 32, 0, 1000),
+            " 0 ⠋ window-2            0m  zsh"
         );
     }
 
@@ -3662,9 +5127,9 @@ mod tests {
             run_started_at: Some(crate::unix_timestamp()),
         };
 
-        let line = compact_tab_line(&card, false, 32, 0);
-        let runtime = &line.spans[6];
-        let process = &line.spans[8];
+        let line = compact_tab_line(&card, false, 0, 1, 32, 0);
+        let runtime = &line.spans[5];
+        let process = &line.spans[7];
 
         assert!(runtime.content.ends_with(' '));
         assert_eq!(process.content, "zsh");
@@ -3691,7 +5156,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_labels_include_quick_jump_numbers_and_right_aligned_processes() {
+    fn compact_labels_include_relative_numbers_and_right_aligned_processes() {
         let groups = group_cards_by_session(vec![
             test_card("alpha", "1"),
             test_card("work", "1"),
@@ -3699,9 +5164,9 @@ mod tests {
             test_card("work", "3"),
         ]);
 
-        assert_eq!(compact_session_label(&groups[1], 1), "2 work");
+        assert_eq!(compact_session_label(&groups[1]), "work");
         assert_eq!(
-            compact_tab_label(&groups[1].cards[2], 28),
+            compact_tab_label(&groups[1].cards[2], 3, 28),
             " 3 ○ window-3            zsh"
         );
     }
@@ -3710,7 +5175,7 @@ mod tests {
     fn compact_session_label_uses_natural_width() {
         let groups = group_cards_by_session(vec![test_card("agent-proxy", "1")]);
 
-        assert_eq!(compact_session_label(&groups[0], 0), "1 agent proxy");
+        assert_eq!(compact_session_label(&groups[0]), "agent proxy");
     }
 
     #[test]
@@ -3721,7 +5186,7 @@ mod tests {
             test_card("mid", "1"),
         ]);
 
-        assert_eq!(compact_session_label_width(groups.iter().enumerate()), 14);
+        assert_eq!(compact_session_label_width(groups.iter().enumerate()), 12);
     }
 
     #[test]
@@ -3735,7 +5200,20 @@ mod tests {
         let backend = TestBackend::new(100, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw(frame, &groups, &state, false, None, &test_preview(), 0))
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &groups,
+                    &state,
+                    ViewMode::Sidebar,
+                    InputMode::Search,
+                    false,
+                    "",
+                    None,
+                    &test_preview(),
+                    0,
+                )
+            })
             .unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -3745,15 +5223,15 @@ mod tests {
         assert_eq!(buffer.get(27, 0).symbol(), "┐");
         assert_eq!(buffer.get(0, 39).symbol(), "└");
         assert_eq!(buffer.get(27, 39).symbol(), "┘");
-        assert_eq!(buffer.get(2, 34).symbol(), "1");
-        assert_eq!(buffer.get(3, 35).symbol(), "1");
-        assert_eq!(buffer.get(5, 35).symbol(), "○");
-        assert_eq!(buffer.get(2, 36).symbol(), "2");
+        assert_eq!(buffer.get(2, 32).symbol(), "w");
+        assert_eq!(buffer.get(3, 33).symbol(), "0");
+        assert_eq!(buffer.get(5, 33).symbol(), "○");
+        assert_eq!(buffer.get(2, 34).symbol(), "o");
 
         let modal_top = (0..100)
             .map(|x| buffer.get(x, 0).symbol())
             .collect::<String>();
-        assert!(modal_top.contains("ymir-agent-sidebar"));
+        assert!(modal_top.contains("agent-switcher"));
         assert!(modal_top.contains("[?] Help"));
     }
 
@@ -3768,7 +5246,20 @@ mod tests {
             .draw(|frame| frame.render_widget(Paragraph::new(stale), frame.size()))
             .unwrap();
         terminal
-            .draw(|frame| draw(frame, &groups, &state, false, None, &test_preview(), 0))
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &groups,
+                    &state,
+                    ViewMode::Sidebar,
+                    InputMode::Search,
+                    false,
+                    "",
+                    None,
+                    &test_preview(),
+                    0,
+                )
+            })
             .unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -3789,7 +5280,20 @@ mod tests {
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|frame| draw(frame, &groups, &state, false, None, &test_preview(), 0))
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &groups,
+                    &state,
+                    ViewMode::Sidebar,
+                    InputMode::Search,
+                    false,
+                    "",
+                    None,
+                    &test_preview(),
+                    0,
+                )
+            })
             .unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -3860,15 +5364,12 @@ mod tests {
             .unwrap();
 
         let buffer = terminal.backend().buffer();
-        assert_eq!(buffer.get(0, 0).symbol(), "1");
-        assert_eq!(buffer.get(1, 0).symbol(), " ");
-        assert_eq!(buffer.get(2, 0).symbol(), "a");
+        assert_eq!(buffer.get(0, 0).symbol(), "a");
         assert_eq!(buffer.get(1, 1).symbol(), "1");
         assert_eq!(buffer.get(3, 1).symbol(), "○");
         assert_eq!(buffer.get(5, 1).symbol(), "w");
-        assert_eq!(buffer.get(0, 2).symbol(), "2");
-        assert_eq!(buffer.get(2, 2).symbol(), "l");
-        assert_eq!(buffer.get(1, 3).symbol(), "1");
+        assert_eq!(buffer.get(0, 2).symbol(), "l");
+        assert_eq!(buffer.get(1, 3).symbol(), "0");
         assert_eq!(buffer.get(3, 3).symbol(), "○");
         assert_eq!(buffer.get(5, 3).symbol(), "w");
         assert_eq!(buffer.get(0, 3).bg, Color::White);
@@ -3992,7 +5493,90 @@ mod tests {
     }
 
     #[test]
-    fn compact_quick_jump_digit_selects_session_then_opens_pane() {
+    fn compact_session_edge_navigation_walks_first_and_last_items() {
+        let groups = group_cards_by_session(vec![
+            test_card("work", "1"),
+            test_card("work", "2"),
+            test_card("work", "3"),
+            test_card("ops", "1"),
+            test_card("ops", "2"),
+            test_card("db", "1"),
+        ]);
+        let mut state = GridState::new();
+        state.selected_column = 1;
+
+        move_compact_session_edge(&mut state, &groups, Direction::Down, 8);
+        assert_eq!((state.selected_row, state.selected_column), (0, 2));
+
+        move_compact_session_edge(&mut state, &groups, Direction::Down, 8);
+        assert_eq!((state.selected_row, state.selected_column), (1, 0));
+
+        move_compact_session_edge(&mut state, &groups, Direction::Down, 8);
+        assert_eq!((state.selected_row, state.selected_column), (1, 1));
+
+        move_compact_session_edge(&mut state, &groups, Direction::Up, 8);
+        assert_eq!((state.selected_row, state.selected_column), (1, 0));
+
+        move_compact_session_edge(&mut state, &groups, Direction::Up, 8);
+        assert_eq!((state.selected_row, state.selected_column), (0, 2));
+
+        move_compact_session_edge(&mut state, &groups, Direction::Up, 8);
+        assert_eq!((state.selected_row, state.selected_column), (0, 0));
+    }
+
+    #[test]
+    fn compact_session_edge_navigation_clamps_at_list_ends() {
+        let groups = group_cards_by_session(vec![
+            test_card("work", "1"),
+            test_card("work", "2"),
+            test_card("ops", "1"),
+        ]);
+        let mut state = GridState::new();
+
+        move_compact_session_edge(&mut state, &groups, Direction::Up, 8);
+        assert_eq!((state.selected_row, state.selected_column), (0, 0));
+
+        state.selected_row = 1;
+        move_compact_session_edge(&mut state, &groups, Direction::Down, 8);
+        assert_eq!((state.selected_row, state.selected_column), (1, 0));
+    }
+
+    #[test]
+    fn fuzzy_score_matches_subsequences_and_prefers_word_starts() {
+        assert!(fuzzy_score("work window-1 zsh tmp", "wrk").is_some());
+        assert!(fuzzy_score("work window-1 zsh tmp", "xyz").is_none());
+        assert!(fuzzy_score("work editor", "EDIT").is_some());
+
+        // A hit at a word start beats one buried mid-word.
+        let word_start = fuzzy_score("ops server zsh tmp", "ser").unwrap();
+        let buried = fuzzy_score("work browser zsh tmp", "ser").unwrap();
+        assert!(word_start > buried);
+    }
+
+    #[test]
+    fn filter_sessions_prunes_windows_and_empty_sessions() {
+        let mut editor = test_card("work", "2");
+        editor.window_name = "editor".to_owned();
+        let sessions =
+            group_cards_by_session(vec![test_card("work", "1"), editor, test_card("ops", "1")]);
+
+        let filtered = filter_sessions(&sessions, "edit");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].session_name, "work");
+        assert_eq!(filtered[0].cards.len(), 1);
+        assert_eq!(filtered[0].cards[0].window_name, "editor");
+
+        // Session names match too, keeping every window of that session.
+        let filtered = filter_sessions(&sessions, "ops");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].cards.len(), 1);
+
+        // A blank query keeps everything.
+        assert_eq!(filter_sessions(&sessions, " "), sessions);
+    }
+
+    #[test]
+    fn keys_mode_count_moves_across_sessions_like_vim() {
         let groups = group_cards_by_session(vec![
             test_card("work", "1"),
             test_card("work", "2"),
@@ -4001,22 +5585,84 @@ mod tests {
             test_card("ops", "3"),
         ]);
         let mut state = GridState::new();
-        let mut pending_session = None;
+        let mut count = None;
 
-        let selected =
-            handle_compact_quick_jump_digit(&mut state, &groups, &mut pending_session, '2', 8);
+        assert!(push_movement_count(&mut count, '3'));
+        move_compact_selection_by(
+            &mut state,
+            &groups,
+            Direction::Down,
+            count.take().unwrap(),
+            8,
+        );
 
-        assert!(selected.is_none());
-        assert_eq!(pending_session, Some(1));
+        assert_eq!((state.selected_row, state.selected_column), (1, 1));
+        assert_eq!(count, None);
+    }
+
+    #[test]
+    fn keys_mode_count_accepts_multiple_digits_and_clamps_at_the_edge() {
+        let groups = group_cards_by_session(vec![
+            test_card("work", "1"),
+            test_card("work", "2"),
+            test_card("ops", "1"),
+        ]);
+        let mut state = GridState::new();
+        let mut count = None;
+
+        assert!(push_movement_count(&mut count, '1'));
+        assert!(push_movement_count(&mut count, '0'));
+        assert_eq!(count, Some(10));
+        move_compact_selection_by(&mut state, &groups, Direction::Down, count.unwrap(), 8);
+
         assert_eq!((state.selected_row, state.selected_column), (1, 0));
 
-        let selected =
-            handle_compact_quick_jump_digit(&mut state, &groups, &mut pending_session, '3', 8)
-                .unwrap();
+        let mut leading_zero = None;
+        assert!(!push_movement_count(&mut leading_zero, '0'));
+        assert_eq!(leading_zero, None);
+    }
 
-        assert_eq!(selected.window_id, "@ops-3");
-        assert_eq!(pending_session, None);
-        assert_eq!((state.selected_row, state.selected_column), (1, 2));
+    #[test]
+    fn counted_uppercase_motion_selects_the_relative_target_for_opening() {
+        let groups = group_cards_by_session(vec![
+            test_card("work", "1"),
+            test_card("work", "2"),
+            test_card("work", "3"),
+            test_card("ops", "1"),
+            test_card("ops", "2"),
+        ]);
+        let mut state = GridState::new();
+        state.selected_column = 1;
+
+        let mut down_count = Some(2);
+        assert_eq!(
+            take_counted_open_motion(&mut down_count, 'J'),
+            Some((Direction::Down, 2))
+        );
+        assert_eq!(down_count, None);
+
+        let down = select_compact_relative(&mut state, &groups, Direction::Down, 2, 8).unwrap();
+        assert_eq!(down.window_id, "@ops-1");
+        assert_eq!((state.selected_row, state.selected_column), (1, 0));
+
+        let up = select_compact_relative(&mut state, &groups, Direction::Up, 2, 8).unwrap();
+        assert_eq!(up.window_id, "@work-2");
+        assert_eq!((state.selected_row, state.selected_column), (0, 1));
+
+        let mut no_count = None;
+        assert_eq!(take_counted_open_motion(&mut no_count, 'K'), None);
+    }
+
+    #[test]
+    fn best_match_position_points_at_the_top_scoring_card() {
+        let mut editor = test_card("ops", "2");
+        editor.window_name = "editor".to_owned();
+        let sessions =
+            group_cards_by_session(vec![test_card("work", "1"), test_card("ops", "1"), editor]);
+
+        assert_eq!(best_match_position(&sessions, "editor"), Some((1, 1)));
+        assert_eq!(best_match_position(&sessions, ""), None);
+        assert_eq!(best_match_position(&sessions, "zzz"), None);
     }
 
     #[test]
@@ -4062,18 +5708,16 @@ mod tests {
             .unwrap();
 
         let buffer = terminal.backend().buffer();
-        assert_eq!(buffer.get(0, 0).symbol(), "1");
-        assert_eq!(buffer.get(1, 0).symbol(), " ");
-        assert_eq!(buffer.get(2, 0).symbol(), "w");
+        assert_eq!(buffer.get(0, 0).symbol(), "w");
         assert_eq!(buffer.get(1, 1).symbol(), "1");
         assert_eq!(buffer.get(3, 1).symbol(), "○");
         assert_eq!(buffer.get(5, 1).symbol(), "w");
-        assert_eq!(buffer.get(1, 2).symbol(), "2");
+        assert_eq!(buffer.get(1, 2).symbol(), "0");
         assert_eq!(buffer.get(3, 2).symbol(), "○");
         assert_eq!(buffer.get(5, 2).symbol(), "w");
         assert_eq!(buffer.get(0, 2).bg, Color::White);
-        assert_eq!(buffer.get(0, 3).symbol(), "2");
-        assert_eq!(buffer.get(2, 3).symbol(), "o");
+        assert_eq!(buffer.get(0, 3).symbol(), "o");
+        assert_eq!(buffer.get(1, 4).symbol(), "1");
     }
 
     #[test]
@@ -4129,13 +5773,11 @@ mod tests {
             .unwrap();
 
         let buffer = terminal.backend().buffer();
-        assert_eq!(buffer.get(0, 0).symbol(), "1");
-        assert_eq!(buffer.get(1, 0).symbol(), " ");
-        assert_eq!(buffer.get(2, 0).symbol(), "w");
-        assert_eq!(buffer.get(1, 1).symbol(), "5");
+        assert_eq!(buffer.get(0, 0).symbol(), "w");
+        assert_eq!(buffer.get(1, 1).symbol(), "1");
         assert_eq!(buffer.get(3, 1).symbol(), "○");
         assert_eq!(buffer.get(5, 1).symbol(), "w");
-        assert_eq!(buffer.get(1, 2).symbol(), "6");
+        assert_eq!(buffer.get(1, 2).symbol(), "0");
         assert_eq!(buffer.get(3, 2).symbol(), "○");
         assert_eq!(buffer.get(5, 2).symbol(), "w");
         assert_eq!(buffer.get(0, 2).bg, Color::White);
@@ -4159,16 +5801,16 @@ mod tests {
 
     #[test]
     fn env_tmux_value_ignores_unexpanded_tmux_formats() {
-        std::env::set_var("YMIR_AGENT_SIDEBAR_TEST_LITERAL", "#{window_id}");
-        assert_eq!(env_tmux_value("YMIR_AGENT_SIDEBAR_TEST_LITERAL"), None);
+        std::env::set_var("TMUX_AGENT_SWITCHER_TEST_LITERAL", "#{window_id}");
+        assert_eq!(env_tmux_value("TMUX_AGENT_SWITCHER_TEST_LITERAL"), None);
 
-        std::env::set_var("YMIR_AGENT_SIDEBAR_TEST_LITERAL", "@42");
+        std::env::set_var("TMUX_AGENT_SWITCHER_TEST_LITERAL", "@42");
         assert_eq!(
-            env_tmux_value("YMIR_AGENT_SIDEBAR_TEST_LITERAL"),
+            env_tmux_value("TMUX_AGENT_SWITCHER_TEST_LITERAL"),
             Some("@42".to_owned())
         );
 
-        std::env::remove_var("YMIR_AGENT_SIDEBAR_TEST_LITERAL");
+        std::env::remove_var("TMUX_AGENT_SWITCHER_TEST_LITERAL");
     }
 
     fn test_preview() -> PreviewMirror {

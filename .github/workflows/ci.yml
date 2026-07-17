@@ -35,5 +35,5 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: ShellCheck launcher scripts
-        run: shellcheck bin/ymir-agent-sidebar bin/ymir-agent-sidebar-fetch bin/ymir-agent-sidebar-popup ymir-agent-sidebar.tmux
+        run: shellcheck bin/tmux-agent-switcher bin/tmux-agent-switcher-fetch bin/tmux-agent-switcher-popup tmux-agent-switcher.tmux
         continue-on-error: true

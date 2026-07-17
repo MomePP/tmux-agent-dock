@@ -1,9 +1,9 @@
-# ymir-agent-sidebar
+# tmux-agent-switcher
 
 A tmux sidebar that lets you switch between windows **and** keep an eye on your
 running AI coding agents (Claude Code and Codex) from one full-screen popup.
 
-Press <kbd>Ctrl</kbd>+<kbd>n</kbd> and you get a list of every window across all
+Press <kbd>Ctrl</kbd>+<kbd>j</kbd> or <kbd>Ctrl</kbd>+<kbd>k</kbd> and you get a list of every window across all
 your sessions on the left, a live preview of the selected window on the right,
 and a status badge on any pane running an agent: **Working**, **Blocked**
 (waiting on you), or **Idle** (done). Jump straight to the agent that needs you.
@@ -22,6 +22,8 @@ and a status badge on any pane running an agent: **Working**, **Blocked**
 - **Agent monitoring**: each pane running Claude Code or Codex is tagged
   Working / Blocked / Idle, with a run timer, so you can see at a glance which
   agent is waiting on input.
+- **Tab status indicators**: the same rolled-up agent state is appended to each
+  tmux window tab without replacing your existing tab format.
 - **Vim-aware navigation**: <kbd>Ctrl</kbd>+<kbd>h/j/k/l</kbd> move between panes
   and windows but pass through to Vim/Neovim when it's focused.
 - **No daemon to babysit**: a lightweight background poller starts itself the
@@ -43,7 +45,7 @@ and a status badge on any pane running an agent: **Working**, **Blocked**
 Add to `~/.tmux.conf` (or `~/.config/tmux/tmux.conf`):
 
 ```tmux
-set -g @plugin 'Ymirke/ymir-agent-sidebar'
+set -g @plugin 'Ymirke/tmux-agent-switcher'
 ```
 
 Then press <kbd>prefix</kbd> + <kbd>I</kbd> to install. On first use the plugin
@@ -53,14 +55,14 @@ you have Rust and no prebuilt exists).
 ### Manual
 
 ```sh
-git clone https://github.com/Ymirke/ymir-agent-sidebar \
-  ~/.tmux/plugins/ymir-agent-sidebar
+git clone https://github.com/Ymirke/tmux-agent-switcher \
+  ~/.tmux/plugins/tmux-agent-switcher
 ```
 
 Add to your tmux config and reload:
 
 ```tmux
-run-shell "~/.tmux/plugins/ymir-agent-sidebar/ymir-agent-sidebar.tmux"
+run-shell "~/.tmux/plugins/tmux-agent-switcher/tmux-agent-switcher.tmux"
 ```
 
 See [`examples/tmux.conf`](examples/tmux.conf) for a manual keybinding snippet.
@@ -68,31 +70,58 @@ See [`examples/tmux.conf`](examples/tmux.conf) for a manual keybinding snippet.
 ### From source (cargo)
 
 ```sh
-cargo install --git https://github.com/Ymirke/ymir-agent-sidebar
+cargo install --git https://github.com/Ymirke/tmux-agent-switcher
 ```
 
 ## Usage
 
 | Key | Action |
 | --- | --- |
-| <kbd>Ctrl</kbd>+<kbd>n</kbd> | Open the sidebar |
-| <kbd>Ctrl</kbd>+<kbd>j</kbd> / <kbd>Ctrl</kbd>+<kbd>k</kbd> | Open the sidebar pre-moved down / up (pass through to Vim if focused) |
+| <kbd>Ctrl</kbd>+<kbd>j</kbd> / <kbd>Ctrl</kbd>+<kbd>k</kbd> | Open the sidebar (pass through to Vim if focused) |
 | <kbd>Ctrl</kbd>+<kbd>h</kbd> / <kbd>Ctrl</kbd>+<kbd>l</kbd> | Move panes / wrap to prev/next window (pass through to Vim if focused) |
 
-Inside the sidebar: move the selection to a window and press <kbd>Enter</kbd> to
-jump to it. Press <kbd>?</kbd> for help.
+Inside the switcher, typing **filters the windows fuzzily** (telescope.nvim
+style) — matching session name, window name, process, and directory — from a
+prompt at the bottom of the list. <kbd>↑</kbd>/<kbd>↓</kbd> move the selection
+for previewing, <kbd>Ctrl</kbd>+<kbd>j</kbd>/<kbd>k</kbd> opens the next/previous
+window directly, <kbd>Enter</kbd> jumps to the selected window, and
+<kbd>Esc</kbd> clears the filter, then closes.
+
+- <kbd>Tab</kbd> toggles the input mode: **search** (default; typing filters) or
+  **keys** (Vim-style bindings: <kbd>j/k</kbd> move, a numeric count such as
+  <kbd>4j</kbd>/<kbd>4k</kbd> moves several windows, <kbd>n</kbd>/<kbd>N</kbd> new
+  window/session, <kbd>q</kbd> closes).
+- A counted uppercase motion such as <kbd>4J</kbd>/<kbd>4K</kbd> moves down or
+  up by that relative number and immediately opens the target window.
+- <kbd>H</kbd>/<kbd>L</kbd> move between session edges: first and last in the
+  current session, then first and last in the previous or next session.
+- Window rows use Vim-style relative numbers: the selected window is
+  <kbd>0</kbd>, and every other number is its distance above or below it.
+- <kbd>Shift</kbd>+<kbd>Tab</kbd> cycles the view: the left-docked **sidebar**,
+  a right-docked **sidebar-right**, or a **palette** floating just above the
+  middle of the screen with the selected window previewed full-screen behind
+  it.
+- Both toggles stick for the rest of the tmux server's lifetime.
+- <kbd>Ctrl</kbd>+<kbd>t</kbd> / <kbd>Ctrl</kbd>+<kbd>s</kbd> create a new
+  window / session in any mode. Press <kbd>?</kbd> for the full shortcut list.
 
 ## Configuration
 
 Set these **before** the plugin loads:
 
 ```tmux
-set -g @agent_sidebar_key 'C-n'   # key that opens the sidebar (default: C-n)
-set -g @agent_sidebar_nav 'on'    # vim-aware C-h/C-j/C-k/C-l nav (default: on)
+set -g @agent_switcher_key 'C-n'       # optional extra key that opens the sidebar
+set -g @agent_switcher_nav 'on'        # vim-aware C-h/C-j/C-k/C-l nav (default: on)
+set -g @agent_switcher_view 'sidebar'  # 'sidebar' (left), 'sidebar-right' (right) or 'palette' (floating)
+set -g @agent_switcher_input 'search'  # 'search' (type to filter) or 'keys' ([count]j/k)
+set -g @agent_switcher_tab_status 'on' # show agent state in tmux window tabs
 ```
 
-Set `@agent_sidebar_nav 'off'` if you already bind
+Set `@agent_switcher_nav 'off'` if you already bind
 <kbd>Ctrl</kbd>+<kbd>h/j/k/l</kbd> yourself or want to keep those keys.
+Set `@agent_switcher_tab_status 'off'` to leave tmux's window status formats
+untouched. Tab indicators begin updating after the sidebar starts its status
+daemon for the first time.
 
 ## How it works
 
@@ -121,7 +150,7 @@ cargo test          # unit tests
 cargo build --release
 ```
 
-The `bin/ymir-agent-sidebar` launcher prefers an existing release binary,
+The `bin/tmux-agent-switcher` launcher prefers an existing release binary,
 otherwise downloads a prebuilt one, otherwise builds from source. Editing
 `src/` and reopening the sidebar picks up your changes.
 
@@ -132,12 +161,12 @@ repo; unchecked ones need a published release or external accounts.
 
 - [x] Scope to the shippable product (Rust crate + launchers + tmux entry point); leave personal dotfiles and superseded scripts out
 - [x] Neutralize hardcoded personal paths in test fixtures
-- [x] TPM entry point (`ymir-agent-sidebar.tmux`) with a tmux-version guard and configurable keys
+- [x] TPM entry point (`tmux-agent-switcher.tmux`) with a tmux-version guard and configurable keys
 - [x] Launcher prefers a prebuilt binary, downloads on first run, falls back to `cargo build`
 - [x] Release workflow builds per-platform binaries (macOS arm64/x86_64, Linux musl x86_64/aarch64) and attaches them to GitHub Releases
 - [x] `LICENSE` (MIT)
 - [x] README with install, usage, requirements, and the detection caveat
-- [x] Keybindings overridable via `@agent_sidebar_*` options
+- [x] Keybindings overridable via `@agent_switcher_*` options
 - [x] CI runs `cargo test` on macOS + Linux
 - [ ] Add a demo GIF to the README
 - [ ] Headless smoke test of the status daemon in CI
