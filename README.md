@@ -13,7 +13,7 @@ and a status badge on any pane running an agent: **Working**, **Blocked**
 > never wraps, shims, or launches your agents. You run `claude`/`codex` as usual;
 > the sidebar reads tmux and the process table.
 
-<!-- TODO: add a demo GIF here (biggest win for adoption). -->
+![tmux-agent-switcher showing agent statuses and a live Codex pane preview](assets/demo.png)
 
 ## Features
 
