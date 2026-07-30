@@ -7,7 +7,7 @@
 # first use, from the launcher script).
 #
 # Options (set before this plugin is loaded):
-#   set -g @agent_switcher_key 'C-n'   # optional extra key that opens the sidebar
+#   set -g @agent_switcher_key 'C-n'   # key that opens the sidebar (default C-n)
 #   set -g @agent_switcher_nav 'on'    # vim-aware C-h/C-j/C-k/C-l nav (default on)
 #   set -g @agent_switcher_tab_status 'on' # agent indicator in window tabs (default on)
 set -euo pipefail
@@ -32,7 +32,7 @@ if [[ -n "$version" ]]; then
   fi
 fi
 
-open_key="$(tmux show-option -gqv @agent_switcher_key)"
+open_key="$(tmux_option @agent_switcher_key C-n)"
 nav="$(tmux_option @agent_switcher_nav on)"
 tab_status="$(tmux_option @agent_switcher_tab_status on)"
 
@@ -53,8 +53,7 @@ configure_tab_status() {
 configure_tab_status window-status-format
 configure_tab_status window-status-current-format
 
-# Optional extra opener. By default C-j/C-k are the open keys, so no dedicated
-# C-n binding is installed unless the user explicitly asks for one.
+# Dedicated switcher opener.
 if [[ -n "$open_key" ]]; then
   tmux unbind-key -n "$open_key" 2>/dev/null || true
   tmux bind-key -n "$open_key" run-shell -b "$POPUP '#{window_id}' '#{session_name}'"
@@ -64,13 +63,13 @@ if [[ "$nav" == "on" ]]; then
   # Vim-aware navigation: pass C-h/j/k/l through to Vim when the focused pane
   # runs it, otherwise:
   #   C-h / C-l  move panes (or wrap to prev/next window at an edge)
-  #   C-j / C-k  open the sidebar
+  #   C-j / C-k  switch to the next/previous session
   is_vim="ps -o state= -o comm= -t '#{pane_tty}' | grep -iqE '^[^TXZ ]+ +(\\S+/)?g?(view|n?vim?x?)(diff)?\$'"
 
   tmux bind-key -n C-h if-shell "$is_vim" "send-keys C-h" "if -F '#{pane_at_left}' 'previous-window' 'select-pane -L'"
   tmux bind-key -n C-l if-shell "$is_vim" "send-keys C-l" "if -F '#{pane_at_right}' 'next-window' 'select-pane -R'"
-  tmux bind-key -n C-j if-shell "$is_vim" "send-keys C-j" "run-shell -b \"$POPUP '#{window_id}' '#{session_name}'\""
-  tmux bind-key -n C-k if-shell "$is_vim" "send-keys C-k" "run-shell -b \"$POPUP '#{window_id}' '#{session_name}'\""
+  tmux bind-key -n C-j if-shell "$is_vim" "send-keys C-j" "switch-client -n"
+  tmux bind-key -n C-k if-shell "$is_vim" "send-keys C-k" "switch-client -p"
 
   # Keep the nav keys from being swallowed by tmux's tree-mode.
   tmux unbind-key -q -T tree-mode C-j 2>/dev/null || true

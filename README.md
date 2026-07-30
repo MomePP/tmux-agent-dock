@@ -3,7 +3,7 @@
 A tmux sidebar that lets you switch between windows **and** keep an eye on your
 running AI coding agents (Claude Code and Codex) from one full-screen popup.
 
-Press <kbd>Ctrl</kbd>+<kbd>j</kbd> or <kbd>Ctrl</kbd>+<kbd>k</kbd> and you get a list of every window across all
+Press <kbd>Ctrl</kbd>+<kbd>n</kbd> and you get a list of every window across all
 your sessions on the left, a live preview of the selected window on the right,
 and a status badge on any pane running an agent: **Working**, **Blocked**
 (waiting on you), or **Idle** (done). Jump straight to the agent that needs you.
@@ -24,8 +24,8 @@ and a status badge on any pane running an agent: **Working**, **Blocked**
   agent is waiting on input.
 - **Tab status indicators**: the same rolled-up agent state is appended to each
   tmux window tab without replacing your existing tab format.
-- **Vim-aware navigation**: <kbd>Ctrl</kbd>+<kbd>h/j/k/l</kbd> move between panes
-  and windows but pass through to Vim/Neovim when it's focused.
+- **Vim-aware navigation**: <kbd>Ctrl</kbd>+<kbd>h/j/k/l</kbd> move between panes,
+  windows, and sessions but pass through to Vim/Neovim when it's focused.
 - **No daemon to babysit**: a lightweight background poller starts itself the
   first time you open the sidebar and keeps agent state fresh.
 
@@ -77,25 +77,36 @@ cargo install --git https://github.com/Ymirke/tmux-agent-switcher
 
 | Key | Action |
 | --- | --- |
-| <kbd>Ctrl</kbd>+<kbd>j</kbd> / <kbd>Ctrl</kbd>+<kbd>k</kbd> | Open the sidebar (pass through to Vim if focused) |
+| <kbd>Ctrl</kbd>+<kbd>n</kbd> | Open the sidebar |
+| <kbd>Ctrl</kbd>+<kbd>j</kbd> / <kbd>Ctrl</kbd>+<kbd>k</kbd> | Switch to the next / previous session (pass through to Vim if focused) |
 | <kbd>Ctrl</kbd>+<kbd>h</kbd> / <kbd>Ctrl</kbd>+<kbd>l</kbd> | Move panes / wrap to prev/next window (pass through to Vim if focused) |
 
-Inside the switcher, typing **filters the windows fuzzily** (telescope.nvim
-style) — matching session name, window name, process, and directory — from a
-prompt at the bottom of the list. <kbd>↑</kbd>/<kbd>↓</kbd> move the selection
-for previewing, <kbd>Ctrl</kbd>+<kbd>j</kbd>/<kbd>k</kbd> opens the next/previous
-window directly, <kbd>Enter</kbd> jumps to the selected window, and
-<kbd>Esc</kbd> clears the filter, then closes.
+Inside the switcher, Vim mode is the default. Bare <kbd>j/k</kbd> moves the
+highlight, and a count such as <kbd>10j</kbd>/<kbd>10k</kbd> immediately opens
+the relative window. Window rows show Vim-style relative numbers: the selected
+window is <kbd>0</kbd>, and every other number is its distance above or below
+it.
 
-- <kbd>Tab</kbd> toggles the input mode: **search** (default; typing filters) or
-  **keys** (Vim-style bindings: bare <kbd>j/k</kbd> moves the highlight, while a
-  count such as <kbd>4j</kbd>/<kbd>4k</kbd> immediately opens the window at that
-  relative number; <kbd>n</kbd>/<kbd>N</kbd> creates a window/session and
-  <kbd>q</kbd> closes).
+- <kbd>Tab</kbd> cycles **Vim**, **numbers**, and **search** modes. Keeping the
+  numeric shortcuts separate means the first digit of <kbd>10j</kbd> is never
+  mistaken for session 1.
+- Numbers mode labels sessions and their windows from 1. Press <kbd>2</kbd>,
+  then <kbd>5</kbd> to open the fifth window in session 2. A comma remains
+  optional, and <kbd>Enter</kbd> commits an ambiguous multi-digit window prefix.
+- Search mode filters windows fuzzily (telescope.nvim style), matching session
+  name, window name, process, and directory. <kbd>Esc</kbd> clears the filter,
+  then closes.
+- <kbd>↑</kbd>/<kbd>↓</kbd> move the selection for previewing,
+  <kbd>Ctrl</kbd>+<kbd>j</kbd>/<kbd>k</kbd> opens the next/previous window
+  directly, and <kbd>Enter</kbd> jumps to the selected window.
+- In Vim or Numbers mode, <kbd>r</kbd> opens an editable prompt prefilled with
+  the selected window's current name; <kbd>Enter</kbd> applies the rename and
+  <kbd>Esc</kbd> cancels. Arrow keys, Home/End, Backspace, and Delete edit the
+  field.
 - <kbd>H</kbd>/<kbd>L</kbd> move between session edges: first and last in the
   current session, then first and last in the previous or next session.
-- Window rows use Vim-style relative numbers: the selected window is
-  <kbd>0</kbd>, and every other number is its distance above or below it.
+- <kbd>Shift</kbd>+<kbd>J</kbd>/<kbd>K</kbd> swaps the selected session down or
+  up in the list. The custom order lasts for the tmux server's lifetime.
 - <kbd>Shift</kbd>+<kbd>Tab</kbd> cycles the view: the left-docked **sidebar**,
   a right-docked **sidebar-right**, or a **palette** floating just above the
   middle of the screen with the selected window previewed full-screen behind
@@ -109,10 +120,10 @@ window directly, <kbd>Enter</kbd> jumps to the selected window, and
 Set these **before** the plugin loads:
 
 ```tmux
-set -g @agent_switcher_key 'C-n'       # optional extra key that opens the sidebar
+set -g @agent_switcher_key 'C-n'       # key that opens the sidebar (default: C-n)
 set -g @agent_switcher_nav 'on'        # vim-aware C-h/C-j/C-k/C-l nav (default: on)
 set -g @agent_switcher_view 'sidebar'  # 'sidebar' (left), 'sidebar-right' (right) or 'palette' (floating)
-set -g @agent_switcher_input 'search'  # 'search' (type to filter) or 'keys' ([count]j/k)
+set -g @agent_switcher_input 'keys'    # 'keys' (default), 'numbers', or 'search'
 set -g @agent_switcher_tab_status 'on' # show agent state in tmux window tabs
 ```
 
