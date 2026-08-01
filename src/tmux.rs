@@ -172,6 +172,19 @@ pub fn rename_window(window_id: &str, window_name: &str) -> Result<()> {
     tmux_status(Command::new("tmux").args(["rename-window", "-t", window_id, window_name]))
 }
 
+/// Swaps two windows' positions. `-d` keeps each session's current window
+/// current, so reordering behind the popup never changes what is focused.
+pub fn swap_windows(source_window_id: &str, target_window_id: &str) -> Result<()> {
+    tmux_status(Command::new("tmux").args([
+        "swap-window",
+        "-d",
+        "-s",
+        source_window_id,
+        "-t",
+        target_window_id,
+    ]))
+}
+
 pub fn create_window(session_name: &str, window_name: &str) -> Result<()> {
     let output = Command::new("tmux")
         .args([
@@ -284,7 +297,7 @@ mod tests {
 
     #[test]
     fn parses_cached_agent_status_from_pane_rows() {
-        let panes = parse_panes("%1\t@1\t1\tcodex\t/tmp\t⠋ working\t123\tcodex\tworking\t1\t1000\t\t\n%2\t@1\t0\tzsh\t/tmp\t\t124\tclaude\tidle\t0\t\t\t\n").unwrap();
+        let panes = parse_panes("%1\t@1\t1\tcodex\t/tmp\t⠋ working\t123\tcodex\tworking\t1\t1000\t\t\n%2\t@1\t0\tzsh\t/tmp\t\t124\tclaude\tidle\t0\t\t\t\n%3\t@2\t1\topencode\t/tmp\tOC | task\t125\topencode\tblocked\t1\t2000\t\t\n").unwrap();
 
         assert_eq!(panes[0].pane_pid, Some(123));
         assert_eq!(
@@ -303,6 +316,15 @@ mod tests {
                 state: AgentState::Idle,
                 seen: false,
                 run_started_at: None,
+            }
+        );
+        assert_eq!(
+            panes[2].agent_status,
+            AgentStatus {
+                agent: Some(AgentKind::OpenCode),
+                state: AgentState::Blocked,
+                seen: true,
+                run_started_at: Some(2000),
             }
         );
     }

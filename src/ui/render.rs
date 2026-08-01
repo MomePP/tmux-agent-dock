@@ -40,6 +40,7 @@ pub(crate) fn draw(
     input: InputMode,
     show_help: bool,
     query: &str,
+    pending_vim_count: Option<usize>,
     prompt: Option<&PromptState>,
     preview: &PreviewMirror,
     spinner_frame: usize,
@@ -72,6 +73,7 @@ pub(crate) fn draw(
             state,
             input,
             query,
+            pending_vim_count,
             spinner_frame,
         );
     }
@@ -174,6 +176,7 @@ pub(crate) fn render_compact_with_mode(
     state: &GridState,
     input: InputMode,
     numbered_input: &str,
+    pending_vim_count: Option<usize>,
     spinner_frame: usize,
 ) {
     let lines = compact_lines(sessions);
@@ -199,6 +202,10 @@ pub(crate) fn render_compact_with_mode(
         numbered_session_index(numbered_input, sessions)
     } else {
         None
+    };
+    let pending_vim_prefix = match (input, pending_vim_count) {
+        (InputMode::Keys, Some(count)) => Some(count.to_string()),
+        _ => None,
     };
     let start = state.row_offset.min(lines.len().saturating_sub(1));
     let visible_rows = (area.height as usize).min(lines.len().saturating_sub(start));
@@ -276,12 +283,30 @@ pub(crate) fn render_compact_with_mode(
                 } else {
                     card_position.abs_diff(selected_position)
                 };
+                let matching_prefix_len = pending_vim_prefix.as_ref().and_then(|prefix| {
+                    display_number
+                        .to_string()
+                        .starts_with(prefix.as_str())
+                        .then_some(prefix.len())
+                });
+                let vim_count_hint = match (input, matching_prefix_len) {
+                    (InputMode::Keys, Some(prefix_len)) => {
+                        match card_position.cmp(&selected_position) {
+                            std::cmp::Ordering::Less => VimCountHint::Up { prefix_len },
+                            std::cmp::Ordering::Greater => VimCountHint::Down { prefix_len },
+                            std::cmp::Ordering::Equal => VimCountHint::Idle,
+                        }
+                    }
+                    (InputMode::Keys, None) => VimCountHint::Idle,
+                    (InputMode::Search | InputMode::Numbers, _) => VimCountHint::Hidden,
+                };
                 frame.render_widget(
                     Paragraph::new(compact_tab_line(
                         card,
                         selected,
                         display_number,
                         number_width,
+                        vim_count_hint,
                         row_area.width,
                         spinner_frame,
                     ))
@@ -356,16 +381,50 @@ fn text_width(text: &str) -> u16 {
     text.chars().count().min(u16::MAX as usize) as u16
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VimCountHint {
+    Hidden,
+    Idle,
+    Up { prefix_len: usize },
+    Down { prefix_len: usize },
+}
+
+impl VimCountHint {
+    fn motion(self) -> &'static str {
+        match self {
+            Self::Hidden => "",
+            Self::Idle => " ",
+            Self::Up { .. } => "k",
+            Self::Down { .. } => "j",
+        }
+    }
+
+    fn highlighted_prefix_len(self) -> usize {
+        match self {
+            Self::Up { prefix_len } | Self::Down { prefix_len } => prefix_len,
+            Self::Hidden | Self::Idle => 0,
+        }
+    }
+}
+
 fn compact_tab_line(
     card: &WindowCard,
     selected: bool,
     relative_number: usize,
     number_width: usize,
+    vim_count_hint: VimCountHint,
     width: u16,
     spinner_frame: usize,
 ) -> Line<'static> {
     let now = unix_timestamp();
-    let label = compact_tab_left_text_at(card, relative_number, number_width, spinner_frame, now);
+    let label = compact_tab_left_text_at(
+        card,
+        relative_number,
+        number_width,
+        vim_count_hint,
+        spinner_frame,
+        now,
+    );
     let runtime = agent_runtime_cell(card.agent_status, now);
     let process = compact_tab_process_text(card);
     let right_width = text_width(&compact_tab_right_text(card, now)) as usize;
@@ -381,9 +440,27 @@ fn compact_tab_line(
     } else {
         agent_status_style(card.agent_status)
     };
+    let number = relative_number.to_string();
+    let highlighted_prefix_len = vim_count_hint.highlighted_prefix_len().min(number.len());
+    let (highlighted_prefix, number_suffix) = number.split_at(highlighted_prefix_len);
+    let number_padding = format!(" {}", " ".repeat(number_width.saturating_sub(number.len())));
 
     Line::from(vec![
-        Span::raw(format!(" {:>number_width$}", relative_number)),
+        Span::raw(number_padding),
+        Span::styled(
+            highlighted_prefix.to_owned(),
+            Style::default()
+                .fg(TMUX_ORANGE)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(number_suffix.to_owned()),
+        Span::styled(
+            vim_count_hint.motion(),
+            Style::default()
+                .fg(TMUX_ORANGE)
+                .add_modifier(Modifier::DIM)
+                .remove_modifier(Modifier::BOLD),
+        ),
         Span::raw(" "),
         Span::styled(
             agent_status_icon(card.agent_status, spinner_frame).to_owned(),
@@ -401,11 +478,13 @@ fn compact_tab_left_text_at(
     card: &WindowCard,
     relative_number: usize,
     number_width: usize,
+    vim_count_hint: VimCountHint,
     spinner_frame: usize,
     _now: u64,
 ) -> String {
+    let hint = vim_count_hint.motion();
     format!(
-        " {:>number_width$} {} {}",
+        " {:>number_width$}{hint} {} {}",
         relative_number,
         agent_status_icon(card.agent_status, spinner_frame),
         card.window_name
@@ -549,6 +628,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         "nums: session → window",
         "vim: j/k · [n]j/k open",
         "S-j/S-k: reorder session",
+        "M-j/M-k: reorder window",
         "H/L: previous/next edge",
         "↑/↓: move, C-j/C-k: open",
         "←/→: switch session",
@@ -652,6 +732,7 @@ mod tests {
             state,
             InputMode::Search,
             "",
+            None,
             spinner_frame,
         );
     }
@@ -681,6 +762,7 @@ mod tests {
             card,
             relative_number,
             relative_number.to_string().len(),
+            VimCountHint::Hidden,
             spinner_frame,
             now,
         );
@@ -728,6 +810,7 @@ mod tests {
                     false,
                     "",
                     None,
+                    None,
                     &test_preview(),
                     0,
                 )
@@ -763,6 +846,7 @@ mod tests {
                     InputMode::Search,
                     true,
                     "",
+                    None,
                     None,
                     &test_preview(),
                     0,
@@ -800,6 +884,7 @@ mod tests {
                     false,
                     "",
                     None,
+                    None,
                     &test_preview(),
                     0,
                 )
@@ -835,6 +920,7 @@ mod tests {
                     InputMode::Search,
                     false,
                     "",
+                    None,
                     None,
                     &test_preview(),
                     0,
@@ -880,6 +966,7 @@ mod tests {
                     false,
                     "zzz",
                     None,
+                    None,
                     &test_preview(),
                     0,
                 )
@@ -915,6 +1002,7 @@ mod tests {
                     true,
                     "",
                     None,
+                    None,
                     &test_preview(),
                     0,
                 )
@@ -934,6 +1022,7 @@ mod tests {
                     || row.contains("nums:")
                     || row.contains("vim:")
                     || row.contains("S-j/S-k:")
+                    || row.contains("M-j/M-k:")
                     || row.contains("H/L:")
                     || row.contains("C-j/C-k")
                     || row.contains("←/→")
@@ -944,7 +1033,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(help_rows.len(), 12);
+        assert_eq!(help_rows.len(), 13);
         assert!(help_rows
             .iter()
             .any(|row| row.contains("tab: vim / nums / search")));
@@ -960,6 +1049,9 @@ mod tests {
         assert!(help_rows
             .iter()
             .any(|row| row.contains("S-j/S-k: reorder session")));
+        assert!(help_rows
+            .iter()
+            .any(|row| row.contains("M-j/M-k: reorder window")));
         assert!(help_rows
             .iter()
             .any(|row| row.contains("H/L: previous/next edge")));
@@ -1002,6 +1094,7 @@ mod tests {
                     InputMode::Search,
                     false,
                     "",
+                    None,
                     Some(&prompt),
                     &test_preview(),
                     0,
@@ -1086,9 +1179,9 @@ mod tests {
             run_started_at: Some(unix_timestamp()),
         };
 
-        let line = compact_tab_line(&card, false, 0, 1, 32, 0);
-        let runtime = &line.spans[5];
-        let process = &line.spans[7];
+        let line = compact_tab_line(&card, false, 0, 1, VimCountHint::Hidden, 32, 0);
+        let runtime = &line.spans[8];
+        let process = &line.spans[10];
 
         assert!(runtime.content.ends_with(' '));
         assert_eq!(process.content, "zsh");
@@ -1169,6 +1262,7 @@ mod tests {
                     false,
                     "",
                     None,
+                    None,
                     &test_preview(),
                     0,
                 )
@@ -1215,6 +1309,7 @@ mod tests {
                     false,
                     "",
                     None,
+                    None,
                     &test_preview(),
                     0,
                 )
@@ -1248,6 +1343,7 @@ mod tests {
                     InputMode::Search,
                     false,
                     "",
+                    None,
                     None,
                     &test_preview(),
                     0,
@@ -1437,6 +1533,7 @@ mod tests {
                     &state,
                     InputMode::Keys,
                     "",
+                    None,
                     0,
                 );
             })
@@ -1448,6 +1545,94 @@ mod tests {
         assert_eq!(buffer.get(1, 2).symbol(), "0");
         assert_eq!(buffer.get(0, 3).symbol(), "o");
         assert_eq!(buffer.get(1, 4).symbol(), "1");
+    }
+
+    #[test]
+    fn pending_vim_count_highlights_matching_prefixes_and_ghosts_valid_motions() {
+        let cards = (1..=21)
+            .map(|index| test_card("work", &index.to_string()))
+            .collect();
+        let groups = group_cards_by_session(cards);
+        let mut state = GridState::new();
+        state.selected_column = 10;
+        let backend = TestBackend::new(80, 22);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| {
+                render_compact_with_mode(
+                    frame,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 80,
+                        height: 22,
+                    },
+                    &groups,
+                    &state,
+                    InputMode::Keys,
+                    "",
+                    Some(1),
+                    0,
+                );
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        // Distance 10 above: only the typed `1` prefix is highlighted.
+        assert_eq!(buffer.get(1, 1).symbol(), "1");
+        assert_eq!(buffer.get(1, 1).fg, TMUX_ORANGE);
+        assert_eq!(buffer.get(2, 1).symbol(), "0");
+        assert_eq!(buffer.get(2, 1).fg, Color::White);
+        assert_eq!(buffer.get(3, 1).symbol(), "k");
+        assert_eq!(buffer.get(3, 1).fg, TMUX_ORANGE);
+        assert!(buffer.get(3, 1).modifier.contains(Modifier::DIM));
+
+        // Exact distance 1 is also a match in both directions.
+        assert_eq!(buffer.get(2, 10).symbol(), "1");
+        assert_eq!(buffer.get(2, 10).fg, TMUX_ORANGE);
+        assert_eq!(buffer.get(3, 10).symbol(), "k");
+        assert_eq!(buffer.get(2, 12).symbol(), "1");
+        assert_eq!(buffer.get(2, 12).fg, TMUX_ORANGE);
+        assert_eq!(buffer.get(3, 12).symbol(), "j");
+
+        // Nonmatching distances stay quiet.
+        assert_eq!(buffer.get(2, 9).symbol(), "2");
+        assert_eq!(buffer.get(2, 9).fg, Color::White);
+        assert_eq!(buffer.get(3, 9).symbol(), " ");
+
+        // Distance 10 below gets the same prefix-only treatment.
+        assert_eq!(buffer.get(1, 21).symbol(), "1");
+        assert_eq!(buffer.get(1, 21).fg, TMUX_ORANGE);
+        assert_eq!(buffer.get(2, 21).symbol(), "0");
+        assert_eq!(buffer.get(2, 21).fg, Color::White);
+        assert_eq!(buffer.get(3, 21).symbol(), "j");
+
+        terminal
+            .draw(|frame| {
+                render_compact_with_mode(
+                    frame,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 80,
+                        height: 22,
+                    },
+                    &groups,
+                    &state,
+                    InputMode::Keys,
+                    "",
+                    None,
+                    0,
+                );
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer.get(1, 1).fg, Color::White);
+        assert_eq!(buffer.get(3, 1).symbol(), " ");
+        assert_eq!(buffer.get(1, 21).fg, Color::White);
+        assert_eq!(buffer.get(3, 21).symbol(), " ");
     }
 
     #[test]
@@ -1475,6 +1660,7 @@ mod tests {
                     &state,
                     InputMode::Numbers,
                     "",
+                    None,
                     0,
                 );
             })
@@ -1512,6 +1698,7 @@ mod tests {
                     &state,
                     InputMode::Numbers,
                     "2,",
+                    None,
                     0,
                 );
             })

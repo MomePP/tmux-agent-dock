@@ -5,6 +5,7 @@
 pub enum AgentKind {
     Codex,
     Claude,
+    OpenCode,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -118,6 +119,7 @@ pub(crate) fn parse_agent_kind(value: &str) -> Option<AgentKind> {
     match value {
         "codex" => Some(AgentKind::Codex),
         "claude" => Some(AgentKind::Claude),
+        "opencode" => Some(AgentKind::OpenCode),
         _ => None,
     }
 }
@@ -126,6 +128,7 @@ pub(crate) fn format_agent_kind(agent: Option<AgentKind>) -> &'static str {
     match agent {
         Some(AgentKind::Codex) => "codex",
         Some(AgentKind::Claude) => "claude",
+        Some(AgentKind::OpenCode) => "opencode",
         None => "",
     }
 }

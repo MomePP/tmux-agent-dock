@@ -20,7 +20,7 @@ const PALETTE_BOTTOM_PERCENT: u16 = 55;
 /// Rows the search bar occupies at the top of the list: the prompt line plus a
 /// separator rule under it.
 pub(crate) const SEARCH_BAR_ROWS: u16 = 2;
-pub(crate) const HELP_LINE_COUNT: u16 = 13;
+pub(crate) const HELP_LINE_COUNT: u16 = 14;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SwitcherLayout {

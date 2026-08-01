@@ -7,6 +7,8 @@ pub fn detect_agent_from_process_name(name: &str) -> Option<AgentKind> {
     let basename = name.rsplit('/').next().unwrap_or(name);
     if basename == "codex" || basename.starts_with("codex-") {
         Some(AgentKind::Codex)
+    } else if basename == "opencode" || basename.starts_with("opencode-") {
+        Some(AgentKind::OpenCode)
     } else if basename == "claude"
         || basename == "claude-code"
         || basename.starts_with("claude-")
@@ -43,6 +45,7 @@ pub fn detect_agent_state(agent: AgentKind, evidence: &AgentEvidence) -> AgentSt
     match agent {
         AgentKind::Codex => detect_codex_state(evidence),
         AgentKind::Claude => detect_claude_state(evidence),
+        AgentKind::OpenCode => detect_opencode_state(evidence),
     }
 }
 
@@ -53,6 +56,10 @@ pub(crate) fn detect_agent_state_from_title(agent: AgentKind, title: &str) -> Op
         AgentKind::Codex if starts_with_braille_status(title) => Some(AgentState::Working),
         AgentKind::Codex if !title.is_empty() => Some(AgentState::Idle),
         AgentKind::Claude if starts_with_braille_status(title) => Some(AgentState::Working),
+        // OpenCode's title is a static session label ("OpenCode" or "OC | …")
+        // and does not encode activity, so always fall through to screen-tail
+        // detection for it.
+        AgentKind::OpenCode => None,
         _ => None,
     }
 }
@@ -115,6 +122,55 @@ fn detect_claude_state(evidence: &AgentEvidence) -> AgentState {
     // Otherwise Claude is idle at its input prompt (title starts with ✳). The `❯`
     // input box is present while working too, so it is not an idle signal on its own.
     AgentState::Idle
+}
+
+fn detect_opencode_state(evidence: &AgentEvidence) -> AgentState {
+    // OpenCode renders all live state at the bottom of the TUI. Limit matching
+    // to that region so an old prompt or status line in the transcript cannot
+    // keep a settled session marked busy or blocked.
+    let recent = recent_screen(&evidence.screen_tail, 25);
+    let recent_lower = recent.to_lowercase();
+
+    // Permission prompts have a fixed heading and action labels. Question
+    // prompts are dynamic, but consistently pair an Enter action with
+    // "esc dismiss" while waiting for an answer.
+    let permission_prompt = recent_lower.contains("permission required")
+        && contains_any(&recent_lower, &["allow once", "allow always", "reject"]);
+    let question_prompt = recent_lower.contains("esc dismiss")
+        && contains_any(
+            &recent_lower,
+            &["enter submit", "enter confirm", "enter toggle"],
+        );
+    let blocked_at = if permission_prompt || question_prompt {
+        [
+            "permission required",
+            "allow once",
+            "allow always",
+            "reject",
+            "esc dismiss",
+        ]
+        .into_iter()
+        .filter_map(|marker| recent_lower.rfind(marker))
+        .max()
+    } else {
+        None
+    };
+
+    // Busy and retry states share the prompt footer's interrupt action. This
+    // text remains stable even when animations are disabled, unlike the
+    // preceding spinner frames. When a redraw briefly contains both old and
+    // new footers, whichever marker occurs last is the current state.
+    let working_at = ["esc interrupt", "esc again to interrupt"]
+        .into_iter()
+        .filter_map(|marker| recent_lower.rfind(marker))
+        .max();
+
+    match (blocked_at, working_at) {
+        (Some(blocked), Some(working)) if working > blocked => AgentState::Working,
+        (Some(_), _) => AgentState::Blocked,
+        (_, Some(_)) => AgentState::Working,
+        _ => AgentState::Idle,
+    }
 }
 
 /// True when the screen shows a Claude selection menu: the cursor (`❯`) rests on
@@ -185,7 +241,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detects_codex_and_claude_agent_states() {
+    fn detects_supported_agent_processes_and_states() {
         assert_eq!(
             detect_agent_from_process_name("/opt/bin/codex"),
             Some(AgentKind::Codex)
@@ -206,6 +262,14 @@ mod tests {
         assert_eq!(
             detect_agent_from_process_name("/Users/x/.local/share/claude/versions/2.1.197"),
             Some(AgentKind::Claude)
+        );
+        assert_eq!(
+            detect_agent_from_process_name("/Users/x/.opencode/bin/opencode"),
+            Some(AgentKind::OpenCode)
+        );
+        assert_eq!(
+            detect_agent_from_process_name("opencode-darwin-arm64"),
+            Some(AgentKind::OpenCode)
         );
         // Non-semver commands must not be mistaken for Claude.
         assert_eq!(detect_agent_from_process_name("zsh"), None);
@@ -233,6 +297,17 @@ mod tests {
             detect_agent_state(AgentKind::Claude, &claude),
             AgentState::Working
         );
+
+        let opencode = AgentEvidence {
+            screen_tail: "⬝⬝⬝⬝⬝⬝⬝⬝  esc interrupt".to_owned(),
+            osc_title: "OC | implement status support".to_owned(),
+            osc_progress: String::new(),
+            process_exited: false,
+        };
+        assert_eq!(
+            detect_agent_state(AgentKind::OpenCode, &opencode),
+            AgentState::Working
+        );
     }
 
     #[test]
@@ -256,6 +331,78 @@ mod tests {
         assert_eq!(
             detect_agent_state_from_title(AgentKind::Claude, "✳ review this"),
             None
+        );
+        assert_eq!(
+            detect_agent_state_from_title(AgentKind::OpenCode, "OC | working or idle"),
+            None
+        );
+    }
+
+    #[test]
+    fn opencode_permission_and_question_prompts_are_blocked() {
+        for screen_tail in [
+            [
+                "△ Permission required",
+                "Shell command",
+                "Allow once  Allow always  Reject",
+            ]
+            .join("\n"),
+            [
+                "Which database should we use?",
+                "1. Postgres",
+                "2. SQLite",
+                "enter submit  esc dismiss",
+            ]
+            .join("\n"),
+        ] {
+            let evidence = AgentEvidence {
+                screen_tail,
+                osc_title: "OC | choose a database".to_owned(),
+                osc_progress: String::new(),
+                process_exited: false,
+            };
+            assert_eq!(
+                detect_agent_state(AgentKind::OpenCode, &evidence),
+                AgentState::Blocked
+            );
+        }
+    }
+
+    #[test]
+    fn opencode_static_title_and_settled_prompt_are_idle() {
+        let evidence = AgentEvidence {
+            screen_tail: [
+                "The implementation is complete.",
+                "Build · Claude Sonnet 4",
+                "/Users/example/project  ctrl+p commands  • OpenCode 1.18.10",
+            ]
+            .join("\n"),
+            osc_title: "OC | implement status support".to_owned(),
+            osc_progress: String::new(),
+            process_exited: false,
+        };
+        assert_eq!(
+            detect_agent_state(AgentKind::OpenCode, &evidence),
+            AgentState::Idle
+        );
+    }
+
+    #[test]
+    fn opencode_latest_footer_wins_over_stale_prompt_text() {
+        let evidence = AgentEvidence {
+            screen_tail: [
+                "Reviewed UI text: enter submit  esc dismiss",
+                "Continuing implementation.",
+                "⬝⬝⬝⬝⬝⬝⬝⬝  esc interrupt",
+            ]
+            .join("\n"),
+            osc_title: "OC | inspect question UI".to_owned(),
+            osc_progress: String::new(),
+            process_exited: false,
+        };
+        assert_eq!(
+            detect_agent_state(AgentKind::OpenCode, &evidence),
+            AgentState::Working
         );
     }
 

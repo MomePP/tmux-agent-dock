@@ -31,18 +31,18 @@ use crate::{
     model::{SessionGroup, SwitcherAction, WindowCard},
     preview::PreviewMirror,
     search::{apply_query, delete_query_word, filter_sessions},
-    tmux::{current_window_id, env_tmux_value, rename_window, tmux_status},
+    tmux::{current_window_id, env_tmux_value, rename_window, swap_windows, tmux_status},
 };
 use layout::{compact_navigation_height, switcher_layout};
 use render::draw;
 use state::{
-    accept_numbered_session, compact_lines, format_input_mode, format_view_mode,
-    handle_prompt_key, initial_grid_state, keep_compact_selection_visible,
-    move_compact_selection, move_compact_session_edge, parse_input_mode, parse_view_mode,
-    push_movement_count, push_numbered_choice, refresh_sessions_from_cards, rename_card_in_place,
-    select_compact_relative, select_key_action, swap_selected_session, sync_numbered_selection,
-    take_counted_open_motion,
-    Direction, GridState, InputMode, NumberedOpen, PromptKind, PromptState, ViewMode,
+    accept_numbered_session, compact_lines, format_input_mode, format_view_mode, handle_prompt_key,
+    initial_grid_state, keep_compact_selection_visible, move_compact_selection,
+    move_compact_session_edge, parse_input_mode, parse_view_mode, push_matching_movement_count,
+    push_numbered_choice, refresh_sessions_from_cards, rename_card_in_place,
+    select_compact_relative, select_key_action, swap_selected_session, swap_selected_window,
+    sync_numbered_selection, take_counted_open_motion, Direction, GridState, InputMode,
+    NumberedOpen, PromptKind, PromptState, ViewMode,
 };
 
 const CARD_REFRESH_INTERVAL: Duration = Duration::from_millis(300);
@@ -251,7 +251,29 @@ impl SwitcherUi {
         if rename_window(window_id, window_name).is_err() {
             return;
         }
-        rename_card_in_place(&mut self.sessions, &mut self.filtered, window_id, window_name);
+        rename_card_in_place(
+            &mut self.sessions,
+            &mut self.filtered,
+            window_id,
+            window_name,
+        );
+    }
+
+    /// Moves the selected window one slot up or down within its session,
+    /// reordering the cached lists immediately and mirroring the swap in
+    /// tmux. Best-effort: if tmux rejects the swap (e.g. a window vanished),
+    /// the periodic card refresh restores tmux's real order within a beat.
+    fn move_selected_window(&mut self, direction: Direction, navigation_height: u16) {
+        if let Some((source, target)) = swap_selected_window(
+            &mut self.sessions,
+            &mut self.filtered,
+            &mut self.state,
+            &self.query,
+            direction,
+            navigation_height,
+        ) {
+            let _ = swap_windows(&source, &target);
+        }
     }
 
     fn handle_mouse(&mut self, kind: MouseEventKind, navigation_height: u16) {
@@ -304,13 +326,17 @@ impl SwitcherUi {
 
         let navigation_height = self.navigation_height(terminal_size);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
 
-        // A Vim-style count survives until j/k consumes it and opens the target.
+        // A Vim-style count survives until j/k consumes it or another digit
+        // leaves it with no matching relative target.
         let keys_count_key = self.input == InputMode::Keys
             && !ctrl
             && matches!(key.code, KeyCode::Char(ch) if ch.is_ascii_digit());
-        let keys_count_motion =
-            self.input == InputMode::Keys && !ctrl && matches!(key.code, KeyCode::Char('j' | 'k'));
+        let keys_count_motion = self.input == InputMode::Keys
+            && !ctrl
+            && !alt
+            && matches!(key.code, KeyCode::Char('j' | 'k'));
         if !keys_count_key && !keys_count_motion {
             self.movement_count = None;
         }
@@ -379,6 +405,15 @@ impl SwitcherUi {
                     self.refilter(navigation_height);
                 }
             }
+            KeyCode::Down | KeyCode::Up if alt => {
+                self.numbered_input.clear();
+                let direction = if key.code == KeyCode::Down {
+                    Direction::Down
+                } else {
+                    Direction::Up
+                };
+                self.move_selected_window(direction, navigation_height);
+            }
             KeyCode::Down => {
                 self.numbered_input.clear();
                 move_compact_selection(
@@ -418,6 +453,15 @@ impl SwitcherUi {
             KeyCode::Char(ch) if ctrl => {
                 self.numbered_input.clear();
                 return self.handle_ctrl_char(ch, navigation_height);
+            }
+            KeyCode::Char('j' | 'k') if alt => {
+                self.numbered_input.clear();
+                let direction = if key.code == KeyCode::Char('j') {
+                    Direction::Down
+                } else {
+                    Direction::Up
+                };
+                self.move_selected_window(direction, navigation_height);
             }
             KeyCode::Char('J' | 'K') => {
                 self.numbered_input.clear();
@@ -654,7 +698,12 @@ impl SwitcherUi {
                 );
             }
             _ if ch.is_ascii_digit() => {
-                push_movement_count(&mut self.movement_count, ch);
+                push_matching_movement_count(
+                    &mut self.movement_count,
+                    ch,
+                    &self.state,
+                    &self.filtered,
+                );
             }
             _ => {}
         }
@@ -709,6 +758,7 @@ fn run_tui_loop(
                 ui.input,
                 ui.show_help,
                 input_value,
+                ui.movement_count,
                 ui.prompt.as_ref(),
                 &preview,
                 spinner_frame,

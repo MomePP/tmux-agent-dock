@@ -517,6 +517,42 @@ pub(crate) fn push_movement_count(count: &mut Option<usize>, ch: char) -> bool {
     true
 }
 
+/// Extends a Vim movement count only while it remains a prefix of at least one
+/// relative window number. An unmatched digit clears the count so the next
+/// digit begins a fresh sequence.
+pub(crate) fn push_matching_movement_count(
+    count: &mut Option<usize>,
+    ch: char,
+    state: &GridState,
+    sessions: &[SessionGroup],
+) -> bool {
+    if !push_movement_count(count, ch) {
+        return false;
+    }
+
+    let positions = compact_card_positions(sessions);
+    let Some(selected_position) = positions
+        .iter()
+        .position(|&(row, column)| row == state.selected_row && column == state.selected_column)
+    else {
+        *count = None;
+        return false;
+    };
+    let prefix = count.unwrap_or_default().to_string();
+    let has_match = positions.iter().enumerate().any(|(position, _)| {
+        position != selected_position
+            && position
+                .abs_diff(selected_position)
+                .to_string()
+                .starts_with(&prefix)
+    });
+
+    if !has_match {
+        *count = None;
+    }
+    has_match
+}
+
 pub(crate) fn take_counted_open_motion(
     count: &mut Option<usize>,
     ch: char,
@@ -710,6 +746,59 @@ pub(crate) fn swap_selected_session(
     true
 }
 
+/// Swaps the selected window with its visible neighbour in the same session,
+/// keeping the selection on the moved window. Returns the swapped window ids
+/// (selected, neighbour) so the caller can mirror the move in tmux; `None`
+/// when the move would cross the session's edge.
+pub(crate) fn swap_selected_window(
+    sessions: &mut [SessionGroup],
+    filtered: &mut Vec<SessionGroup>,
+    state: &mut GridState,
+    query: &str,
+    direction: Direction,
+    terminal_height: u16,
+) -> Option<(String, String)> {
+    let session = filtered.get(state.selected_row)?;
+    let target_column = match direction {
+        Direction::Down if state.selected_column + 1 < session.cards.len() => {
+            state.selected_column + 1
+        }
+        Direction::Up if state.selected_column > 0 => state.selected_column - 1,
+        _ => return None,
+    };
+    let session_name = session.session_name.clone();
+    let selected_id = session.cards.get(state.selected_column)?.window_id.clone();
+    let target_id = session.cards[target_column].window_id.clone();
+
+    let full_session = sessions
+        .iter_mut()
+        .find(|session| session.session_name == session_name)?;
+    let selected_index = full_session
+        .cards
+        .iter()
+        .position(|card| card.window_id == selected_id)?;
+    let target_index = full_session
+        .cards
+        .iter()
+        .position(|card| card.window_id == target_id)?;
+
+    // tmux swap-window exchanges the windows' indexes along with their
+    // positions; mirror both so the cached cards stay accurate until the
+    // next refresh.
+    let selected_tmux_index = full_session.cards[selected_index].window_index.clone();
+    let target_tmux_index = std::mem::replace(
+        &mut full_session.cards[target_index].window_index,
+        selected_tmux_index,
+    );
+    full_session.cards[selected_index].window_index = target_tmux_index;
+    full_session.cards.swap(selected_index, target_index);
+
+    *filtered = filter_sessions(sessions, query);
+    *state = GridState::for_window_id(filtered, &selected_id);
+    keep_compact_selection_visible(state, filtered, terminal_height);
+    Some((selected_id, target_id))
+}
+
 pub(crate) fn refresh_sessions_from_cards(
     sessions: &mut Vec<SessionGroup>,
     filtered: &mut Vec<SessionGroup>,
@@ -778,7 +867,11 @@ pub(crate) fn rename_card_in_place(
     }
 }
 
-pub(crate) fn fallback_grid_state(sessions: &[SessionGroup], row: usize, column: usize) -> GridState {
+pub(crate) fn fallback_grid_state(
+    sessions: &[SessionGroup],
+    row: usize,
+    column: usize,
+) -> GridState {
     let mut state = GridState::new();
     state.selected_row = row.min(sessions.len().saturating_sub(1));
     let max_column = sessions
@@ -1138,6 +1231,79 @@ mod tests {
     }
 
     #[test]
+    fn swapping_window_moves_it_within_the_session_and_follows_it() {
+        let mut groups = group_cards_by_session(vec![
+            test_card("work", "1"),
+            test_card("work", "2"),
+            test_card("work", "3"),
+            test_card("ops", "1"),
+        ]);
+        let mut filtered = groups.clone();
+        let mut state = GridState::new();
+
+        assert_eq!(
+            swap_selected_window(
+                &mut groups,
+                &mut filtered,
+                &mut state,
+                "",
+                Direction::Down,
+                10,
+            ),
+            Some(("@work-1".to_owned(), "@work-2".to_owned()))
+        );
+
+        let names: Vec<&str> = groups[0]
+            .cards
+            .iter()
+            .map(|card| card.window_name.as_str())
+            .collect();
+        assert_eq!(names, ["window-2", "window-1", "window-3"]);
+        // The selection follows the moved window, and the tmux indexes stay
+        // with the slots (as swap-window leaves them).
+        assert_eq!(state.selected_column, 1);
+        assert_eq!(state.selected_card(&filtered).unwrap().window_id, "@work-1");
+        assert_eq!(groups[0].cards[0].window_index, "1");
+        assert_eq!(groups[0].cards[1].window_index, "2");
+    }
+
+    #[test]
+    fn swapping_window_clamps_at_the_session_edges() {
+        let mut groups = group_cards_by_session(vec![
+            test_card("work", "1"),
+            test_card("work", "2"),
+            test_card("ops", "1"),
+        ]);
+        let mut filtered = groups.clone();
+        let mut state = GridState::new();
+
+        assert_eq!(
+            swap_selected_window(
+                &mut groups,
+                &mut filtered,
+                &mut state,
+                "",
+                Direction::Up,
+                10
+            ),
+            None
+        );
+        state.selected_column = 1;
+        // The last window stays put instead of crossing into the next session.
+        assert_eq!(
+            swap_selected_window(
+                &mut groups,
+                &mut filtered,
+                &mut state,
+                "",
+                Direction::Down,
+                10,
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn compact_navigation_uses_terminal_height_for_vertical_viewport() {
         let groups = group_cards_by_session(vec![
             test_card("one", "1"),
@@ -1297,6 +1463,36 @@ mod tests {
         let mut leading_zero = None;
         assert!(!push_movement_count(&mut leading_zero, '0'));
         assert_eq!(leading_zero, None);
+    }
+
+    #[test]
+    fn unmatched_keys_mode_count_resets_before_the_next_sequence() {
+        let cards = (1..=13)
+            .map(|index| test_card("work", &index.to_string()))
+            .collect();
+        let groups = group_cards_by_session(cards);
+        let mut state = GridState::new();
+        state.selected_column = 11;
+        let mut count = None;
+
+        assert!(push_matching_movement_count(
+            &mut count, '1', &state, &groups
+        ));
+        assert_eq!(count, Some(1));
+        assert!(push_matching_movement_count(
+            &mut count, '1', &state, &groups
+        ));
+        assert_eq!(count, Some(11));
+
+        assert!(!push_matching_movement_count(
+            &mut count, '1', &state, &groups
+        ));
+        assert_eq!(count, None);
+
+        assert!(push_matching_movement_count(
+            &mut count, '1', &state, &groups
+        ));
+        assert_eq!(count, Some(1));
     }
 
     #[test]

@@ -1,7 +1,8 @@
 # tmux-agent-switcher
 
 A tmux sidebar that lets you switch between windows **and** keep an eye on your
-running AI coding agents (Claude Code and Codex) from one full-screen popup.
+running AI coding agents (Claude Code, Codex, and OpenCode) from one full-screen
+popup.
 
 Press <kbd>Ctrl</kbd>+<kbd>n</kbd> and you get a list of every window across all
 your sessions on the left, a live preview of the selected window on the right,
@@ -10,8 +11,8 @@ and a status badge on any pane running an agent: **Working**, **Blocked**
 
 > [!NOTE]
 > Detection is **fully passive** (see [How it works](#how-it-works)). The plugin
-> never wraps, shims, or launches your agents. You run `claude`/`codex` as usual;
-> the sidebar reads tmux and the process table.
+> never wraps, shims, or launches your agents. You run `claude`, `codex`, or
+> `opencode` as usual; the sidebar reads tmux and the process table.
 
 ![tmux-agent-switcher showing agent statuses and a live Codex pane preview](assets/demo.png)
 
@@ -19,9 +20,9 @@ and a status badge on any pane running an agent: **Working**, **Blocked**
 
 - **Cross-session window switcher** in a full-screen popup with a live, scaled
   preview of the highlighted window.
-- **Agent monitoring**: each pane running Claude Code or Codex is tagged
-  Working / Blocked / Idle, with a run timer, so you can see at a glance which
-  agent is waiting on input.
+- **Agent monitoring**: each pane running Claude Code, Codex, or OpenCode is
+  tagged Working / Blocked / Idle, with a run timer, so you can see at a glance
+  which agent is waiting on input.
 - **Tab status indicators**: the same rolled-up agent state is appended to each
   tmux window tab without replacing your existing tab format.
 - **Vim-aware navigation**: <kbd>Ctrl</kbd>+<kbd>h/j/k/l</kbd> move between panes,
@@ -33,8 +34,8 @@ and a status badge on any pane running an agent: **Working**, **Blocked**
 
 - **tmux ≥ 3.3** (for `display-popup -B -e`)
 - **bash** and **ps** (present on macOS and Linux)
-- One or more agents (`claude`, `codex`) running inside tmux panes. That's all
-  detection needs; launch them however you like.
+- One or more agents (`claude`, `codex`, `opencode`) running inside tmux panes.
+  That's all detection needs; launch them however you like.
 - To build from source: a **Rust toolchain** (only needed if no prebuilt binary
   exists for your platform; see below).
 
@@ -85,7 +86,9 @@ Inside the switcher, Vim mode is the default. Bare <kbd>j/k</kbd> moves the
 highlight, and a count such as <kbd>10j</kbd>/<kbd>10k</kbd> immediately opens
 the relative window. Window rows show Vim-style relative numbers: the selected
 window is <kbd>0</kbd>, and every other number is its distance above or below
-it.
+it. After you type a count, matching relative-number prefixes are highlighted
+and a dim <kbd>j</kbd> or <kbd>k</kbd> shows which targets remain available. A
+prefix that matches no window cancels itself, so the next digit starts fresh.
 
 - <kbd>Tab</kbd> cycles **Vim**, **numbers**, and **search** modes. Keeping the
   numeric shortcuts separate means the first digit of <kbd>10j</kbd> is never
@@ -107,6 +110,10 @@ it.
   current session, then first and last in the previous or next session.
 - <kbd>Shift</kbd>+<kbd>J</kbd>/<kbd>K</kbd> swaps the selected session down or
   up in the list. The custom order lasts for the tmux server's lifetime.
+- <kbd>Alt</kbd>+<kbd>j</kbd>/<kbd>k</kbd> (or <kbd>Alt</kbd>+<kbd>↓</kbd>/<kbd>↑</kbd>)
+  moves the selected window down or up within its session, like moving a line
+  in an editor. The move runs through `swap-window`, so tmux keeps the new
+  order itself.
 - <kbd>Shift</kbd>+<kbd>Tab</kbd> cycles the view: the left-docked **sidebar**,
   a right-docked **sidebar-right**, or a **palette** floating just above the
   middle of the screen with the selected window previewed full-screen behind
@@ -141,17 +148,17 @@ The plugin observes; it never intercepts. Agent state comes from:
 - `tmux capture-pane`: the visible screen text, and
 - a `ps` process-tree snapshot that attributes agents to panes.
 
-**Working** is inferred from the agent's activity spinner, **Blocked** from an
-on-screen prompt/selection awaiting input, and **Idle** once activity settles
-(with debouncing so a single stray sample can't flash a false "done"). There are
-no wrappers, shims, PID files, FIFOs, `LD_PRELOAD`, or log scraping around your
-agents.
+**Working** is inferred from the agent's on-screen activity indicators,
+**Blocked** from a prompt/selection awaiting input, and **Idle** once activity
+settles (with debouncing so a single stray sample can't flash a false "done").
+There are no wrappers, shims, PID files, FIFOs, `LD_PRELOAD`, or log scraping
+around your agents.
 
 > [!WARNING]
 > Because detection reads the agents' on-screen output, it is **heuristic and
-> version-sensitive**: a Claude/Codex UI change, a custom theme, or a non-English
-> locale can throw off state classification. It's best-effort and expected to
-> need occasional upkeep as the agent CLIs evolve.
+> version-sensitive**: a Claude/Codex/OpenCode UI change, a custom theme, or a
+> non-English locale can throw off state classification. It's best-effort and
+> expected to need occasional upkeep as the agent CLIs evolve.
 
 ## Development
 
