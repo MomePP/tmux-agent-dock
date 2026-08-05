@@ -198,7 +198,6 @@ pub(crate) fn format_expanded(expanded: &HashSet<String>) -> String {
 
 /// Which section the keyboard is driving. The other keeps its cursor and
 /// scroll position and renders dim.
-#[allow(dead_code)] // Agents variant constructed by Task 6 (key handling)
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SectionFocus {
     Sessions,
@@ -206,7 +205,6 @@ pub(crate) enum SectionFocus {
 }
 
 impl SectionFocus {
-    #[allow(dead_code)] // Consumed by Task 6 (key handling)
     pub(crate) fn toggled(self) -> Self {
         match self {
             Self::Sessions => Self::Agents,

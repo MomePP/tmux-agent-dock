@@ -43,7 +43,8 @@ use layout::{compact_navigation_height, switcher_layout};
 use pane::Pane;
 use render::draw;
 use sections::{
-    agent_rows, format_expanded, parse_expanded, row_key, session_rows, Row, SectionFocus,
+    agent_rows, format_expanded, parse_expanded, row_key, session_rows, Row, RowKind,
+    SectionFocus,
 };
 use state::{
     accept_numbered_session, compact_lines, format_input_mode, format_view_mode, handle_prompt_key,
@@ -153,7 +154,6 @@ fn initial_expanded() -> HashSet<String> {
     parse_expanded(&value)
 }
 
-#[allow(dead_code)] // Consumed by Task 5 (UI state)
 fn persist_expanded(expanded: &HashSet<String>) {
     let _ = tmux_status(Command::new("tmux").args([
         "set-option",
@@ -223,7 +223,6 @@ impl SwitcherUi {
     /// True while a view backed by the two sections is active. `palette` keeps
     /// the flat `GridState` list, so every sections-specific key path checks
     /// this first.
-    #[allow(dead_code)] // Consumed by Task 6 (key handling) and Task 7 (rendering)
     fn uses_sections(&self) -> bool {
         matches!(self.view, ViewMode::Sidebar | ViewMode::SidebarRight)
     }
@@ -265,7 +264,6 @@ impl SwitcherUi {
         }
     }
 
-    #[allow(dead_code)] // Consumed by Task 6 (key handling)
     fn focused_pane_mut(&mut self) -> &mut Pane<Row> {
         match self.focus {
             SectionFocus::Sessions => &mut self.sessions_pane,
@@ -276,6 +274,37 @@ impl SwitcherUi {
     #[allow(dead_code)] // Consumed by Task 6 (key handling)
     fn selected_row(&self) -> Option<&Row> {
         self.focused_pane().selected()
+    }
+
+    /// Expands the selected session. On a window row this does nothing — the
+    /// row is already the expansion.
+    fn toggle_expanded(&mut self) {
+        let Some(Row {
+            kind: RowKind::Session { name, .. },
+            ..
+        }) = self.sessions_pane.selected()
+        else {
+            return;
+        };
+        let name = name.clone();
+        self.expanded.insert(name);
+        persist_expanded(&self.expanded);
+        self.rebuild_panes();
+    }
+
+    /// Collapses the selected session, or the session owning the selected
+    /// window row.
+    fn collapse_selected(&mut self) {
+        let Some(row) = self.sessions_pane.selected() else {
+            return;
+        };
+        let name = match &row.kind {
+            RowKind::Session { name, .. } => name.clone(),
+            _ => row.target.session_name.clone(),
+        };
+        self.expanded.remove(&name);
+        persist_expanded(&self.expanded);
+        self.rebuild_panes();
     }
 
     /// The list viewport height used for scrolling, derived from the current
@@ -480,17 +509,20 @@ impl SwitcherUi {
                     return Some(Some(action));
                 }
             }
-            KeyCode::Tab => {
+            KeyCode::Tab if self.uses_sections() => {
+                if !self.agents_pane.is_empty() {
+                    self.focus = self.focus.toggled();
+                }
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                // Shift-Tab cycles the input mode, and plain Tab still does in
+                // the palette, which has no sections to focus. This must stay
+                // non-printable: in Search mode every printable key is text and
+                // Esc closes the switcher rather than leaving the mode, so this
+                // is the only way out.
                 self.input = self.input.toggled();
                 self.numbered_input.clear();
                 persist_input_mode(self.input);
-                let navigation_height = self.navigation_height(terminal_size);
-                keep_compact_selection_visible(&mut self.state, &self.filtered, navigation_height);
-            }
-            KeyCode::BackTab => {
-                self.numbered_input.clear();
-                self.view = self.view.toggled();
-                persist_view_mode(self.view);
                 let navigation_height = self.navigation_height(terminal_size);
                 keep_compact_selection_visible(&mut self.state, &self.filtered, navigation_height);
             }
@@ -514,39 +546,55 @@ impl SwitcherUi {
             }
             KeyCode::Down => {
                 self.numbered_input.clear();
-                move_compact_selection(
-                    &mut self.state,
-                    &self.filtered,
-                    Direction::Down,
-                    navigation_height,
-                );
+                if self.uses_sections() {
+                    self.focused_pane_mut().move_by(1);
+                } else {
+                    move_compact_selection(
+                        &mut self.state,
+                        &self.filtered,
+                        Direction::Down,
+                        navigation_height,
+                    );
+                }
             }
             KeyCode::Up => {
                 self.numbered_input.clear();
-                move_compact_selection(
-                    &mut self.state,
-                    &self.filtered,
-                    Direction::Up,
-                    navigation_height,
-                );
+                if self.uses_sections() {
+                    self.focused_pane_mut().move_by(-1);
+                } else {
+                    move_compact_selection(
+                        &mut self.state,
+                        &self.filtered,
+                        Direction::Up,
+                        navigation_height,
+                    );
+                }
             }
             KeyCode::Left => {
                 self.numbered_input.clear();
-                move_compact_selection(
-                    &mut self.state,
-                    &self.filtered,
-                    Direction::Left,
-                    navigation_height,
-                );
+                if self.uses_sections() {
+                    self.collapse_selected();
+                } else {
+                    move_compact_selection(
+                        &mut self.state,
+                        &self.filtered,
+                        Direction::Left,
+                        navigation_height,
+                    );
+                }
             }
             KeyCode::Right => {
                 self.numbered_input.clear();
-                move_compact_selection(
-                    &mut self.state,
-                    &self.filtered,
-                    Direction::Right,
-                    navigation_height,
-                );
+                if self.uses_sections() {
+                    self.toggle_expanded();
+                } else {
+                    move_compact_selection(
+                        &mut self.state,
+                        &self.filtered,
+                        Direction::Right,
+                        navigation_height,
+                    );
+                }
             }
             KeyCode::Char(ch) if ctrl => {
                 self.numbered_input.clear();
@@ -737,13 +785,24 @@ impl SwitcherUi {
             '?' => self.toggle_help(terminal_size),
             'n' => self.open_new_window_prompt(),
             'N' => self.open_new_session_prompt(),
+            'v' => {
+                self.numbered_input.clear();
+                self.view = self.view.toggled();
+                persist_view_mode(self.view);
+                let navigation_height = self.navigation_height(terminal_size);
+                keep_compact_selection_visible(&mut self.state, &self.filtered, navigation_height);
+            }
             'h' => {
-                move_compact_selection(
-                    &mut self.state,
-                    &self.filtered,
-                    Direction::Left,
-                    navigation_height,
-                );
+                if self.uses_sections() {
+                    self.collapse_selected();
+                } else {
+                    move_compact_selection(
+                        &mut self.state,
+                        &self.filtered,
+                        Direction::Left,
+                        navigation_height,
+                    );
+                }
             }
             'H' => {
                 move_compact_session_edge(
@@ -754,6 +813,11 @@ impl SwitcherUi {
                 );
             }
             'j' | 'k' => {
+                if self.uses_sections() {
+                    let delta = if ch == 'j' { 1 } else { -1 };
+                    self.focused_pane_mut().move_by(delta);
+                    return None;
+                }
                 if let Some((direction, count)) =
                     take_counted_open_motion(&mut self.movement_count, ch)
                 {
@@ -780,12 +844,16 @@ impl SwitcherUi {
                 }
             }
             'l' => {
-                move_compact_selection(
-                    &mut self.state,
-                    &self.filtered,
-                    Direction::Right,
-                    navigation_height,
-                );
+                if self.uses_sections() {
+                    self.toggle_expanded();
+                } else {
+                    move_compact_selection(
+                        &mut self.state,
+                        &self.filtered,
+                        Direction::Right,
+                        navigation_height,
+                    );
+                }
             }
             'L' => {
                 move_compact_session_edge(
@@ -957,5 +1025,91 @@ mod tests {
         ui.rebuild_panes();
 
         assert_eq!(ui.sessions_pane.len(), 3);
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    fn size() -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 40,
+        }
+    }
+
+    #[test]
+    fn tab_moves_focus_between_the_sections() {
+        let mut agent = test_card("dotfiles", "0");
+        agent.agent_status = AgentStatus {
+            agent: Some(AgentKind::Claude),
+            state: AgentState::Working,
+            seen: true,
+            run_started_at: None,
+        };
+        let mut ui = ui_with(vec![agent]);
+
+        ui.handle_key(key(KeyCode::Tab), size());
+        assert_eq!(ui.focus, SectionFocus::Agents);
+
+        ui.handle_key(key(KeyCode::Tab), size());
+        assert_eq!(ui.focus, SectionFocus::Sessions);
+    }
+
+    #[test]
+    fn tab_does_nothing_when_no_agent_is_running() {
+        let mut ui = ui_with(vec![test_card("dotfiles", "0")]);
+
+        ui.handle_key(key(KeyCode::Tab), size());
+
+        assert_eq!(ui.focus, SectionFocus::Sessions);
+    }
+
+    #[test]
+    fn l_expands_and_h_collapses_the_selected_session() {
+        let mut ui = ui_with(vec![test_card("dotfiles", "0"), test_card("dotfiles", "1")]);
+        assert_eq!(ui.sessions_pane.len(), 1);
+
+        ui.handle_key(key(KeyCode::Char('l')), size());
+        assert_eq!(ui.sessions_pane.len(), 3);
+        assert!(ui.expanded.contains("dotfiles"));
+
+        ui.handle_key(key(KeyCode::Char('h')), size());
+        assert_eq!(ui.sessions_pane.len(), 1);
+        assert!(!ui.expanded.contains("dotfiles"));
+    }
+
+    #[test]
+    fn h_on_a_child_row_collapses_its_parent_session() {
+        let mut ui = ui_with(vec![test_card("dotfiles", "0"), test_card("dotfiles", "1")]);
+        ui.handle_key(key(KeyCode::Char('l')), size());
+        // Move onto the first window row.
+        ui.handle_key(key(KeyCode::Char('j')), size());
+
+        ui.handle_key(key(KeyCode::Char('h')), size());
+
+        assert!(!ui.expanded.contains("dotfiles"));
+        assert_eq!(ui.sessions_pane.len(), 1);
+    }
+
+    #[test]
+    fn j_and_k_stay_inside_the_focused_section() {
+        let mut agent = test_card("dotfiles", "0");
+        agent.agent_status = AgentStatus {
+            agent: Some(AgentKind::Claude),
+            state: AgentState::Working,
+            seen: true,
+            run_started_at: None,
+        };
+        let mut ui = ui_with(vec![agent, test_card("gogo", "0")]);
+
+        // Two session rows; j moves to the second and stops there.
+        ui.handle_key(key(KeyCode::Char('j')), size());
+        assert_eq!(ui.sessions_pane.cursor, 1);
+        ui.handle_key(key(KeyCode::Char('j')), size());
+        assert_eq!(ui.sessions_pane.cursor, 1);
+        assert_eq!(ui.focus, SectionFocus::Sessions);
     }
 }
