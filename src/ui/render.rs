@@ -11,6 +11,8 @@ use ratatui::{
 
 use super::{
     layout::{inset_rect, switcher_layout_for_input},
+    pane::Pane,
+    sections::{section_heights, Row, RowKind, SectionFocus},
     state::{
         char_byte_index, compact_card_positions, compact_lines, numbered_session_index,
         CompactLine, GridState, InputMode, PromptState, ViewMode,
@@ -44,6 +46,9 @@ pub(crate) fn draw(
     prompt: Option<&PromptState>,
     preview: &PreviewMirror,
     spinner_frame: usize,
+    sessions_pane: &Pane<Row>,
+    agents_pane: &Pane<Row>,
+    focus: SectionFocus,
 ) {
     let layout = switcher_layout_for_input(
         frame.size(),
@@ -63,7 +68,16 @@ pub(crate) fn draw(
     );
     render_modal_top_bar(frame, layout.list_overlay);
     render_search_bar(frame, layout.search, query, input);
-    if sessions.is_empty() {
+    if matches!(view, ViewMode::Sidebar | ViewMode::SidebarRight) {
+        render_sections(
+            frame,
+            layout.sessions,
+            sessions_pane,
+            agents_pane,
+            focus,
+            spinner_frame,
+        );
+    } else if sessions.is_empty() {
         render_no_matches(frame, layout.sessions);
     } else {
         render_compact_with_mode(
@@ -166,6 +180,120 @@ fn render_selected_preview(frame: &mut Frame, area: Rect, preview: &PreviewMirro
     }
 
     frame.render_widget(Paragraph::new(preview.text.clone()), area);
+}
+
+/// Draws the Sessions and Agents sections into `body`. The unfocused section
+/// is dimmed so it is obvious which one the keyboard drives.
+pub(crate) fn render_sections(
+    frame: &mut Frame,
+    body: Rect,
+    sessions: &Pane<Row>,
+    agents: &Pane<Row>,
+    focus: SectionFocus,
+    spinner_frame: usize,
+) {
+    let (sessions_area, agents_area) = section_heights(body, agents.len());
+
+    render_section(
+        frame,
+        sessions_area,
+        "Sessions",
+        sessions,
+        focus == SectionFocus::Sessions,
+        spinner_frame,
+    );
+
+    if let Some(agents_area) = agents_area {
+        render_section(
+            frame,
+            agents_area,
+            "Agents",
+            agents,
+            focus == SectionFocus::Agents,
+            spinner_frame,
+        );
+    }
+}
+
+fn render_section(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    pane: &Pane<Row>,
+    focused: bool,
+    spinner_frame: usize,
+) {
+    if area.height == 0 {
+        return;
+    }
+
+    let title_style = Style::default().fg(Color::DarkGray);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(title.to_owned(), title_style))),
+        Rect {
+            height: 1,
+            ..area
+        },
+    );
+
+    let rows_area = Rect {
+        y: area.y.saturating_add(1),
+        height: area.height.saturating_sub(1),
+        ..area
+    };
+    if rows_area.height == 0 {
+        return;
+    }
+
+    let visible = pane.visible_range(rows_area.height as usize);
+    let lines: Vec<Line> = pane.items()[visible.clone()]
+        .iter()
+        .enumerate()
+        .map(|(offset, row)| {
+            let selected = focused && visible.start + offset == pane.cursor;
+            section_row_line(row, selected, focused, spinner_frame)
+        })
+        .collect();
+
+    frame.render_widget(Paragraph::new(lines), rows_area);
+}
+
+fn section_row_line(row: &Row, selected: bool, focused: bool, spinner_frame: usize) -> Line<'static> {
+    let icon = agent_status_icon(row.status, spinner_frame);
+    let body = match &row.kind {
+        RowKind::Session {
+            name,
+            window_count,
+            attached,
+            ..
+        } => format!(
+            "{name} {window_count}{}",
+            if *attached { " \u{25b8}" } else { "" }
+        ),
+        RowKind::Window {
+            index,
+            name,
+            last_child,
+        } => format!(
+            "  {} {index}: {name}",
+            if *last_child { "\u{2514}\u{2500}>" } else { "\u{251c}\u{2500}>" }
+        ),
+        RowKind::Agent { window_name, tool } => format!("{window_name}  {tool}"),
+    };
+
+    let mut style = if focused {
+        Style::default()
+    } else {
+        Style::default().add_modifier(Modifier::DIM)
+    };
+    if selected {
+        style = style.add_modifier(Modifier::REVERSED);
+    }
+
+    Line::from(vec![
+        Span::styled(format!("{icon} "), agent_status_style(row.status)),
+        Span::styled(body, style),
+    ])
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -710,12 +838,24 @@ mod tests {
         test_support::test_card,
         ui::state::PromptKind,
     };
+    use crate::ui::pane::Pane;
+    use crate::ui::sections::{agent_rows, session_rows, SectionFocus};
+    use std::collections::HashSet;
 
     fn test_preview() -> PreviewMirror {
         PreviewMirror {
             text: Text::from("preview"),
             ..PreviewMirror::default()
         }
+    }
+
+    /// The Sessions/Agents panes `draw` now expects, built the same way
+    /// `SwitcherUi::rebuild_panes` builds them from the loaded cards.
+    fn panes_from(groups: &[SessionGroup]) -> (Pane<Row>, Pane<Row>) {
+        (
+            Pane::new(session_rows(groups, &HashSet::new(), None)),
+            Pane::new(agent_rows(groups)),
+        )
     }
 
     fn render_compact(
@@ -797,6 +937,7 @@ mod tests {
     fn draw_uses_modal_top_bar_without_bottom_status_line() {
         let groups = group_cards_by_session(vec![test_card("work", "1")]);
         let state = GridState::new();
+        let (sessions_pane, agents_pane) = panes_from(&groups);
         let backend = TestBackend::new(100, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
@@ -813,6 +954,9 @@ mod tests {
                     None,
                     &test_preview(),
                     0,
+                    &sessions_pane,
+                    &agents_pane,
+                    SectionFocus::Sessions,
                 )
             })
             .unwrap();
@@ -834,6 +978,7 @@ mod tests {
     fn draw_renders_shortcuts_under_sessions_when_help_is_open() {
         let groups = group_cards_by_session(vec![test_card("work", "1")]);
         let state = GridState::new();
+        let (sessions_pane, agents_pane) = panes_from(&groups);
         let backend = TestBackend::new(100, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
@@ -850,6 +995,9 @@ mod tests {
                     None,
                     &test_preview(),
                     0,
+                    &sessions_pane,
+                    &agents_pane,
+                    SectionFocus::Sessions,
                 )
             })
             .unwrap();
@@ -868,9 +1016,10 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_sessions_are_pushed_to_bottom_when_content_is_short() {
+    fn sidebar_sections_render_top_anchored_inside_the_modal() {
         let groups = group_cards_by_session(vec![test_card("work", "1")]);
         let state = GridState::new();
+        let (sessions_pane, agents_pane) = panes_from(&groups);
         let backend = TestBackend::new(100, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
@@ -887,6 +1036,9 @@ mod tests {
                     None,
                     &test_preview(),
                     0,
+                    &sessions_pane,
+                    &agents_pane,
+                    SectionFocus::Sessions,
                 )
             })
             .unwrap();
@@ -896,10 +1048,12 @@ mod tests {
         assert_eq!(buffer.get(27, 0).symbol(), "┐");
         assert_eq!(buffer.get(0, 39).symbol(), "└");
         assert_eq!(buffer.get(27, 39).symbol(), "┘");
-        // List sits just above the bottom search bar (separator + prompt).
-        assert_eq!(buffer.get(2, 34).symbol(), "w");
-        assert_eq!(buffer.get(3, 35).symbol(), "0");
-        assert_eq!(buffer.get(5, 35).symbol(), "○");
+        // Sections render top-anchored (unlike the old compact list, which
+        // pushed short content down to the search bar): the "Sessions" title
+        // sits right under the top border, with the row directly beneath it.
+        assert_eq!(buffer.get(2, 2).symbol(), "S");
+        assert_eq!(buffer.get(2, 3).symbol(), "○");
+        assert_eq!(buffer.get(4, 3).symbol(), "w");
         assert_eq!(buffer.get(2, 36).symbol(), "─");
         assert_eq!(buffer.get(2, 37).symbol(), "❯");
     }
@@ -908,6 +1062,7 @@ mod tests {
     fn draw_renders_palette_box_over_fullscreen_preview() {
         let groups = group_cards_by_session(vec![test_card("work", "1")]);
         let state = GridState::new();
+        let (sessions_pane, agents_pane) = panes_from(&groups);
         let backend = TestBackend::new(100, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
@@ -924,6 +1079,9 @@ mod tests {
                     None,
                     &test_preview(),
                     0,
+                    &sessions_pane,
+                    &agents_pane,
+                    SectionFocus::Sessions,
                 )
             })
             .unwrap();
@@ -953,6 +1111,7 @@ mod tests {
     fn draw_renders_query_text_and_no_matches_hint() {
         let groups = group_cards_by_session(Vec::new());
         let state = GridState::new();
+        let (sessions_pane, agents_pane) = panes_from(&groups);
         let backend = TestBackend::new(100, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
@@ -969,6 +1128,9 @@ mod tests {
                     None,
                     &test_preview(),
                     0,
+                    &sessions_pane,
+                    &agents_pane,
+                    SectionFocus::Sessions,
                 )
             })
             .unwrap();
@@ -989,6 +1151,7 @@ mod tests {
     fn help_renders_one_shortcut_per_row() {
         let groups = group_cards_by_session(vec![test_card("work", "1")]);
         let state = GridState::new();
+        let (sessions_pane, agents_pane) = panes_from(&groups);
         let backend = TestBackend::new(100, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
@@ -1005,6 +1168,9 @@ mod tests {
                     None,
                     &test_preview(),
                     0,
+                    &sessions_pane,
+                    &agents_pane,
+                    SectionFocus::Sessions,
                 )
             })
             .unwrap();
@@ -1081,6 +1247,7 @@ mod tests {
             },
             "server".to_owned(),
         );
+        let (sessions_pane, agents_pane) = panes_from(&groups);
 
         let backend = TestBackend::new(100, 40);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1098,6 +1265,9 @@ mod tests {
                     Some(&prompt),
                     &test_preview(),
                     0,
+                    &sessions_pane,
+                    &agents_pane,
+                    SectionFocus::Sessions,
                 )
             })
             .unwrap();
@@ -1248,6 +1418,7 @@ mod tests {
         selected.path = "/Users/example/project".to_owned();
         let groups = group_cards_by_session(vec![selected, test_card("ops", "1")]);
         let state = GridState::new();
+        let (sessions_pane, agents_pane) = panes_from(&groups);
 
         let backend = TestBackend::new(100, 40);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1265,6 +1436,9 @@ mod tests {
                     None,
                     &test_preview(),
                     0,
+                    &sessions_pane,
+                    &agents_pane,
+                    SectionFocus::Sessions,
                 )
             })
             .unwrap();
@@ -1276,10 +1450,12 @@ mod tests {
         assert_eq!(buffer.get(27, 0).symbol(), "┐");
         assert_eq!(buffer.get(0, 39).symbol(), "└");
         assert_eq!(buffer.get(27, 39).symbol(), "┘");
-        assert_eq!(buffer.get(2, 32).symbol(), "w");
-        assert_eq!(buffer.get(3, 33).symbol(), "0");
-        assert_eq!(buffer.get(5, 33).symbol(), "○");
-        assert_eq!(buffer.get(2, 34).symbol(), "o");
+        // Sections render top-anchored: "Sessions" title, then one row per
+        // session, both starting right under the top border.
+        assert_eq!(buffer.get(2, 2).symbol(), "S");
+        assert_eq!(buffer.get(4, 3).symbol(), "w");
+        assert_eq!(buffer.get(2, 3).symbol(), "○");
+        assert_eq!(buffer.get(4, 4).symbol(), "o");
 
         let modal_top = (0..100)
             .map(|x| buffer.get(x, 0).symbol())
@@ -1292,6 +1468,7 @@ mod tests {
     fn draw_clears_preview_through_right_edge() {
         let groups = group_cards_by_session(vec![test_card("work", "1")]);
         let state = GridState::new();
+        let (sessions_pane, agents_pane) = panes_from(&groups);
         let backend = TestBackend::new(100, 8);
         let mut terminal = Terminal::new(backend).unwrap();
         let stale = "x".repeat(100);
@@ -1312,6 +1489,9 @@ mod tests {
                     None,
                     &test_preview(),
                     0,
+                    &sessions_pane,
+                    &agents_pane,
+                    SectionFocus::Sessions,
                 )
             })
             .unwrap();
@@ -1330,6 +1510,7 @@ mod tests {
         selected.preview = vec!["last shell line".to_owned()];
         let groups = group_cards_by_session(vec![selected]);
         let state = GridState::new();
+        let (sessions_pane, agents_pane) = panes_from(&groups);
 
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -1347,6 +1528,9 @@ mod tests {
                     None,
                     &test_preview(),
                     0,
+                    &sessions_pane,
+                    &agents_pane,
+                    SectionFocus::Sessions,
                 )
             })
             .unwrap();
@@ -1752,5 +1936,51 @@ mod tests {
         assert_eq!(buffer.get(3, 2).symbol(), "○");
         assert_eq!(buffer.get(5, 2).symbol(), "w");
         assert_eq!(buffer.get(0, 2).bg, Color::White);
+    }
+
+    #[test]
+    fn sections_render_titles_and_rows_in_both_halves() {
+        let mut agent_card = crate::test_support::test_card("dotfiles", "0");
+        agent_card.window_name = "config".to_owned();
+        agent_card.agent_status = AgentStatus {
+            agent: Some(AgentKind::Claude),
+            state: AgentState::Working,
+            seen: true,
+            run_started_at: None,
+        };
+        let sessions_group = vec![SessionGroup {
+            session_name: "dotfiles".to_owned(),
+            cards: vec![agent_card],
+        }];
+        let sessions = Pane::new(session_rows(&sessions_group, &HashSet::new(), None));
+        let agents = Pane::new(agent_rows(&sessions_group));
+
+        let backend = ratatui::backend::TestBackend::new(28, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_sections(
+                    frame,
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 28,
+                        height: 12,
+                    },
+                    &sessions,
+                    &agents,
+                    SectionFocus::Sessions,
+                    0,
+                );
+            })
+            .unwrap();
+
+        let rendered = terminal.backend().buffer().content();
+        let text: String = rendered.iter().map(|cell| cell.symbol()).collect();
+
+        assert!(text.contains("Sessions"), "missing Sessions title: {text}");
+        assert!(text.contains("Agents"), "missing Agents title: {text}");
+        assert!(text.contains("dotfiles"), "missing session row: {text}");
+        assert!(text.contains("claude"), "missing agent row: {text}");
     }
 }

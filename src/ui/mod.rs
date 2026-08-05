@@ -39,12 +39,12 @@ use crate::{
     search::{apply_query, delete_query_word, filter_sessions},
     tmux::{current_window_id, env_tmux_value, rename_window, swap_windows, tmux_output, tmux_status},
 };
-use layout::{compact_navigation_height, switcher_layout};
+use layout::{compact_navigation_height, switcher_layout, switcher_layout_for_input};
 use pane::Pane;
 use render::draw;
 use sections::{
-    agent_rows, format_expanded, parse_expanded, row_key, session_rows, Row, RowKind,
-    SectionFocus,
+    agent_rows, format_expanded, parse_expanded, row_key, section_heights, session_rows, Row,
+    RowKind, SectionFocus,
 };
 use state::{
     accept_numbered_session, compact_lines, format_input_mode, format_view_mode, handle_prompt_key,
@@ -256,7 +256,7 @@ impl SwitcherUi {
         }
     }
 
-    #[allow(dead_code)] // Consumed by Task 6 (key handling) and Task 7 (rendering)
+    #[allow(dead_code)] // Consumed by a later task (open/select the focused row)
     fn focused_pane(&self) -> &Pane<Row> {
         match self.focus {
             SectionFocus::Sessions => &self.sessions_pane,
@@ -894,6 +894,39 @@ fn queue_full_repaint(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> 
     Ok(())
 }
 
+/// Scrolls the Sessions and Agents panes so their cursors stay inside the
+/// window `render_sections` is about to draw.
+///
+/// `Pane::move_by` only moves the cursor; nothing calls `Pane::keep_visible`
+/// to follow it with the scroll offset, and `Pane::visible_range` is a pure
+/// function of that offset — so without this, driving a cursor past the
+/// bottom of a section walks it out of the visible rows with no way for
+/// rendering alone to bring it back. Must run before every `draw` while a
+/// sections view is active.
+fn keep_sections_visible(ui: &mut SwitcherUi, terminal_size: Rect) {
+    if !ui.uses_sections() {
+        return;
+    }
+
+    let body = switcher_layout_for_input(
+        terminal_size,
+        ui.show_help,
+        ui.view,
+        compact_lines(&ui.filtered).len(),
+        ui.input,
+    )
+    .sessions;
+    let (sessions_area, agents_area) = section_heights(body, ui.agents_pane.len());
+
+    // Each section spends one row on its title before the rows start.
+    ui.sessions_pane
+        .keep_visible(sessions_area.height.saturating_sub(1) as usize);
+    if let Some(agents_area) = agents_area {
+        ui.agents_pane
+            .keep_visible(agents_area.height.saturating_sub(1) as usize);
+    }
+}
+
 fn run_tui_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     cards: Vec<WindowCard>,
@@ -927,6 +960,7 @@ fn run_tui_loop(
             last_full_redraw = now;
         }
         let spinner_frame = spinner_started_at.elapsed().as_millis() as usize / 120;
+        keep_sections_visible(&mut ui, terminal.size()?);
         let input_value = if ui.input == InputMode::Numbers {
             ui.numbered_input.as_str()
         } else {
@@ -945,6 +979,9 @@ fn run_tui_loop(
                 ui.prompt.as_ref(),
                 &preview,
                 spinner_frame,
+                &ui.sessions_pane,
+                &ui.agents_pane,
+                ui.focus,
             )
         })?;
 
@@ -1111,5 +1148,50 @@ mod tests {
         ui.handle_key(key(KeyCode::Char('j')), size());
         assert_eq!(ui.sessions_pane.cursor, 1);
         assert_eq!(ui.focus, SectionFocus::Sessions);
+    }
+
+    /// `Pane::move_by` only moves the cursor — nothing calls `Pane::keep_visible`
+    /// to scroll the offset along with it — so a cursor driven past the bottom
+    /// of a short viewport would otherwise walk off the visible rows with no
+    /// way for rendering (which only sees `&Pane`) to recover it. This drives
+    /// the cursor to the last of many session rows in a viewport far too short
+    /// to show them all, then asserts `keep_sections_visible` scrolled the pane
+    /// so the cursor is still inside `visible_range`.
+    #[test]
+    fn scrolling_the_cursor_past_the_viewport_keeps_it_visible() {
+        let cards: Vec<WindowCard> = (0..20)
+            .map(|index| test_card(&format!("session-{index}"), "0"))
+            .collect();
+        let mut ui = ui_with(cards);
+        let small = Rect {
+            x: 0,
+            y: 0,
+            width: 28,
+            height: 12,
+        };
+        assert_eq!(ui.sessions_pane.len(), 20);
+
+        for _ in 0..19 {
+            ui.handle_key(key(KeyCode::Char('j')), small);
+        }
+        assert_eq!(ui.sessions_pane.cursor, 19);
+
+        keep_sections_visible(&mut ui, small);
+
+        let body = switcher_layout_for_input(
+            small,
+            ui.show_help,
+            ui.view,
+            compact_lines(&ui.filtered).len(),
+            ui.input,
+        )
+        .sessions;
+        let (sessions_area, _) = section_heights(body, ui.agents_pane.len());
+        let row_height = sessions_area.height.saturating_sub(1) as usize;
+
+        assert!(ui
+            .sessions_pane
+            .visible_range(row_height)
+            .contains(&ui.sessions_pane.cursor));
     }
 }
