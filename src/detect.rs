@@ -5,19 +5,27 @@ use crate::model::{AgentEvidence, AgentKind, AgentState};
 
 pub fn detect_agent_from_process_name(name: &str) -> Option<AgentKind> {
     let basename = name.rsplit('/').next().unwrap_or(name);
-    if basename == "codex" || basename.starts_with("codex-") {
+    if is_agent_binary(basename, "codex") {
         Some(AgentKind::Codex)
-    } else if basename == "opencode" || basename.starts_with("opencode-") {
+    } else if is_agent_binary(basename, "opencode") {
         Some(AgentKind::OpenCode)
-    } else if basename == "claude"
-        || basename == "claude-code"
-        || basename.starts_with("claude-")
-        || is_claude_version_name(basename)
-    {
+    } else if is_agent_binary(basename, "claude") || is_claude_version_name(basename) {
         Some(AgentKind::Claude)
     } else {
         None
     }
+}
+
+/// Matches the agent's own binary plus any `-`/`_` suffixed variant of it:
+/// `claude-code` for the packaged build, and per-slot clone shims like
+/// `claude_1` / `claude_2`, which sidekick.nvim needs on `$PATH` to run several
+/// sessions of one tool side by side. Anything else sharing the prefix
+/// (`codexify`) is left alone.
+fn is_agent_binary(basename: &str, agent: &str) -> bool {
+    let Some(suffix) = basename.strip_prefix(agent) else {
+        return false;
+    };
+    matches!(suffix.chars().next(), None | Some('-') | Some('_'))
 }
 
 /// Claude Code's native installer runs the versioned binary at
@@ -271,8 +279,19 @@ mod tests {
             detect_agent_from_process_name("opencode-darwin-arm64"),
             Some(AgentKind::OpenCode)
         );
+        // Per-slot clone shims (sidekick.nvim symlinks these onto $PATH).
+        assert_eq!(
+            detect_agent_from_process_name("/Users/x/.local/bin/claude_1"),
+            Some(AgentKind::Claude)
+        );
+        assert_eq!(
+            detect_agent_from_process_name("opencode_2"),
+            Some(AgentKind::OpenCode)
+        );
         // Non-semver commands must not be mistaken for Claude.
         assert_eq!(detect_agent_from_process_name("zsh"), None);
+        // A prefix match without a separator is a different program.
+        assert_eq!(detect_agent_from_process_name("codexify"), None);
         assert_eq!(detect_agent_from_process_name("2.1"), None);
         assert_eq!(detect_agent_from_process_name("node"), None);
 

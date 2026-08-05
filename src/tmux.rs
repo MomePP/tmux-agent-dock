@@ -12,7 +12,7 @@ use anyhow::{anyhow, Context, Result};
 
 use crate::{
     cards::{codex_unread_dir, codex_unread_file},
-    daemon::mark_window_seen,
+    daemon::{mark_pane_seen, mark_window_seen},
     model::{
         parse_agent_kind, parse_agent_state, AgentKind, AgentState, AgentStatus, SwitcherAction,
         TmuxPane, TmuxWindow,
@@ -150,6 +150,13 @@ pub fn select_card(card: &crate::model::WindowCard) -> Result<()> {
     tmux_status(Command::new("tmux").args(["select-pane", "-t", &card.target_pane_id]))?;
     clear_unread_for_pane(&card.target_pane_id);
     mark_window_seen(&card.window_id);
+    // Panes folded in from an embedded session are what this card's "done" mark
+    // came from, and selecting the card is how you reach them — so clear them
+    // too, or the mark can never be dismissed.
+    for pane_id in &card.folded_pane_ids {
+        clear_unread_for_pane(pane_id);
+        mark_pane_seen(pane_id);
+    }
     Ok(())
 }
 

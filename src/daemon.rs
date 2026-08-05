@@ -15,11 +15,15 @@ use anyhow::{Context, Result};
 use crate::{
     cards::rollup_agent_status,
     detect::{detect_agent_from_process_name, detect_agent_state, detect_agent_state_from_title},
+    embed::{embedded_session_hosts, folded_panes},
     model::{
         format_agent_kind, format_agent_state, AgentEvidence, AgentKind, AgentState, AgentStatus,
         TmuxPane,
     },
-    tmux::{parse_panes, set_pane_option, shell_quote, tmux_output, tmux_status, unix_timestamp},
+    tmux::{
+        parse_panes, parse_windows, set_pane_option, shell_quote, tmux_output, tmux_status,
+        unix_timestamp,
+    },
 };
 
 const STATUS_DAEMON_INTERVAL: Duration = Duration::from_millis(300);
@@ -99,24 +103,31 @@ pub fn poll_agent_status_once(debounce: &mut HashMap<String, Debounce>) -> Resul
 
     let now = unix_timestamp();
     let live: HashSet<String> = panes.iter().map(|pane| pane.pane_id.clone()).collect();
-    // Built lazily: only needed when a pane that was an agent no longer reports
-    // one as its foreground command, to tell an exit from a foreground subprocess.
+    // Built lazily, at most once per poll: needed whenever a pane's foreground
+    // command is not itself an agent, to look for one deeper in the pane.
     let mut processes: Option<ProcessTree> = None;
 
     for pane in &mut panes {
         let previous = pane.agent_status;
         let agent = match detect_agent_from_process_name(&pane.pane_current_command) {
             Some(agent) => Some(agent),
-            // The foreground command is no longer an agent. Keep the previous agent
-            // only while the agent process is genuinely still alive under this pane
-            // (e.g. it spawned a foreground child); otherwise treat it as exited so
-            // the pane doesn't latch to a stale "claude idle". If the process table
-            // can't be read this poll, keep the previous agent rather than clearing
-            // it — a transient `ps` failure shouldn't drop a live agent to unknown.
-            None => previous.agent.filter(|_| {
+            // The foreground command is not an agent, which says little on its own:
+            // the agent may be running under a wrapper (a login shell, or the
+            // `$SHELL -c "claude …"` tmux uses when a session is created with a
+            // command — how sidekick.nvim's mux backend spawns one), or it may have
+            // just exited. Look for one anywhere under the pane to tell those apart,
+            // so a wrapped agent is detected and an exited one stops latching a
+            // stale "claude idle". If the process table can't be read this poll,
+            // keep the previous agent — a transient `ps` failure shouldn't drop a
+            // live agent to unknown.
+            None => {
                 let tree = processes.get_or_insert_with(ProcessTree::snapshot);
-                tree.is_empty() || tree.has_agent_descendant(pane.pane_pid)
-            }),
+                if tree.is_empty() {
+                    previous.agent
+                } else {
+                    tree.agent_descendant(pane.pane_pid)
+                }
+            }
         };
         let next = if let Some(agent) = agent {
             let raw = detect_agent_state_from_title(agent, &pane.pane_title).unwrap_or_else(|| {
@@ -140,7 +151,19 @@ pub fn poll_agent_status_once(debounce: &mut HashMap<String, Debounce>) -> Resul
         pane.agent_status = next;
     }
 
-    write_window_status_icons(&panes)?;
+    // The status line reads these per window, so an embedded session's agent has
+    // to be attributed to the window hosting it — nothing else shows the window
+    // it actually runs in.
+    let windows = parse_windows(&tmux_output(&[
+        "list-windows",
+        "-a",
+        "-F",
+        "#{window_id}\t#{session_name}\t#{window_index}\t#{window_name}\t#{window_flags}",
+    ])?)?;
+    let processes = processes.get_or_insert_with(ProcessTree::snapshot);
+    let embedded = embedded_session_hosts(&windows, &panes, processes.parents());
+    write_window_status_icons(&panes, &folded_panes(&windows, &panes, &embedded))?;
+
     debounce.retain(|pane_id, _| live.contains(pane_id));
     Ok(())
 }
@@ -179,15 +202,17 @@ fn process_exists(pid: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// A snapshot of the process table used to decide whether an agent is still
-/// running under a pane once its foreground command stops looking like one.
-struct ProcessTree {
+/// A snapshot of the process table, used to find the agent running under a pane
+/// when the pane's own foreground command isn't one, and to trace a tmux client
+/// back to the pane it was launched from (see [`crate::embed`]).
+pub(crate) struct ProcessTree {
     children: HashMap<u32, Vec<u32>>,
-    agent_pids: HashSet<u32>,
+    parents: HashMap<u32, u32>,
+    agents: HashMap<u32, AgentKind>,
 }
 
 impl ProcessTree {
-    fn snapshot() -> Self {
+    pub(crate) fn snapshot() -> Self {
         let output = Command::new("ps")
             .args(["-Ao", "pid=,ppid=,comm="])
             .output()
@@ -199,7 +224,8 @@ impl ProcessTree {
 
     fn parse(output: &str) -> Self {
         let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
-        let mut agent_pids = HashSet::new();
+        let mut parents = HashMap::new();
+        let mut agents = HashMap::new();
         for line in output.lines() {
             let mut fields = line.split_whitespace();
             let (Some(pid), Some(ppid)) = (fields.next(), fields.next()) else {
@@ -209,41 +235,46 @@ impl ProcessTree {
                 continue;
             };
             children.entry(ppid).or_default().push(pid);
-            if detect_agent_from_process_name(fields.next().unwrap_or_default()).is_some() {
-                agent_pids.insert(pid);
+            parents.insert(pid, ppid);
+            if let Some(agent) = detect_agent_from_process_name(fields.next().unwrap_or_default()) {
+                agents.insert(pid, agent);
             }
         }
         Self {
             children,
-            agent_pids,
+            parents,
+            agents,
         }
     }
 
     /// True when the snapshot captured no processes at all, i.e. `ps` failed or
     /// produced nothing — a signal to treat its answers as unavailable.
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.children.is_empty()
     }
 
-    /// True if `root` or any of its descendants is an agent process.
-    fn has_agent_descendant(&self, root: Option<u32>) -> bool {
-        let Some(root) = root else {
-            return false;
-        };
+    /// pid -> parent pid, for walking a process back up to its ancestors.
+    pub(crate) fn parents(&self) -> &HashMap<u32, u32> {
+        &self.parents
+    }
+
+    /// The agent `root` or any of its descendants is running, if any.
+    fn agent_descendant(&self, root: Option<u32>) -> Option<AgentKind> {
+        let root = root?;
         let mut stack = vec![root];
         let mut seen = HashSet::new();
         while let Some(pid) = stack.pop() {
             if !seen.insert(pid) {
                 continue;
             }
-            if self.agent_pids.contains(&pid) {
-                return true;
+            if let Some(agent) = self.agents.get(&pid) {
+                return Some(*agent);
             }
             if let Some(children) = self.children.get(&pid) {
                 stack.extend(children.iter().copied());
             }
         }
-        false
+        None
     }
 }
 
@@ -405,13 +436,17 @@ fn status_option_updates(
     updates
 }
 
-fn window_status_icons(panes: &[TmuxPane]) -> HashMap<String, &'static str> {
+fn window_status_icons(
+    panes: &[TmuxPane],
+    folded: &HashMap<&str, Vec<&TmuxPane>>,
+) -> HashMap<String, &'static str> {
     let mut statuses: HashMap<&str, Vec<AgentStatus>> = HashMap::new();
     for pane in panes {
-        statuses
-            .entry(&pane.window_id)
-            .or_default()
-            .push(pane.agent_status);
+        let window = statuses.entry(&pane.window_id).or_default();
+        window.push(pane.agent_status);
+        for embedded in folded.get(pane.pane_id.as_str()).into_iter().flatten() {
+            window.push(embedded.agent_status);
+        }
     }
 
     statuses
@@ -437,8 +472,11 @@ fn tmux_window_status_icon(status: AgentStatus) -> &'static str {
     }
 }
 
-fn write_window_status_icons(panes: &[TmuxPane]) -> Result<()> {
-    let desired = window_status_icons(panes);
+fn write_window_status_icons(
+    panes: &[TmuxPane],
+    folded: &HashMap<&str, Vec<&TmuxPane>>,
+) -> Result<()> {
+    let desired = window_status_icons(panes, folded);
     let current = tmux_output(&[
         "list-windows",
         "-a",
@@ -484,8 +522,12 @@ pub(crate) fn mark_window_seen(window_id: &str) {
     let output =
         tmux_output(&["list-panes", "-t", window_id, "-F", "#{pane_id}"]).unwrap_or_default();
     for pane_id in output.lines().filter(|line| !line.trim().is_empty()) {
-        let _ = set_pane_option(pane_id, STATUS_SEEN_OPTION, "1");
+        mark_pane_seen(pane_id);
     }
+}
+
+pub(crate) fn mark_pane_seen(pane_id: &str) {
+    let _ = set_pane_option(pane_id, STATUS_SEEN_OPTION, "1");
 }
 
 #[cfg(test)]
@@ -555,9 +597,24 @@ mod tests {
         )
         .unwrap();
 
-        let icons = window_status_icons(&panes);
+        let icons = window_status_icons(&panes, &HashMap::new());
         assert_eq!(icons.get("@1"), Some(&" #[fg=red,bold]◉#[default]"));
         assert_eq!(icons.get("@2"), Some(&""));
+    }
+
+    #[test]
+    fn tmux_tab_icon_adopts_an_embedded_session_pane() {
+        let panes = parse_panes(
+            "%6\t@1\t1\tnvim\t/tmp\tnvim\t100\t\tunknown\t1\t\n\
+             %20\t@9\t1\tnu\t/tmp\tagent\t200\tclaude\tworking\t1\t1000\n",
+        )
+        .unwrap();
+        // %20 belongs to a session embedded in %6, so its status lands on @1 —
+        // and @9, which nobody can see, keeps reporting for itself.
+        let folded = HashMap::from([("%6", vec![&panes[1]])]);
+
+        let icons = window_status_icons(&panes, &folded);
+        assert_eq!(icons.get("@1"), Some(&" #[fg=yellow,bold]⠋#[default]"));
     }
 
     #[test]
@@ -743,18 +800,26 @@ mod tests {
     fn process_tree_distinguishes_live_agent_from_exit() {
         // pane shell 100 -> claude 200 -> its bash subprocess 300.
         let running = ProcessTree::parse("100 1 zsh\n200 100 claude\n300 200 bash\n");
-        assert!(running.has_agent_descendant(Some(100)));
-        assert!(running.has_agent_descendant(Some(200)));
+        assert_eq!(running.agent_descendant(Some(100)), Some(AgentKind::Claude));
+        assert_eq!(running.agent_descendant(Some(200)), Some(AgentKind::Claude));
 
         // Same pane shell once Claude has exited: no agent left underneath.
         let exited = ProcessTree::parse("100 1 zsh\n400 100 nvim\n");
-        assert!(!exited.has_agent_descendant(Some(100)));
-        assert!(!exited.has_agent_descendant(None));
+        assert_eq!(exited.agent_descendant(Some(100)), None);
+        assert_eq!(exited.agent_descendant(None), None);
 
         // The versioned native binary is recognized by its comm path too.
         let versioned =
             ProcessTree::parse("10 1 -zsh\n11 10 /Users/x/.local/share/claude/versions/2.1.197\n");
-        assert!(versioned.has_agent_descendant(Some(10)));
+        assert_eq!(versioned.agent_descendant(Some(10)), Some(AgentKind::Claude));
+    }
+
+    #[test]
+    fn process_tree_finds_the_agent_a_wrapper_shell_runs() {
+        // How sidekick.nvim's tmux backend spawns one: the pane runs the login
+        // shell tmux started it with, and the agent is a child of that shell.
+        let wrapped = ProcessTree::parse("100 1 nu\n200 100 /Users/x/.local/bin/claude_1\n");
+        assert_eq!(wrapped.agent_descendant(Some(100)), Some(AgentKind::Claude));
     }
 
     #[test]

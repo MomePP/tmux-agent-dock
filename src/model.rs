@@ -91,6 +91,10 @@ pub struct WindowCard {
     pub preview: Vec<String>,
     pub codex_unread: bool,
     pub agent_status: AgentStatus,
+    /// Panes of embedded sessions whose status this card carries — they have no
+    /// card of their own, so anything done per-pane on select must reach them
+    /// through here. See [`crate::embed`].
+    pub folded_pane_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -11,8 +11,9 @@ use std::{
 use anyhow::Result;
 
 use crate::{
-    daemon::ensure_status_daemon,
+    daemon::{ensure_status_daemon, ProcessTree},
     detect::detect_agent_from_process_name,
+    embed::{embedded_session_hosts, folded_panes},
     model::{AgentKind, AgentState, AgentStatus, SessionGroup, TmuxPane, TmuxWindow, WindowCard},
     tmux::{parse_panes, parse_windows, tmux_output, tmux_status},
 };
@@ -38,17 +39,24 @@ pub fn build_cards(
     panes: &[TmuxPane],
     unread_dir: &Path,
 ) -> Vec<WindowCard> {
-    build_cards_with_previews(windows, panes, &HashMap::new(), unread_dir)
+    build_cards_with_previews(windows, panes, &HashMap::new(), &HashMap::new(), unread_dir)
 }
 
+/// `embedded` maps sessions that live inside another pane to that pane (see
+/// [`crate::embed`]): they get no cards of their own, and their panes count
+/// toward the card of the pane hosting them.
 pub fn build_cards_with_previews(
     windows: &[TmuxWindow],
     panes: &[TmuxPane],
+    embedded: &HashMap<String, String>,
     previews: &HashMap<String, Vec<String>>,
     unread_dir: &Path,
 ) -> Vec<WindowCard> {
+    let folded = folded_panes(windows, panes, embedded);
+
     windows
         .iter()
+        .filter(|window| !embedded.contains_key(&window.session_name))
         .filter_map(|window| {
             let active_pane = panes
                 .iter()
@@ -59,11 +67,22 @@ pub fn build_cards_with_previews(
                 .iter()
                 .filter(|pane| pane.window_id == window.window_id)
                 .collect();
+            let adopted: Vec<&TmuxPane> = window_panes
+                .iter()
+                .filter_map(|pane| folded.get(pane.pane_id.as_str()))
+                .flatten()
+                .copied()
+                .collect();
             let codex_unread = window_panes
                 .iter()
+                .chain(adopted.iter())
                 .any(|pane| codex_unread_file(unread_dir, &pane.pane_id).exists());
-            let agent_status =
-                rollup_agent_status(window_panes.iter().map(|pane| pane.agent_status));
+            let agent_status = rollup_agent_status(
+                window_panes
+                    .iter()
+                    .chain(adopted.iter())
+                    .map(|pane| pane.agent_status),
+            );
 
             Some(WindowCard {
                 window_id: window.window_id.clone(),
@@ -81,6 +100,10 @@ pub fn build_cards_with_previews(
                     .unwrap_or_default(),
                 codex_unread: codex_unread || agent_status.is_done(),
                 agent_status,
+                folded_pane_ids: adopted
+                    .iter()
+                    .map(|pane| pane.pane_id.clone())
+                    .collect(),
             })
         })
         .collect()
@@ -210,9 +233,12 @@ pub fn load_cards() -> Result<Vec<WindowCard>> {
         "-F",
         "#{pane_id}\t#{window_id}\t#{pane_active}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_title}\t#{pane_pid}\t#{@tmux_agent_switcher_agent}\t#{@tmux_agent_switcher_state}\t#{@tmux_agent_switcher_seen}\t#{@tmux_agent_switcher_run_started_at}\t#{@codex_status_state}\t#{@codex_status_unread}",
     ])?)?;
+    let processes = ProcessTree::snapshot();
+    let embedded = embedded_session_hosts(&windows, &panes, processes.parents());
     Ok(build_cards_with_previews(
         &windows,
         &panes,
+        &embedded,
         &HashMap::new(),
         &codex_unread_dir(),
     ))
@@ -265,6 +291,35 @@ mod tests {
         let cards = build_cards(&windows, &panes, dir.path());
 
         assert_eq!(cards[0].agent_status.state, AgentState::Blocked);
+    }
+
+    #[test]
+    fn embedded_session_is_hidden_and_its_status_folded_into_the_host_card() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("20.json"), "{}").unwrap();
+
+        let windows =
+            parse_windows("@1\tdotfiles\t0\teditor\t*\n@9\tclaude_1 abc\t0\tagent\t*\n").unwrap();
+        // %6 runs Neovim; %20 is the agent in the session embedded inside it.
+        let panes = parse_panes(
+            "%6\t@1\t1\tnvim\t/Users/example/.config\teditor\t100\t\tunknown\t1\t\n\
+             %20\t@9\t1\tnu\t/Users/example/.config\tagent\t200\tclaude\tworking\t1\t1000\n",
+        )
+        .unwrap();
+        let embedded = HashMap::from([("claude_1 abc".to_owned(), "%6".to_owned())]);
+
+        let cards =
+            build_cards_with_previews(&windows, &panes, &embedded, &HashMap::new(), dir.path());
+
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].session_name, "dotfiles");
+        assert_eq!(cards[0].agent_status.state, AgentState::Working);
+        assert_eq!(cards[0].agent_status.agent, Some(AgentKind::Claude));
+        // The card still shows what the pane itself runs.
+        assert_eq!(cards[0].command, "nvim");
+        // Unread and seen state live on the folded pane, which has no card.
+        assert!(cards[0].codex_unread);
+        assert_eq!(cards[0].folded_pane_ids, vec!["%20".to_owned()]);
     }
 
     #[test]

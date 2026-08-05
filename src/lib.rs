@@ -5,6 +5,7 @@
 //! - [`model`] — core types (agents, statuses, windows, panes, cards)
 //! - [`tmux`] — running tmux commands, parsing their output, executing actions
 //! - [`detect`] — recognizing agent processes and inferring their state
+//! - [`embed`] — sessions running inside another pane, folded into their host
 //! - [`daemon`] — the background poller that caches status in tmux options
 //! - [`cards`] — building/grouping the window cards and session ordering
 //! - [`search`] — fuzzy filtering of the session/window list
@@ -18,6 +19,7 @@ pub const TMUX_ORANGE: Color = Color::Indexed(202);
 mod cards;
 mod daemon;
 mod detect;
+mod embed;
 mod model;
 mod preview;
 mod search;
@@ -33,6 +35,7 @@ pub use cards::{
 };
 pub use daemon::{ensure_status_daemon, poll_agent_status_once, run_status_daemon, Debounce};
 pub use detect::{detect_agent_from_process_name, detect_agent_state};
+pub use embed::embedded_session_hosts;
 pub use model::{
     AgentEvidence, AgentKind, AgentState, AgentStatus, SessionGroup, SwitcherAction, TmuxPane,
     TmuxWindow, WindowCard,
