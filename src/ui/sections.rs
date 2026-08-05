@@ -153,7 +153,7 @@ const MIN_SPLIT_HEIGHT: u16 = 4;
 /// Divides the body between the two sections. Agents is sized to its content
 /// but never more than half, so a couple of agents cannot strand half the
 /// sidebar empty while the session list scrolls.
-#[allow(dead_code)]
+#[allow(dead_code)] // Consumed by Task 7 (rendering)
 pub(crate) fn section_heights(body: Rect, agent_row_count: usize) -> (Rect, Option<Rect>) {
     if agent_row_count == 0 || body.height < MIN_SPLIT_HEIGHT {
         return (body, None);
