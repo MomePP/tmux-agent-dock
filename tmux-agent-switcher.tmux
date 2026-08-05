@@ -59,18 +59,40 @@ if [[ -n "$open_key" ]]; then
   tmux bind-key -n "$open_key" run-shell -b "$POPUP '#{window_id}' '#{session_name}'"
 fi
 
+# Vim-aware navigation: pass C-h/j/k/l through to Vim when the focused pane
+# runs it, otherwise:
+#   C-h / C-l  move panes (or wrap to prev/next window at an edge)
+#   C-j / C-k  switch to the next/previous session
+is_vim="ps -o state= -o comm= -t '#{pane_tty}' | grep -iqE '^[^TXZ ]+ +(\\S+/)?g?(view|n?vim?x?)(diff)?\$'"
+
+# tmux keeps its key tables across config reloads, so switching the option off
+# has to actively remove what an earlier load bound — otherwise the keys keep
+# navigating until the server is restarted, and C-l never reaches the shell.
+# Only this plugin's own binding is dropped: it is recognized by the exact
+# vim-passthrough-plus-action pair below, which a binding the user installed
+# under the same key will not carry. Read the whole table once — `list-keys`
+# with both -T and a key argument returns nothing.
+root_keys=""
+if [[ "$nav" != "on" ]]; then
+  root_keys="$(tmux list-keys -T root 2>/dev/null || true)"
+fi
+
+configure_nav_key() {
+  local key="$1" action="$2"
+
+  if [[ "$nav" == "on" ]]; then
+    tmux bind-key -n "$key" if-shell "$is_vim" "send-keys $key" "$action"
+  elif [[ "$root_keys" == *"\"send-keys $key\" \"$action\""* ]]; then
+    tmux unbind-key -n "$key"
+  fi
+}
+
+configure_nav_key C-h "if -F '#{pane_at_left}' 'previous-window' 'select-pane -L'"
+configure_nav_key C-l "if -F '#{pane_at_right}' 'next-window' 'select-pane -R'"
+configure_nav_key C-j "switch-client -n"
+configure_nav_key C-k "switch-client -p"
+
 if [[ "$nav" == "on" ]]; then
-  # Vim-aware navigation: pass C-h/j/k/l through to Vim when the focused pane
-  # runs it, otherwise:
-  #   C-h / C-l  move panes (or wrap to prev/next window at an edge)
-  #   C-j / C-k  switch to the next/previous session
-  is_vim="ps -o state= -o comm= -t '#{pane_tty}' | grep -iqE '^[^TXZ ]+ +(\\S+/)?g?(view|n?vim?x?)(diff)?\$'"
-
-  tmux bind-key -n C-h if-shell "$is_vim" "send-keys C-h" "if -F '#{pane_at_left}' 'previous-window' 'select-pane -L'"
-  tmux bind-key -n C-l if-shell "$is_vim" "send-keys C-l" "if -F '#{pane_at_right}' 'next-window' 'select-pane -R'"
-  tmux bind-key -n C-j if-shell "$is_vim" "send-keys C-j" "switch-client -n"
-  tmux bind-key -n C-k if-shell "$is_vim" "send-keys C-k" "switch-client -p"
-
   # Keep the nav keys from being swallowed by tmux's tree-mode.
   tmux unbind-key -q -T tree-mode C-j 2>/dev/null || true
   tmux unbind-key -q -T tree-mode C-k 2>/dev/null || true
