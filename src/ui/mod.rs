@@ -2,6 +2,7 @@
 //! handling for each input mode.
 
 pub(crate) mod layout;
+pub(crate) mod pane;
 pub(crate) mod render;
 pub(crate) mod state;
 
