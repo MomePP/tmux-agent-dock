@@ -40,8 +40,11 @@ use crate::{
     tmux::{current_window_id, env_tmux_value, rename_window, swap_windows, tmux_output, tmux_status},
 };
 use layout::{compact_navigation_height, switcher_layout};
+use pane::Pane;
 use render::draw;
-use sections::{format_expanded, parse_expanded};
+use sections::{
+    agent_rows, format_expanded, parse_expanded, row_key, session_rows, Row, SectionFocus,
+};
 use state::{
     accept_numbered_session, compact_lines, format_input_mode, format_view_mode, handle_prompt_key,
     initial_grid_state, keep_compact_selection_visible, move_compact_selection,
@@ -145,7 +148,6 @@ fn persist_input_mode(input: InputMode) {
 
 /// Which sessions were left expanded, remembered for the tmux server's
 /// lifetime the same way the view and input modes are.
-#[allow(dead_code)] // Consumed by Task 5 (UI state)
 fn initial_expanded() -> HashSet<String> {
     let value = tmux_output(&["show-option", "-gqv", EXPANDED_OPTION]).unwrap_or_default();
     parse_expanded(&value)
@@ -174,6 +176,11 @@ struct SwitcherUi {
     numbered_input: String,
     show_help: bool,
     prompt: Option<PromptState>,
+    sessions_pane: Pane<Row>,
+    agents_pane: Pane<Row>,
+    focus: SectionFocus,
+    expanded: HashSet<String>,
+    current_window_id: Option<String>,
 }
 
 impl SwitcherUi {
@@ -194,7 +201,13 @@ impl SwitcherUi {
             numbered_input: String::new(),
             show_help: false,
             prompt: None,
+            sessions_pane: Pane::new(Vec::new()),
+            agents_pane: Pane::new(Vec::new()),
+            focus: SectionFocus::Sessions,
+            expanded: initial_expanded(),
+            current_window_id: current_window_id.map(str::to_owned),
         };
+        ui.rebuild_panes();
         ui.state = initial_grid_state(
             &ui.filtered,
             current_window_id,
@@ -205,6 +218,64 @@ impl SwitcherUi {
             move_compact_selection(&mut ui.state, &ui.filtered, direction, navigation_height);
         }
         ui
+    }
+
+    /// True while a view backed by the two sections is active. `palette` keeps
+    /// the flat `GridState` list, so every sections-specific key path checks
+    /// this first.
+    #[allow(dead_code)] // Consumed by Task 6 (key handling) and Task 7 (rendering)
+    fn uses_sections(&self) -> bool {
+        matches!(self.view, ViewMode::Sidebar | ViewMode::SidebarRight)
+    }
+
+    /// Rebuilds both row lists from the filtered cards, holding each cursor on
+    /// the row it was on.
+    fn rebuild_panes(&mut self) {
+        let keep_session = self
+            .sessions_pane
+            .selected()
+            .map(|row| row_key(row).to_owned());
+        let keep_agent = self
+            .agents_pane
+            .selected()
+            .map(|row| row_key(row).to_owned());
+
+        let sessions = session_rows(
+            &self.filtered,
+            &self.expanded,
+            self.current_window_id.as_deref(),
+        );
+        let agents = agent_rows(&self.filtered);
+
+        self.sessions_pane
+            .set_items(sessions, keep_session.as_deref(), |row| row_key(row));
+        self.agents_pane
+            .set_items(agents, keep_agent.as_deref(), |row| row_key(row));
+
+        if self.agents_pane.is_empty() {
+            self.focus = SectionFocus::Sessions;
+        }
+    }
+
+    #[allow(dead_code)] // Consumed by Task 6 (key handling) and Task 7 (rendering)
+    fn focused_pane(&self) -> &Pane<Row> {
+        match self.focus {
+            SectionFocus::Sessions => &self.sessions_pane,
+            SectionFocus::Agents => &self.agents_pane,
+        }
+    }
+
+    #[allow(dead_code)] // Consumed by Task 6 (key handling)
+    fn focused_pane_mut(&mut self) -> &mut Pane<Row> {
+        match self.focus {
+            SectionFocus::Sessions => &mut self.sessions_pane,
+            SectionFocus::Agents => &mut self.agents_pane,
+        }
+    }
+
+    #[allow(dead_code)] // Consumed by Task 6 (key handling)
+    fn selected_row(&self) -> Option<&Row> {
+        self.focused_pane().selected()
     }
 
     /// The list viewport height used for scrolling, derived from the current
@@ -238,6 +309,7 @@ impl SwitcherUi {
             &self.query,
             navigation_height,
         );
+        self.rebuild_panes();
     }
 
     fn toggle_help(&mut self, terminal_size: Rect) {
@@ -825,5 +897,65 @@ fn run_tui_loop(
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{AgentKind, AgentState, AgentStatus};
+    use crate::test_support::test_card;
+
+    // `SwitcherUi::new` reads the real `EXPANDED_OPTION` tmux global (via
+    // `initial_expanded`) and shells out to load the session order, so tests
+    // must not depend on the developer's live tmux state. Reset the
+    // expansion set and rebuild before returning, so every assertion starts
+    // from a known collapsed state regardless of what tmux happens to have.
+    fn ui_with(cards: Vec<WindowCard>) -> SwitcherUi {
+        let mut ui = SwitcherUi::new(
+            cards,
+            None,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 40,
+            },
+        );
+        ui.expanded.clear();
+        ui.rebuild_panes();
+        ui
+    }
+
+    #[test]
+    fn panes_are_populated_from_the_loaded_cards() {
+        let mut agent = test_card("dotfiles", "0");
+        agent.agent_status = AgentStatus {
+            agent: Some(AgentKind::Claude),
+            state: AgentState::Working,
+            seen: true,
+            run_started_at: None,
+        };
+        let plain = test_card("gogo", "0");
+
+        let ui = ui_with(vec![agent, plain]);
+
+        // One row per session while everything is collapsed.
+        assert_eq!(ui.sessions_pane.len(), 2);
+        // Only the card running an agent reaches the Agents pane.
+        assert_eq!(ui.agents_pane.len(), 1);
+        assert_eq!(ui.focus, SectionFocus::Sessions);
+    }
+
+    #[test]
+    fn expanding_a_session_adds_its_windows_to_the_sessions_pane() {
+        let ui_cards = vec![test_card("dotfiles", "0"), test_card("dotfiles", "1")];
+        let mut ui = ui_with(ui_cards);
+        assert_eq!(ui.sessions_pane.len(), 1);
+
+        ui.expanded.insert("dotfiles".to_owned());
+        ui.rebuild_panes();
+
+        assert_eq!(ui.sessions_pane.len(), 3);
     }
 }

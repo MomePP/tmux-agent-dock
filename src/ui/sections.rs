@@ -196,6 +196,25 @@ pub(crate) fn format_expanded(expanded: &HashSet<String>) -> String {
     names.join(&EXPANDED_SEPARATOR.to_string())
 }
 
+/// Which section the keyboard is driving. The other keeps its cursor and
+/// scroll position and renders dim.
+#[allow(dead_code)] // Agents variant constructed by Task 6 (key handling)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SectionFocus {
+    Sessions,
+    Agents,
+}
+
+impl SectionFocus {
+    #[allow(dead_code)] // Consumed by Task 6 (key handling)
+    pub(crate) fn toggled(self) -> Self {
+        match self {
+            Self::Sessions => Self::Agents,
+            Self::Agents => Self::Sessions,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,5 +434,11 @@ mod tests {
     fn parsing_an_empty_option_yields_nothing_expanded() {
         assert!(parse_expanded("").is_empty());
         assert!(parse_expanded("\t\t").is_empty());
+    }
+
+    #[test]
+    fn focus_toggles_between_the_two_sections() {
+        assert_eq!(SectionFocus::Sessions.toggled(), SectionFocus::Agents);
+        assert_eq!(SectionFocus::Agents.toggled(), SectionFocus::Sessions);
     }
 }
