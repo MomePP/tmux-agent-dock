@@ -4,6 +4,7 @@
 pub(crate) mod layout;
 pub(crate) mod pane;
 pub(crate) mod render;
+pub(crate) mod sections;
 pub(crate) mod state;
 
 use std::{
