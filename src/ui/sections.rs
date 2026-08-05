@@ -6,6 +6,8 @@
 
 use std::collections::HashSet;
 
+use ratatui::layout::Rect;
+
 use crate::{
     cards::rollup_agent_status,
     model::{format_agent_kind, AgentStatus, SessionGroup, WindowCard},
@@ -140,6 +142,40 @@ pub(crate) fn agent_rows(sessions: &[SessionGroup]) -> Vec<Row> {
             target: card.clone(),
         })
         .collect()
+}
+
+/// Rows the Agents section needs below its title before it starts scrolling.
+const MIN_AGENTS_ROWS: u16 = 1;
+/// Below this the body cannot carry two titles plus a row each, so the split is
+/// abandoned and Sessions keeps everything.
+const MIN_SPLIT_HEIGHT: u16 = 4;
+
+/// Divides the body between the two sections. Agents is sized to its content
+/// but never more than half, so a couple of agents cannot strand half the
+/// sidebar empty while the session list scrolls.
+#[allow(dead_code)]
+pub(crate) fn section_heights(body: Rect, agent_row_count: usize) -> (Rect, Option<Rect>) {
+    if agent_row_count == 0 || body.height < MIN_SPLIT_HEIGHT {
+        return (body, None);
+    }
+
+    let wanted = u16::try_from(agent_row_count)
+        .unwrap_or(u16::MAX)
+        .saturating_add(1); // title row
+    let agents_height = wanted.clamp(MIN_AGENTS_ROWS.saturating_add(1), body.height / 2);
+    let sessions_height = body.height.saturating_sub(agents_height);
+
+    let sessions = Rect {
+        height: sessions_height,
+        ..body
+    };
+    let agents = Rect {
+        y: body.y.saturating_add(sessions_height),
+        height: agents_height,
+        ..body
+    };
+
+    (sessions, Some(agents))
 }
 
 #[cfg(test)]
@@ -294,5 +330,52 @@ mod tests {
         // Order is session-then-window, so urgency must not reshuffle the rows
         // out from under the cursor.
         assert_eq!(before, after);
+    }
+
+    fn body(height: u16) -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            width: 28,
+            height,
+        }
+    }
+
+    #[test]
+    fn no_agents_gives_the_whole_body_to_sessions() {
+        let (sessions, agents) = section_heights(body(20), 0);
+
+        assert_eq!(sessions, body(20));
+        assert_eq!(agents, None);
+    }
+
+    #[test]
+    fn agents_take_only_what_they_need() {
+        // Two agents: one title row plus two rows.
+        let (sessions, agents) = section_heights(body(20), 2);
+        let agents = agents.expect("agents section");
+
+        assert_eq!(agents.height, 3);
+        assert_eq!(sessions.height, 17);
+        assert_eq!(sessions.y, 0);
+        assert_eq!(agents.y, 17);
+    }
+
+    #[test]
+    fn agents_never_exceed_half_the_body() {
+        // Twenty agents would want 21 rows; half of 20 is 10.
+        let (sessions, agents) = section_heights(body(20), 20);
+        let agents = agents.expect("agents section");
+
+        assert_eq!(agents.height, 10);
+        assert_eq!(sessions.height, 10);
+    }
+
+    #[test]
+    fn a_body_too_short_to_split_stays_one_section() {
+        let (sessions, agents) = section_heights(body(3), 5);
+
+        assert_eq!(sessions, body(3));
+        assert_eq!(agents, None);
     }
 }
