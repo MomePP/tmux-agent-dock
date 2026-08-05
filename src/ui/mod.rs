@@ -17,9 +17,12 @@ use crossterm::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
         MouseEventKind,
     },
-    execute,
+    execute, queue,
     style::force_color_output,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{
+        disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen,
+        LeaveAlternateScreen,
+    },
 };
 use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 
@@ -711,6 +714,23 @@ impl SwitcherUi {
     }
 }
 
+/// Arranges for the next `draw` to repaint every cell, without showing a blank
+/// frame first.
+///
+/// `Terminal::clear` emits its escape through `execute!`, which flushes on the
+/// spot — the terminal blanks immediately and then stays empty until the next
+/// `draw` has rendered and flushed. At [`FULL_REDRAW_INTERVAL`] that reads as
+/// the popup blinking twice a second. Queueing the escape instead leaves it in
+/// the buffer, so the terminal receives the clear and the repaint as one write
+/// and never presents the gap between them. `swap_buffers` then empties the
+/// diff baseline the way `clear` does, so `draw` really does rewrite every
+/// cell rather than trusting what it believes is still on screen.
+fn queue_full_repaint(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+    queue!(terminal.backend_mut(), Clear(ClearType::All))?;
+    terminal.swap_buffers();
+    Ok(())
+}
+
 fn run_tui_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     cards: Vec<WindowCard>,
@@ -740,7 +760,7 @@ fn run_tui_loop(
         .preview;
         preview.refresh_for(ui.state.selected_card(&ui.filtered), preview_area, now);
         if now.duration_since(last_full_redraw) >= FULL_REDRAW_INTERVAL {
-            terminal.clear()?;
+            queue_full_repaint(terminal)?;
             last_full_redraw = now;
         }
         let spinner_frame = spinner_started_at.elapsed().as_millis() as usize / 120;
