@@ -8,6 +8,7 @@ pub(crate) mod sections;
 pub(crate) mod state;
 
 use std::{
+    collections::HashSet,
     io,
     process::Command,
     time::{Duration, Instant},
@@ -36,10 +37,11 @@ use crate::{
     model::{SessionGroup, SwitcherAction, WindowCard},
     preview::PreviewMirror,
     search::{apply_query, delete_query_word, filter_sessions},
-    tmux::{current_window_id, env_tmux_value, rename_window, swap_windows, tmux_status},
+    tmux::{current_window_id, env_tmux_value, rename_window, swap_windows, tmux_output, tmux_status},
 };
 use layout::{compact_navigation_height, switcher_layout};
 use render::draw;
+use sections::{format_expanded, parse_expanded};
 use state::{
     accept_numbered_session, compact_lines, format_input_mode, format_view_mode, handle_prompt_key,
     initial_grid_state, keep_compact_selection_visible, move_compact_selection,
@@ -61,6 +63,7 @@ const FULL_REDRAW_INTERVAL: Duration = Duration::from_millis(500);
 const TUI_TICK_INTERVAL: Duration = Duration::from_millis(50);
 const VIEW_MODE_OPTION: &str = "@tmux_agent_switcher_view";
 const INPUT_MODE_OPTION: &str = "@tmux_agent_switcher_input";
+const EXPANDED_OPTION: &str = "@tmux_agent_switcher_expanded";
 
 pub fn run_tui(cards: Vec<WindowCard>) -> Result<Option<SwitcherAction>> {
     if cards.is_empty() {
@@ -137,6 +140,24 @@ fn persist_input_mode(input: InputMode) {
         "-g",
         INPUT_MODE_OPTION,
         format_input_mode(input),
+    ]));
+}
+
+/// Which sessions were left expanded, remembered for the tmux server's
+/// lifetime the same way the view and input modes are.
+#[allow(dead_code)] // Consumed by Task 5 (UI state)
+fn initial_expanded() -> HashSet<String> {
+    let value = tmux_output(&["show-option", "-gqv", EXPANDED_OPTION]).unwrap_or_default();
+    parse_expanded(&value)
+}
+
+#[allow(dead_code)] // Consumed by Task 5 (UI state)
+fn persist_expanded(expanded: &HashSet<String>) {
+    let _ = tmux_status(Command::new("tmux").args([
+        "set-option",
+        "-g",
+        EXPANDED_OPTION,
+        &format_expanded(expanded),
     ]));
 }
 

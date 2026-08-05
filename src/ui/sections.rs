@@ -178,6 +178,24 @@ pub(crate) fn section_heights(body: Rect, agent_row_count: usize) -> (Rect, Opti
     (sessions, Some(agents))
 }
 
+/// Session names may contain spaces, so the persisted set is tab-separated.
+const EXPANDED_SEPARATOR: char = '\t';
+
+pub(crate) fn parse_expanded(value: &str) -> HashSet<String> {
+    value
+        .split(EXPANDED_SEPARATOR)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+pub(crate) fn format_expanded(expanded: &HashSet<String>) -> String {
+    let mut names: Vec<&str> = expanded.iter().map(String::as_str).collect();
+    names.sort_unstable(); // stable option value, so no pointless tmux writes
+    names.join(&EXPANDED_SEPARATOR.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,5 +395,25 @@ mod tests {
 
         assert_eq!(sessions, body(3));
         assert_eq!(agents, None);
+    }
+
+    #[test]
+    fn expanded_state_round_trips_through_a_tab_separated_option() {
+        let expanded = HashSet::from([
+            "dotfiles-config".to_owned(),
+            // Session names can contain spaces, which is why the separator is
+            // a tab rather than whitespace.
+            "claude_1 b9f9f91c".to_owned(),
+        ]);
+
+        let restored = parse_expanded(&format_expanded(&expanded));
+
+        assert_eq!(restored, expanded);
+    }
+
+    #[test]
+    fn parsing_an_empty_option_yields_nothing_expanded() {
+        assert!(parse_expanded("").is_empty());
+        assert!(parse_expanded("\t\t").is_empty());
     }
 }
