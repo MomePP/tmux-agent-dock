@@ -184,18 +184,17 @@ pub(crate) fn rows_per_height(height: u16, section: SectionFocus) -> usize {
     (height / row_lines(section)) as usize
 }
 
-/// Lines a section spends above its first row.
+/// Lines a section spends above its first row: a leading line, the title, and
+/// a blank line under it.
 ///
-/// Sessions: the title, then a blank line. Agents: a rule marking the boundary
-/// between the two halves, then the same title and blank. The rule belongs to
-/// the section below it rather than to the one above, because Sessions rarely
-/// fills its half — hanging the rule off the end of the session list would put
-/// it in a different place every time a session was expanded.
-pub(crate) fn header_lines(section: SectionFocus) -> u16 {
-    match section {
-        SectionFocus::Sessions => 2,
-        SectionFocus::Agents => 3,
-    }
+/// Both sections spend the same three, so the two halves are built the same
+/// way. The leading line is blank for Sessions — padding, so the title is not
+/// jammed against whatever sits above the sidebar — and is the rule for
+/// Agents. The rule belongs to the half below it rather than hanging off the
+/// end of the session list, which would move it every time a session was
+/// expanded.
+pub(crate) fn header_lines(_section: SectionFocus) -> u16 {
+    3
 }
 
 /// The part of a section's area its rows are drawn into, below the header.
@@ -904,16 +903,16 @@ mod tests {
         assert!(expand.is_empty());
     }
 
-    /// body(20) splits into Sessions 0..10 and Agents 10..20. Sessions spends
-    /// y=0 on its title and y=1 blank, so its rows start at y=2; Agents spends
-    /// y=10 on the rule, y=11 on its title and y=12 blank, so its rows start
-    /// at y=13.
+    /// body(20) splits into Sessions 0..10 and Agents 10..20. Each half opens
+    /// with three header lines — a leading line (blank for Sessions, the rule
+    /// for Agents), the title, then a blank — so Sessions rows start at y=3
+    /// and Agents rows at y=13.
     #[test]
     fn a_click_on_a_row_resolves_to_that_row() {
         let area = body(20);
 
         assert_eq!(
-            row_at(area, 2, 5, 0, 3, 0),
+            row_at(area, 3, 5, 0, 3, 0),
             ClickTarget::Row {
                 section: SectionFocus::Sessions,
                 index: 0
@@ -921,7 +920,7 @@ mod tests {
         );
         // Sessions rows are one line tall, so the next line is the next item.
         assert_eq!(
-            row_at(area, 4, 5, 0, 3, 0),
+            row_at(area, 5, 5, 0, 3, 0),
             ClickTarget::Row {
                 section: SectionFocus::Sessions,
                 index: 2
@@ -943,7 +942,7 @@ mod tests {
     fn a_click_on_a_header_focuses_without_selecting() {
         let area = body(20);
 
-        for line in [0, 1] {
+        for line in [0, 1, 2] {
             assert_eq!(
                 row_at(area, line, 5, 0, 3, 0),
                 ClickTarget::Section(SectionFocus::Sessions),
@@ -995,7 +994,7 @@ mod tests {
     fn consecutive_session_lines_are_consecutive_items() {
         let area = body(20);
 
-        for (line, index) in [(2u16, 0usize), (3, 1), (4, 2), (5, 3)] {
+        for (line, index) in [(3u16, 0usize), (4, 1), (5, 2), (6, 3)] {
             assert_eq!(
                 row_at(area, line, 8, 0, 3, 0),
                 ClickTarget::Row {
@@ -1012,8 +1011,8 @@ mod tests {
     fn a_click_past_the_last_row_focuses_the_section_only() {
         let area = body(20);
 
-        // Sessions holds 2 rows: y=2 and y=3. y=5 is past them.
-        assert_eq!(row_at(area, 5, 2, 0, 3, 0), ClickTarget::Section(SectionFocus::Sessions));
+        // Sessions holds 2 rows: y=3 and y=4. y=6 is past them.
+        assert_eq!(row_at(area, 6, 2, 0, 3, 0), ClickTarget::Section(SectionFocus::Sessions));
         // Agents holds 1 row, y=13..=14. y=17 is past it.
         assert_eq!(row_at(area, 17, 2, 0, 1, 0), ClickTarget::Section(SectionFocus::Agents));
     }
@@ -1025,7 +1024,7 @@ mod tests {
         let area = body(20);
 
         assert_eq!(
-            row_at(area, 2, 40, 12, 3, 0),
+            row_at(area, 3, 40, 12, 3, 0),
             ClickTarget::Row {
                 section: SectionFocus::Sessions,
                 index: 12
@@ -1046,7 +1045,7 @@ mod tests {
         let area = body(5);
 
         assert_eq!(
-            row_at(area, 2, 5, 0, 3, 0),
+            row_at(area, 3, 5, 0, 3, 0),
             ClickTarget::Row {
                 section: SectionFocus::Sessions,
                 index: 0

@@ -1847,7 +1847,7 @@ mod tests {
         let mut ui = dock_ui(three_sessions());
         let body = dock_layout(size(), ui.show_help, ui.input).sessions;
 
-        let result = ui.handle_mouse(click(2, body.y + 2), 40, size());
+        let result = ui.handle_mouse(click(2, body.y + 3), 40, size());
 
         assert_eq!(ui.sessions_pane.cursor, 0);
         assert_eq!(opened(&result), Some("alpha"));
@@ -1867,9 +1867,9 @@ mod tests {
         let mut ui = ui_with(three_sessions());
         let body = sections_body(&ui);
 
-        // Sessions spends line 0 on its title and line 1 blank, and its rows
-        // are one line each: line 2 is the first session, line 3 the second.
-        let result = ui.handle_mouse(click(2, body.y + 3), 40, size());
+        // Sessions spends three lines on its header and its rows are one line
+        // each: line 3 is the first session, line 4 the second.
+        let result = ui.handle_mouse(click(2, body.y + 4), 40, size());
 
         assert_eq!(ui.focus, SectionFocus::Sessions);
         assert_eq!(ui.sessions_pane.cursor, 1);

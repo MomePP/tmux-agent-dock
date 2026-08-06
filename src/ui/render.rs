@@ -278,21 +278,17 @@ fn render_section(
         return;
     }
 
-    // The Agents half opens with a rule, which is the only thing marking the
-    // boundary now that neither section is dimmed. The title then sits a line
-    // below it, and the rows a line below that.
-    let mut line = area.y;
-    if header_lines(section) > 2 {
+    // Both headers are three lines: a leading line, the title, a blank. The
+    // leading line is the rule for Agents — the only thing marking the
+    // boundary now that neither section is dimmed — and is left blank for
+    // Sessions, so the title is not jammed against whatever sits above the
+    // sidebar and both sit at the same depth into their half.
+    if section == SectionFocus::Agents {
         frame.render_widget(
             Paragraph::new("\u{2500}".repeat(area.width as usize))
                 .style(Style::default().fg(DETAIL_GRAY)),
-            Rect {
-                y: line,
-                height: 1,
-                ..area
-            },
+            Rect { height: 1, ..area },
         );
-        line = line.saturating_add(1);
     }
 
     // Both titles stay white whether or not their section has focus. They are
@@ -305,7 +301,7 @@ fn render_section(
             Style::default().fg(Color::White),
         ))),
         Rect {
-            y: line,
+            y: area.y.saturating_add(header_lines(section).saturating_sub(2)),
             height: 1,
             ..area
         },
@@ -1283,11 +1279,12 @@ mod tests {
         assert_eq!(buffer.get(27, 39).symbol(), "┘");
         // Sections render top-anchored (unlike the old compact list, which
         // pushed short content down to the search bar): the "Sessions" title
-        // sits right under the top border, a blank line, then the first row.
-        assert_eq!(buffer.get(2, 2).symbol(), "S");
-        assert_eq!(buffer.get(2, 3).symbol(), " ");
-        assert_eq!(buffer.get(2, 4).symbol(), "○");
-        assert_eq!(buffer.get(4, 4).symbol(), "w");
+        // sits a padding line below the top border, then a blank, then rows.
+        assert_eq!(buffer.get(2, 2).symbol(), " ");
+        assert_eq!(buffer.get(2, 3).symbol(), "S");
+        assert_eq!(buffer.get(2, 4).symbol(), " ");
+        assert_eq!(buffer.get(2, 5).symbol(), "○");
+        assert_eq!(buffer.get(4, 5).symbol(), "w");
         assert_eq!(buffer.get(2, 36).symbol(), "─");
         assert_eq!(buffer.get(2, 37).symbol(), "❯");
     }
@@ -1859,20 +1856,20 @@ mod tests {
         assert_eq!(buffer.get(27, 0).symbol(), "┐");
         assert_eq!(buffer.get(0, 39).symbol(), "└");
         assert_eq!(buffer.get(27, 39).symbol(), "┘");
-        // Sections render top-anchored: the "Sessions" title, a blank line,
-        // then one line per session — status icon, name, and the count and
-        // fold arrow at the right edge.
-        assert_eq!(buffer.get(2, 2).symbol(), "S");
-        assert_eq!(buffer.get(2, 4).symbol(), "○");
+        // Sections render top-anchored: a padding line, the "Sessions" title,
+        // a blank line, then one line per session — status icon, name, and the
+        // count and fold arrow at the right edge.
+        assert_eq!(buffer.get(2, 3).symbol(), "S");
+        assert_eq!(buffer.get(2, 5).symbol(), "○");
         let first = (0..28)
-            .map(|x| buffer.get(x, 4).symbol())
+            .map(|x| buffer.get(x, 5).symbol())
             .collect::<String>();
         assert!(
             first.contains("1 \u{25b8}"),
             "the count and fold arrow ride the name line: {first:?}"
         );
         let second = (0..28)
-            .map(|x| buffer.get(x, 5).symbol())
+            .map(|x| buffer.get(x, 6).symbol())
             .collect::<String>();
         assert!(
             second.contains("ops"),
