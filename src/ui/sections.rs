@@ -186,29 +186,58 @@ fn attached_session_name(
         .map(|session| session.session_name.clone())
 }
 
-/// The expansion set the switcher opens with. Spec §4 starts the session you
-/// are attached to expanded — but only on a fresh server: once the persisted
-/// option carries a set, it is the user's own choice, and re-expanding what
-/// they collapsed would fight them every open.
+/// What a fresh tmux server starts with, from `@agent_switcher_expand_default`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+pub(crate) enum ExpandDefault {
+    /// Every session expanded — the whole tree at once.
+    All,
+    /// Only the session you are attached to. Spec §4's rule.
+    #[default]
+    Attached,
+    /// Everything collapsed: one row per session.
+    None,
+}
+
+pub(crate) fn parse_expand_default(value: &str) -> ExpandDefault {
+    match value.trim() {
+        "all" | "expanded" | "open" => ExpandDefault::All,
+        "none" | "collapsed" | "closed" => ExpandDefault::None,
+        // Includes "attached" and anything unrecognised: an unreadable setting
+        // should land on the documented default, not on a surprise.
+        _ => ExpandDefault::Attached,
+    }
+}
+
+/// The expansion set the switcher opens with.
+///
+/// The default only decides what a *fresh* server looks like. Once the
+/// persisted option carries a set it is the user's own choice, and re-applying
+/// a default over it would fight them on every open.
 ///
 /// `persisted` is `None` only when the option was never written. An explicitly
 /// empty set arrives as `Some(empty)` and is honoured as-is — collapsing every
-/// session is a deliberate act, and seeding the attached one back in would undo
-/// it on the very next open.
+/// session is a deliberate act, and seeding anything back in would undo it on
+/// the very next open.
 pub(crate) fn initial_expanded_set(
     persisted: Option<HashSet<String>>,
     sessions: &[SessionGroup],
     current_window_id: Option<&str>,
+    default: ExpandDefault,
 ) -> HashSet<String> {
     if let Some(expanded) = persisted {
         return expanded;
     }
 
-    let mut expanded = HashSet::new();
-    if let Some(name) = attached_session_name(sessions, current_window_id) {
-        expanded.insert(name);
+    match default {
+        ExpandDefault::All => sessions
+            .iter()
+            .map(|session| session.session_name.clone())
+            .collect(),
+        ExpandDefault::None => HashSet::new(),
+        ExpandDefault::Attached => attached_session_name(sessions, current_window_id)
+            .into_iter()
+            .collect(),
     }
-    expanded
 }
 
 /// Session names may contain spaces, so the persisted set is tab-separated.
@@ -578,7 +607,8 @@ mod tests {
         let sessions = fixture();
         let current = sessions[1].cards[0].window_id.clone();
 
-        let expanded = initial_expanded_set(None, &sessions, Some(&current));
+        let expanded =
+            initial_expanded_set(None, &sessions, Some(&current), ExpandDefault::Attached);
 
         assert_eq!(expanded, HashSet::from(["gogo".to_owned()]));
     }
@@ -591,7 +621,56 @@ mod tests {
         let current = sessions[1].cards[0].window_id.clone();
         let persisted = HashSet::from(["dotfiles".to_owned()]);
 
-        let expanded = initial_expanded_set(Some(persisted.clone()), &sessions, Some(&current));
+        let expanded = initial_expanded_set(
+            Some(persisted.clone()),
+            &sessions,
+            Some(&current),
+            ExpandDefault::All,
+        );
+
+        assert_eq!(expanded, persisted);
+    }
+
+    /// `@agent_switcher_expand_default` decides what a fresh server shows.
+    #[test]
+    fn the_expand_default_decides_a_fresh_servers_tree() {
+        let sessions = fixture();
+        let current = sessions[1].cards[0].window_id.clone();
+
+        assert_eq!(
+            initial_expanded_set(None, &sessions, Some(&current), ExpandDefault::All),
+            HashSet::from(["dotfiles".to_owned(), "gogo".to_owned()])
+        );
+        assert!(initial_expanded_set(None, &sessions, Some(&current), ExpandDefault::None).is_empty());
+        assert_eq!(
+            initial_expanded_set(None, &sessions, Some(&current), ExpandDefault::Attached),
+            HashSet::from(["gogo".to_owned()])
+        );
+    }
+
+    /// An unreadable setting lands on the documented default rather than a
+    /// surprise, and the spellings people actually try are accepted.
+    #[test]
+    fn the_expand_default_parses_its_spellings() {
+        assert_eq!(parse_expand_default("all"), ExpandDefault::All);
+        assert_eq!(parse_expand_default("expanded"), ExpandDefault::All);
+        assert_eq!(parse_expand_default(" open "), ExpandDefault::All);
+        assert_eq!(parse_expand_default("none"), ExpandDefault::None);
+        assert_eq!(parse_expand_default("collapsed"), ExpandDefault::None);
+        assert_eq!(parse_expand_default("attached"), ExpandDefault::Attached);
+        assert_eq!(parse_expand_default(""), ExpandDefault::Attached);
+        assert_eq!(parse_expand_default("nonsense"), ExpandDefault::Attached);
+    }
+
+    /// The default only shapes a fresh server. Once anything is remembered it is
+    /// the whole answer, or `all` would re-expand what the user just collapsed.
+    #[test]
+    fn a_remembered_set_outranks_the_default() {
+        let sessions = fixture();
+        let persisted = HashSet::from(["dotfiles".to_owned()]);
+
+        let expanded =
+            initial_expanded_set(Some(persisted.clone()), &sessions, None, ExpandDefault::All);
 
         assert_eq!(expanded, persisted);
     }
@@ -604,7 +683,12 @@ mod tests {
         let sessions = fixture();
         let current = sessions[1].cards[0].window_id.clone();
 
-        let expanded = initial_expanded_set(Some(HashSet::new()), &sessions, Some(&current));
+        let expanded = initial_expanded_set(
+            Some(HashSet::new()),
+            &sessions,
+            Some(&current),
+            ExpandDefault::All,
+        );
 
         assert!(
             expanded.is_empty(),
@@ -614,7 +698,9 @@ mod tests {
 
     #[test]
     fn nothing_is_expanded_when_the_current_window_is_unknown() {
-        assert!(initial_expanded_set(None, &fixture(), None).is_empty());
+        assert!(
+            initial_expanded_set(None, &fixture(), None, ExpandDefault::Attached).is_empty()
+        );
     }
 
     #[test]

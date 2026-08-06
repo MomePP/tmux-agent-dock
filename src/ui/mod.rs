@@ -46,8 +46,8 @@ use layout::{compact_navigation_height, dock_layout, switcher_layout, switcher_l
 use pane::Pane;
 use render::{draw, Surface};
 use sections::{
-    agent_rows, format_expanded, initial_expanded_set, parse_expanded, row_at, row_key,
-    section_heights, session_rows, sessions_matching_windows, ClickTarget, Row, RowKind,
+    agent_rows, format_expanded, initial_expanded_set, parse_expand_default, parse_expanded, row_at, row_key,
+    section_heights, session_rows, sessions_matching_windows, ClickTarget, ExpandDefault, Row, RowKind,
     SectionFocus,
 };
 use state::{
@@ -72,6 +72,7 @@ const TUI_TICK_INTERVAL: Duration = Duration::from_millis(50);
 const VIEW_MODE_OPTION: &str = "@tmux_agent_switcher_view";
 const INPUT_MODE_OPTION: &str = "@tmux_agent_switcher_input";
 const EXPANDED_OPTION: &str = "@tmux_agent_switcher_expanded";
+const EXPAND_DEFAULT_OPTION: &str = "@agent_switcher_expand_default";
 
 pub fn run_tui(cards: Vec<WindowCard>) -> Result<Option<SwitcherAction>> {
     if cards.is_empty() {
@@ -169,6 +170,13 @@ fn initial_input_mode() -> InputMode {
         .unwrap_or(InputMode::Keys)
 }
 
+/// What a fresh tmux server opens with: `all`, `attached` (the default) or
+/// `none`. It only applies until something is remembered — once the user has
+/// expanded or collapsed anything, that is the answer.
+fn initial_expand_default() -> ExpandDefault {
+    parse_expand_default(&tmux_output(&["show-option", "-gqv", EXPAND_DEFAULT_OPTION]).unwrap_or_default())
+}
+
 /// Same stickiness as [`persist_view_mode`], for the Tab-toggled input mode.
 fn persist_input_mode(input: InputMode) {
     let _ = tmux_status(Command::new("tmux").args([
@@ -246,6 +254,7 @@ impl SwitcherUi {
             current_window_id,
             terminal_size,
             initial_expanded(),
+            initial_expand_default(),
             initial_view_mode(),
             initial_input_mode(),
         )
@@ -259,6 +268,7 @@ impl SwitcherUi {
         current_window_id: Option<&str>,
         terminal_size: Rect,
         expanded: Option<HashSet<String>>,
+        expand_default: ExpandDefault,
         view: ViewMode,
         input: InputMode,
     ) -> Self {
@@ -267,7 +277,8 @@ impl SwitcherUi {
             apply_session_order(&mut sessions, &order);
         }
         let filtered = filter_sessions(&sessions, "");
-        let expanded = initial_expanded_set(expanded, &sessions, current_window_id);
+        let expanded =
+            initial_expanded_set(expanded, &sessions, current_window_id, expand_default);
         // Numbers is unusable in the sections views and its own cycle no longer
         // reaches it — but the mode is persisted across opens, so anyone who
         // landed there before is still carrying it. Coerce on the way in rather
@@ -1357,6 +1368,7 @@ mod tests {
             current_window_id,
             size(),
             Some(HashSet::new()),
+            ExpandDefault::Attached,
             ViewMode::Sidebar,
             InputMode::Keys,
         )
@@ -1369,6 +1381,7 @@ mod tests {
             None,
             size(),
             Some(HashSet::new()),
+            ExpandDefault::Attached,
             ViewMode::Palette,
             InputMode::Keys,
         )
@@ -1410,6 +1423,7 @@ mod tests {
             None,
             size(),
             Some(HashSet::new()),
+            ExpandDefault::Attached,
             ViewMode::Sidebar,
             InputMode::Keys,
         );
@@ -1756,6 +1770,7 @@ mod tests {
             None,
             size(),
             Some(HashSet::new()),
+            ExpandDefault::Attached,
             ViewMode::Sidebar,
             InputMode::Numbers,
         );
@@ -2109,6 +2124,7 @@ mod tests {
             Some("@bravo-1"),
             size(),
             None,
+            ExpandDefault::Attached,
             ViewMode::Sidebar,
             InputMode::Keys,
         );
@@ -2136,6 +2152,7 @@ mod tests {
             // A non-empty remembered set is the user's own choice and is taken
             // as-is, so "bravo" stays collapsed.
             Some(HashSet::from(["alpha".to_owned()])),
+            ExpandDefault::Attached,
             ViewMode::Sidebar,
             InputMode::Keys,
         );

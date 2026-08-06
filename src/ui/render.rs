@@ -271,17 +271,15 @@ fn render_section(
         return;
     }
 
-    // The unfocused section steps down to a dimmer colour, not `Modifier::DIM`
-    // on top of one. Terminals implement DIM with wildly different strength —
-    // stacked on an already-dark grey it washed the whole section out to barely
-    // legible. A plain colour step reads the same everywhere.
-    let title_style = if focused {
-        Style::default().fg(Color::Gray)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
+    // Both titles stay white whether or not their section has focus. They are
+    // headings, not state: dimming one made the sidebar look half switched-off,
+    // and which section holds the keyboard is already said by its rows going
+    // grey and by the cursor being drawn there.
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(title.to_owned(), title_style))),
+        Paragraph::new(Line::from(Span::styled(
+            title.to_owned(),
+            Style::default().fg(Color::White),
+        ))),
         Rect {
             height: 1,
             ..area
@@ -2337,14 +2335,16 @@ mod tests {
         let title_cell = buffer.get(agents_area.x, agents_area.y);
         let icon_cell = buffer.get(agents_area.x, agents_area.y.saturating_add(1));
 
+        // Headings are not state: both titles stay white whether or not their
+        // section has focus.
         assert_eq!(
             title_cell.fg,
-            Color::DarkGray,
-            "unfocused Agents title should step down to a dimmer colour"
+            Color::White,
+            "the Agents title should stay white while unfocused"
         );
         assert!(
             !title_cell.modifier.contains(Modifier::DIM),
-            "unfocused title should not stack DIM on top of a dark colour"
+            "a title should never be dimmed"
         );
         // Working -> yellow. The icon must survive the section losing focus.
         assert_eq!(
