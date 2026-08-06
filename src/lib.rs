@@ -46,7 +46,7 @@ pub use tmux::{
     clear_unread_for_pane, create_session, create_window, current_window_id, env_tmux_value,
     execute_action, parse_panes, parse_windows, rename_window, select_card,
 };
-pub use ui::run_tui;
+pub use ui::{run_dock, run_tui};
 pub use ui::state::{
     compact_selected_line_index, initial_grid_state, move_compact_selection, Direction, GridState,
     InputMode, ViewMode,

@@ -37,11 +37,14 @@ use crate::{
     model::{SessionGroup, SwitcherAction, WindowCard},
     preview::PreviewMirror,
     search::{apply_query, delete_query_word, filter_sessions},
-    tmux::{current_window_id, env_tmux_value, rename_window, swap_windows, tmux_output, tmux_status},
+    tmux::{
+        current_window_id, env_tmux_value, execute_action, rename_window, swap_windows,
+        tmux_output, tmux_status,
+    },
 };
-use layout::{compact_navigation_height, switcher_layout, switcher_layout_for_input};
+use layout::{compact_navigation_height, dock_layout, switcher_layout, switcher_layout_for_input};
 use pane::Pane;
-use render::draw;
+use render::{draw, Surface};
 use sections::{
     agent_rows, format_expanded, initial_expanded_set, parse_expanded, row_at, row_key,
     section_heights, session_rows, sessions_matching_windows, ClickTarget, Row, RowKind,
@@ -85,7 +88,7 @@ pub fn run_tui(cards: Vec<WindowCard>) -> Result<Option<SwitcherAction>> {
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    let result = run_tui_loop(&mut terminal, cards, current_window_id.as_deref());
+    let result = run_tui_loop(&mut terminal, cards, current_window_id.as_deref(), Surface::Popup);
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -94,6 +97,34 @@ pub fn run_tui(cards: Vec<WindowCard>) -> Result<Option<SwitcherAction>> {
     )?;
     terminal.show_cursor()?;
     result
+}
+
+/// Runs the switcher as a persistent pane. Unlike [`run_tui`] this never
+/// returns an action for the caller to execute — a dock that exited on
+/// selection would just be the popup.
+pub fn run_dock(cards: Vec<WindowCard>) -> Result<()> {
+    force_color_output(true);
+    let current_window_id = current_window_id();
+
+    let mut stdout = io::stdout();
+    enable_raw_mode()?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    let result = run_tui_loop(
+        &mut terminal,
+        cards,
+        current_window_id.as_deref(),
+        Surface::Dock,
+    );
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
+    terminal.show_cursor()?;
+    result.map(|_| ())
 }
 
 /// An initial list move to apply as soon as the switcher opens, so a key binding
@@ -163,6 +194,16 @@ fn initial_expanded() -> Option<HashSet<String>> {
     Some(parse_expanded(&value))
 }
 
+/// Hands the keyboard back to the pane the user was working in. `select-pane -l`
+/// is the last-active pane, which is where they came from; the `:.+` fallback
+/// covers a dock that has no last pane yet. Best-effort — failing to move focus
+/// is not worth an error.
+fn focus_work_pane() {
+    if tmux_status(Command::new("tmux").args(["select-pane", "-l"])).is_err() {
+        let _ = tmux_status(Command::new("tmux").args(["select-pane", "-t", ":.+"]));
+    }
+}
+
 fn persist_expanded(expanded: &HashSet<String>) {
     let _ = tmux_status(Command::new("tmux").args([
         "set-option",
@@ -185,6 +226,7 @@ struct SwitcherUi {
     numbered_input: String,
     show_help: bool,
     prompt: Option<PromptState>,
+    surface: Surface,
     sessions_pane: Pane<Row>,
     agents_pane: Pane<Row>,
     focus: SectionFocus,
@@ -248,6 +290,7 @@ impl SwitcherUi {
             numbered_input: String::new(),
             show_help: false,
             prompt: None,
+            surface: Surface::Popup,
             sessions_pane: Pane::new(Vec::new()),
             agents_pane: Pane::new(Vec::new()),
             focus: SectionFocus::Sessions,
@@ -299,6 +342,23 @@ impl SwitcherUi {
         }
         let navigation_height = self.navigation_height(terminal_size);
         move_compact_selection(&mut self.state, &self.filtered, direction, navigation_height);
+    }
+
+    /// The rect the sections are drawn into, from whichever layout this surface
+    /// uses. Click resolution and scroll clamping both read it, so neither can
+    /// drift from what was rendered.
+    fn body_rect(&self, terminal_size: Rect) -> Rect {
+        match self.surface {
+            Surface::Dock => dock_layout(terminal_size, self.show_help, self.input),
+            Surface::Popup => switcher_layout_for_input(
+                terminal_size,
+                self.show_help,
+                self.view,
+                compact_lines(&self.filtered).len(),
+                self.input,
+            ),
+        }
+        .sessions
     }
 
     /// True while a view backed by the two sections is active. `palette` keeps
@@ -597,14 +657,10 @@ impl SwitcherUi {
             return None;
         }
 
-        let body = switcher_layout_for_input(
-            terminal_size,
-            self.show_help,
-            self.view,
-            compact_lines(&self.filtered).len(),
-            self.input,
-        )
-        .sessions;
+        // Resolve against the geometry this surface actually drew. The dock has
+        // no modal inset, so using the popup's rect here would land every click
+        // two rows off — silently selecting the wrong window.
+        let body = self.body_rect(terminal_size);
 
         match row_at(
             body,
@@ -681,6 +737,14 @@ impl SwitcherUi {
                     return None;
                 }
                 if self.input != InputMode::Search || self.query.is_empty() {
+                    // The dock is a pane, not a modal: closing it would kill
+                    // the pane and collapse the window layout, and `prefix + b`
+                    // owns that. Esc keeps its other half — clearing the query
+                    // — and otherwise hands the keyboard back to the work pane.
+                    if self.surface == Surface::Dock {
+                        focus_work_pane();
+                        return None;
+                    }
                     return Some(None);
                 }
                 self.query.clear();
@@ -1003,7 +1067,13 @@ impl SwitcherUi {
         terminal_size: Rect,
     ) -> Option<Option<SwitcherAction>> {
         match ch {
-            'q' => return Some(None),
+            'q' => {
+                if self.surface == Surface::Dock {
+                    focus_work_pane();
+                    return None;
+                }
+                return Some(None);
+            }
             ' ' => return self.select_target(),
             '?' => self.toggle_help(terminal_size),
             'n' => self.open_new_window_prompt(),
@@ -1151,15 +1221,9 @@ fn keep_sections_visible(ui: &mut SwitcherUi, terminal_size: Rect) {
         return;
     }
 
-    let body = switcher_layout_for_input(
-        terminal_size,
-        ui.show_help,
-        ui.view,
-        compact_lines(&ui.filtered).len(),
-        ui.input,
-    )
-    .sessions;
-    let (sessions_area, agents_area) = section_heights(body);
+    // The same rect the renderer and the click resolver use — scrolling that
+    // disagreed with either would clamp the cursor against the wrong height.
+    let (sessions_area, agents_area) = section_heights(ui.body_rect(terminal_size));
 
     // Each section spends one row on its title before the rows start.
     ui.sessions_pane
@@ -1174,8 +1238,10 @@ fn run_tui_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     cards: Vec<WindowCard>,
     current_window_id: Option<&str>,
+    surface: Surface,
 ) -> Result<Option<SwitcherAction>> {
     let mut ui = SwitcherUi::new(cards, current_window_id, terminal.size()?);
+    ui.surface = surface;
     let spinner_started_at = Instant::now();
     let mut last_card_refresh = Instant::now();
     let mut last_full_redraw = Instant::now();
@@ -1225,6 +1291,7 @@ fn run_tui_loop(
                 &ui.sessions_pane,
                 &ui.agents_pane,
                 ui.focus,
+                ui.surface,
             )
         })?;
 
@@ -1237,13 +1304,27 @@ fn run_tui_loop(
                 let terminal_size = terminal.size()?;
                 let navigation_height = ui.navigation_height(terminal_size);
                 if let Some(result) = ui.handle_mouse(mouse, navigation_height, terminal_size) {
-                    return Ok(result);
+                    // The dock performs the switch and stays open; the popup
+                    // returns the action and tears down first.
+                    if surface == Surface::Dock {
+                        if let Some(action) = result {
+                            let _ = execute_action(action);
+                        }
+                    } else {
+                        return Ok(result);
+                    }
                 }
             }
             Event::Resize(_, _) => terminal.clear()?,
             Event::Key(key) => {
                 if let Some(result) = ui.handle_key(key, terminal.size()?) {
-                    return Ok(result);
+                    if surface == Surface::Dock {
+                        if let Some(action) = result {
+                            let _ = execute_action(action);
+                        }
+                    } else {
+                        return Ok(result);
+                    }
                 }
             }
             _ => {}
@@ -1317,6 +1398,19 @@ mod tests {
             row,
             modifiers: KeyModifiers::empty(),
         }
+    }
+
+    fn dock_ui(cards: Vec<WindowCard>) -> SwitcherUi {
+        let mut ui = SwitcherUi::with_settings(
+            cards,
+            None,
+            size(),
+            Some(HashSet::new()),
+            ViewMode::Sidebar,
+            InputMode::Keys,
+        );
+        ui.surface = Surface::Dock;
+        ui
     }
 
     /// A wheel event. Its coordinates never matter — scrolling drives whichever
@@ -1663,6 +1757,62 @@ mod tests {
         );
 
         assert_eq!(ui.input, InputMode::Keys);
+    }
+
+    /// The dock is not a modal — nothing typed inside it may tear down the
+    /// pane, because that collapses the window layout. `prefix + b` is the only
+    /// way out, and that is a tmux binding this loop never sees.
+    #[test]
+    fn q_and_esc_do_not_close_the_dock() {
+        let mut ui = dock_ui(three_sessions());
+
+        assert!(ui.handle_key(key(KeyCode::Char('q')), size()).is_none());
+        assert!(ui.handle_key(key(KeyCode::Esc), size()).is_none());
+    }
+
+    /// They keep their useful half: Esc still clears the query.
+    #[test]
+    fn esc_clears_the_query_in_the_dock() {
+        let mut ui = dock_ui(three_sessions());
+        ui.input = InputMode::Search;
+        ui.query = "brav".to_owned();
+        ui.refilter(40);
+
+        assert!(ui.handle_key(key(KeyCode::Esc), size()).is_none());
+
+        assert!(ui.query.is_empty());
+    }
+
+    #[test]
+    fn q_and_esc_still_close_the_popup() {
+        let mut ui = ui_with(three_sessions());
+        assert_eq!(ui.handle_key(key(KeyCode::Char('q')), size()), Some(None));
+
+        let mut ui = ui_with(three_sessions());
+        assert_eq!(ui.handle_key(key(KeyCode::Esc), size()), Some(None));
+    }
+
+    /// The dock has no modal inset, so its rows sit two higher than the
+    /// popup's. Resolving a dock click against the popup's geometry would
+    /// silently select the wrong row.
+    #[test]
+    fn a_dock_click_resolves_against_the_dock_geometry() {
+        let mut ui = dock_ui(three_sessions());
+        let body = dock_layout(size(), ui.show_help, ui.input).sessions;
+
+        let result = ui.handle_mouse(click(2, body.y + 1), 40, size());
+
+        assert_eq!(ui.sessions_pane.cursor, 0);
+        assert_eq!(opened(&result), Some("alpha"));
+    }
+
+    /// The two surfaces really do disagree, which is why `body_rect` exists.
+    #[test]
+    fn the_dock_and_popup_bodies_differ() {
+        let dock = dock_ui(three_sessions());
+        let popup = ui_with(three_sessions());
+
+        assert_ne!(dock.body_rect(size()), popup.body_rect(size()));
     }
 
     #[test]

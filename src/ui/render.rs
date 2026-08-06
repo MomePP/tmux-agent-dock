@@ -10,7 +10,7 @@ use ratatui::{
 };
 
 use super::{
-    layout::{inset_rect, switcher_layout_for_input},
+    layout::{dock_layout, inset_rect, switcher_layout_for_input},
     pane::Pane,
     sections::{section_heights, Row, RowKind, SectionFocus},
     state::{
@@ -62,24 +62,32 @@ pub(crate) fn draw(
     sessions_pane: &Pane<Row>,
     agents_pane: &Pane<Row>,
     focus: SectionFocus,
+    surface: Surface,
 ) {
-    let layout = switcher_layout_for_input(
-        frame.size(),
-        show_help,
-        view,
-        compact_lines(sessions).len(),
-        input,
-    );
+    let layout = match surface {
+        Surface::Dock => dock_layout(frame.size(), show_help, input),
+        Surface::Popup => switcher_layout_for_input(
+            frame.size(),
+            show_help,
+            view,
+            compact_lines(sessions).len(),
+            input,
+        ),
+    };
 
-    render_selected_preview(frame, layout.preview, preview);
-    frame.render_widget(Clear, layout.list_overlay);
-    frame.render_widget(
-        Block::default()
-            .borders(Borders::ALL)
-            .style(Style::default().fg(Color::DarkGray)),
-        layout.list_overlay,
-    );
-    render_modal_top_bar(frame, layout.list_overlay);
+    // The dock is one pane beside the work, not an overlay: no preview to put
+    // next to it, and no modal frame to draw over anything.
+    if surface == Surface::Popup {
+        render_selected_preview(frame, layout.preview, preview);
+        frame.render_widget(Clear, layout.list_overlay);
+        frame.render_widget(
+            Block::default()
+                .borders(Borders::ALL)
+                .style(Style::default().fg(Color::DarkGray)),
+            layout.list_overlay,
+        );
+        render_modal_top_bar(frame, layout.list_overlay);
+    }
     render_search_bar(frame, layout.search, query, input, view);
     // A search filtering everything out is checked first, ahead of the
     // sections/compact split, so the sidebar shows the same feedback the
@@ -1102,6 +1110,7 @@ mod tests {
                     &sessions_pane,
                     &agents_pane,
                     SectionFocus::Sessions,
+                    Surface::Popup,
                 )
             })
             .unwrap();
@@ -1143,6 +1152,7 @@ mod tests {
                     &sessions_pane,
                     &agents_pane,
                     SectionFocus::Sessions,
+                    Surface::Popup,
                 )
             })
             .unwrap();
@@ -1184,6 +1194,7 @@ mod tests {
                     &sessions_pane,
                     &agents_pane,
                     SectionFocus::Sessions,
+                    Surface::Popup,
                 )
             })
             .unwrap();
@@ -1227,6 +1238,7 @@ mod tests {
                     &sessions_pane,
                     &agents_pane,
                     SectionFocus::Sessions,
+                    Surface::Popup,
                 )
             })
             .unwrap();
@@ -1276,6 +1288,7 @@ mod tests {
                     &sessions_pane,
                     &agents_pane,
                     SectionFocus::Sessions,
+                    Surface::Popup,
                 )
             })
             .unwrap();
@@ -1316,6 +1329,7 @@ mod tests {
                     &sessions_pane,
                     &agents_pane,
                     SectionFocus::Sessions,
+                    Surface::Popup,
                 )
             })
             .unwrap();
@@ -1511,6 +1525,7 @@ mod tests {
                     &sessions_pane,
                     &agents_pane,
                     SectionFocus::Sessions,
+                    Surface::Popup,
                 )
             })
             .unwrap();
@@ -1682,6 +1697,7 @@ mod tests {
                     &sessions_pane,
                     &agents_pane,
                     SectionFocus::Sessions,
+                    Surface::Popup,
                 )
             })
             .unwrap();
@@ -1735,6 +1751,7 @@ mod tests {
                     &sessions_pane,
                     &agents_pane,
                     SectionFocus::Sessions,
+                    Surface::Popup,
                 )
             })
             .unwrap();
@@ -1774,6 +1791,7 @@ mod tests {
                     &sessions_pane,
                     &agents_pane,
                     SectionFocus::Sessions,
+                    Surface::Popup,
                 )
             })
             .unwrap();
@@ -2256,6 +2274,7 @@ mod tests {
                     &sessions_pane,
                     &agents_pane,
                     SectionFocus::Sessions,
+                    Surface::Popup,
                 )
             })
             .unwrap();
