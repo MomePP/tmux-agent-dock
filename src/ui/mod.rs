@@ -43,8 +43,8 @@ use layout::{compact_navigation_height, switcher_layout, switcher_layout_for_inp
 use pane::Pane;
 use render::draw;
 use sections::{
-    agent_rows, format_expanded, parse_expanded, row_key, section_heights, session_rows,
-    sessions_matching_windows, Row, RowKind, SectionFocus,
+    agent_rows, format_expanded, initial_expanded_set, parse_expanded, row_key, section_heights,
+    session_rows, sessions_matching_windows, Row, RowKind, SectionFocus,
 };
 use state::{
     accept_numbered_session, compact_lines, format_input_mode, format_view_mode, handle_prompt_key,
@@ -190,18 +190,40 @@ struct SwitcherUi {
 
 impl SwitcherUi {
     fn new(cards: Vec<WindowCard>, current_window_id: Option<&str>, terminal_size: Rect) -> Self {
+        Self::with_settings(
+            cards,
+            current_window_id,
+            terminal_size,
+            initial_expanded(),
+            initial_view_mode(),
+            initial_input_mode(),
+        )
+    }
+
+    /// [`SwitcherUi::new`] with every tmux-derived setting injected, so tests
+    /// can build a switcher whose view, input mode and expansion set do not
+    /// depend on whatever the developer's live tmux server happens to hold.
+    fn with_settings(
+        cards: Vec<WindowCard>,
+        current_window_id: Option<&str>,
+        terminal_size: Rect,
+        expanded: HashSet<String>,
+        view: ViewMode,
+        input: InputMode,
+    ) -> Self {
         let mut sessions = group_cards_by_session(cards);
         if let Ok(order) = load_session_order() {
             apply_session_order(&mut sessions, &order);
         }
         let filtered = filter_sessions(&sessions, "");
+        let expanded = initial_expanded_set(expanded, &sessions, current_window_id);
         let mut ui = Self {
             sessions,
             filtered,
             query: String::new(),
             state: GridState::new(),
-            view: initial_view_mode(),
-            input: initial_input_mode(),
+            view,
+            input,
             movement_count: None,
             numbered_input: String::new(),
             show_help: false,
@@ -209,21 +231,54 @@ impl SwitcherUi {
             sessions_pane: Pane::new(Vec::new()),
             agents_pane: Pane::new(Vec::new()),
             focus: SectionFocus::Sessions,
-            expanded: initial_expanded(),
+            expanded,
             search_expanded: HashSet::new(),
             current_window_id: current_window_id.map(str::to_owned),
         };
         ui.rebuild_panes();
+        ui.focus_current_window();
         ui.state = initial_grid_state(
             &ui.filtered,
             current_window_id,
             ui.navigation_height(terminal_size),
         );
         if let Some(direction) = initial_move_direction() {
-            let navigation_height = ui.navigation_height(terminal_size);
-            move_compact_selection(&mut ui.state, &ui.filtered, direction, navigation_height);
+            ui.apply_initial_move(direction, terminal_size);
         }
         ui
+    }
+
+    /// Opens with the Sessions cursor on the row for the window the client is
+    /// in, rather than on row 0. `GridState` has always done this for the
+    /// palette; without it the sidebar's cursor no longer starts where you are.
+    fn focus_current_window(&mut self) {
+        let Some(window_id) = self.current_window_id.clone() else {
+            return;
+        };
+        // A session row precedes its children and shares their target when the
+        // session's active window is the current one, so the *last* match is
+        // the window's own row whenever its session is expanded, and the
+        // session row when it is not.
+        if let Some(index) = self
+            .sessions_pane
+            .items()
+            .iter()
+            .rposition(|row| row.target.window_id == window_id)
+        {
+            self.sessions_pane.cursor = index;
+        }
+    }
+
+    /// The list move a launcher binding asked for (`Ctrl+j` opening the
+    /// switcher already moved one down), applied to whichever cursor the view
+    /// actually renders.
+    fn apply_initial_move(&mut self, direction: Direction, terminal_size: Rect) {
+        if self.uses_sections() {
+            self.move_focused_pane(direction);
+            return;
+        }
+        let navigation_height = self.navigation_height(terminal_size);
+        move_compact_selection(&mut self.state, &self.filtered, direction, navigation_height);
     }
 
     /// True while a view backed by the two sections is active. `palette` keeps
@@ -236,6 +291,16 @@ impl SwitcherUi {
     /// Rebuilds both row lists from the filtered cards, holding each cursor on
     /// the row it was on.
     fn rebuild_panes(&mut self) {
+        // Recomputed here rather than at the one call site that changes the
+        // query, so the 300ms card refresh sees expansion for the query that
+        // is actually live. Held apart from `expanded`, which is persisted to
+        // a tmux global: a query must never rewrite the remembered state.
+        self.search_expanded = if self.query.trim().is_empty() {
+            HashSet::new()
+        } else {
+            sessions_matching_windows(&self.filtered, &self.sessions)
+        };
+
         let keep_session = self
             .sessions_pane
             .selected()
@@ -285,6 +350,61 @@ impl SwitcherUi {
         self.focused_pane().selected()
     }
 
+    /// The window every key acts on: the focused section's row target while a
+    /// sections view is up, the grid cursor in the palette. Resolving it in one
+    /// place is what keeps the two selection models from drifting apart — the
+    /// sidebar's cursor is the only one it renders, so anything reading
+    /// `GridState` there acts on a window the user cannot see.
+    fn selected_target(&self) -> Option<&WindowCard> {
+        if self.uses_sections() {
+            self.selected_row().map(|row| &row.target)
+        } else {
+            self.state.selected_card(&self.filtered)
+        }
+    }
+
+    /// Closes the switcher on whatever [`Self::selected_target`] resolves to;
+    /// `None` (stay open) when nothing is selected.
+    fn select_target(&self) -> Option<Option<SwitcherAction>> {
+        self.selected_target()
+            .map(|card| Some(SwitcherAction::Select(card.clone())))
+    }
+
+    fn move_focused_pane(&mut self, direction: Direction) {
+        let delta = match direction {
+            Direction::Down => 1,
+            Direction::Up => -1,
+            // The sections have no lateral movement; `h`/`l` collapse and
+            // expand instead (spec §5).
+            Direction::Left | Direction::Right => return,
+        };
+        self.focused_pane_mut().move_by(delta);
+    }
+
+    /// Points `GridState` at the row the sections cursor is on, so the
+    /// selection-driven mutations in `state.rs` — window and session
+    /// reordering — act on the row the user can actually see. A no-op in the
+    /// palette, where `GridState` *is* the visible cursor.
+    fn sync_grid_to_sections(&mut self) {
+        if !self.uses_sections() {
+            return;
+        }
+        let Some(window_id) = self.selected_row().map(|row| row.target.window_id.clone()) else {
+            return;
+        };
+        let synced = GridState::for_window_id(&self.filtered, &window_id);
+        // `for_window_id` falls back to (0, 0) for an id it cannot find; only
+        // adopt it when it really landed on the row's target, so a stale row
+        // can never quietly redirect a reorder onto the first window.
+        if synced
+            .selected_card(&self.filtered)
+            .map(|card| card.window_id.as_str())
+            == Some(window_id.as_str())
+        {
+            self.state = synced;
+        }
+    }
+
     /// Expands the selected session. On a window row this does nothing — the
     /// row is already the expansion.
     fn toggle_expanded(&mut self) {
@@ -328,6 +448,9 @@ impl SwitcherUi {
         )
     }
 
+    /// Re-applies the query to the palette's grid selection and always rebuilds
+    /// the section rows behind it — including the search auto-expansion, which
+    /// `rebuild_panes` owns.
     fn refilter(&mut self, navigation_height: u16) {
         apply_query(
             &mut self.filtered,
@@ -336,11 +459,6 @@ impl SwitcherUi {
             &self.query,
             navigation_height,
         );
-        self.search_expanded = if self.query.trim().is_empty() {
-            HashSet::new()
-        } else {
-            sessions_matching_windows(&self.filtered, &self.sessions)
-        };
         self.rebuild_panes();
     }
 
@@ -363,7 +481,7 @@ impl SwitcherUi {
     }
 
     fn open_new_window_prompt(&mut self) {
-        if let Some(card) = self.state.selected_card(&self.filtered) {
+        if let Some(card) = self.selected_target() {
             let session_name = card.session_name.clone();
             self.show_help = false;
             self.prompt = Some(PromptState::new(PromptKind::NewWindow { session_name }));
@@ -376,7 +494,7 @@ impl SwitcherUi {
     }
 
     fn open_rename_prompt(&mut self) {
-        if let Some(card) = self.state.selected_card(&self.filtered) {
+        if let Some(card) = self.selected_target() {
             let kind = PromptKind::RenameWindow {
                 window_id: card.window_id.clone(),
             };
@@ -406,6 +524,7 @@ impl SwitcherUi {
     /// tmux. Best-effort: if tmux rejects the swap (e.g. a window vanished),
     /// the periodic card refresh restores tmux's real order within a beat.
     fn move_selected_window(&mut self, direction: Direction, navigation_height: u16) {
+        self.sync_grid_to_sections();
         if let Some((source, target)) = swap_selected_window(
             &mut self.sessions,
             &mut self.filtered,
@@ -415,31 +534,24 @@ impl SwitcherUi {
             navigation_height,
         ) {
             let _ = swap_windows(&source, &target);
+            // The rows are built from the cached order, so they have to be
+            // rebuilt for the move to show before the next card refresh.
+            self.rebuild_panes();
         }
     }
 
     fn handle_mouse(&mut self, kind: MouseEventKind, navigation_height: u16) {
-        match kind {
-            MouseEventKind::ScrollDown => {
-                self.numbered_input.clear();
-                move_compact_selection(
-                    &mut self.state,
-                    &self.filtered,
-                    Direction::Down,
-                    navigation_height,
-                );
-            }
-            MouseEventKind::ScrollUp => {
-                self.numbered_input.clear();
-                move_compact_selection(
-                    &mut self.state,
-                    &self.filtered,
-                    Direction::Up,
-                    navigation_height,
-                );
-            }
-            _ => {}
+        let direction = match kind {
+            MouseEventKind::ScrollDown => Direction::Down,
+            MouseEventKind::ScrollUp => Direction::Up,
+            _ => return,
+        };
+        self.numbered_input.clear();
+        if self.uses_sections() {
+            self.move_focused_pane(direction);
+            return;
         }
+        move_compact_selection(&mut self.state, &self.filtered, direction, navigation_height);
     }
 
     /// Feeds one key into the switcher. `Some(result)` closes it with that
@@ -471,9 +583,12 @@ impl SwitcherUi {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
 
         // A Vim-style count survives until j/k consumes it or another digit
-        // leaves it with no matching relative target.
+        // leaves it with no matching relative target. The sections draw no row
+        // numbers, so nothing there can be counted to and the count never
+        // starts (see the digit arm in `handle_keys_mode_char`).
         let keys_count_key = self.input == InputMode::Keys
             && !ctrl
+            && !self.uses_sections()
             && matches!(key.code, KeyCode::Char(ch) if ch.is_ascii_digit());
         let keys_count_motion = self.input == InputMode::Keys
             && !ctrl
@@ -500,9 +615,7 @@ impl SwitcherUi {
             }
             KeyCode::Enter => {
                 if self.uses_sections() {
-                    return self
-                        .selected_row()
-                        .map(|row| Some(SwitcherAction::Select(row.target.clone())));
+                    return self.select_target();
                 }
                 if self.input == InputMode::Numbers {
                     if self.numbered_input.contains(',') {
@@ -636,6 +749,7 @@ impl SwitcherUi {
                 } else {
                     Direction::Up
                 };
+                self.sync_grid_to_sections();
                 if swap_selected_session(
                     &mut self.sessions,
                     &mut self.filtered,
@@ -645,6 +759,10 @@ impl SwitcherUi {
                     navigation_height,
                 ) {
                     persist_session_order(&self.sessions);
+                    // The section rows carry the old order until they are
+                    // rebuilt; `row_key` then walks the cursor along with the
+                    // session it moved.
+                    self.rebuild_panes();
                 }
             }
             KeyCode::Char('r') if self.input != InputMode::Search => {
@@ -653,18 +771,28 @@ impl SwitcherUi {
             }
             KeyCode::Char('j' | 'k') if self.input == InputMode::Numbers => {
                 self.numbered_input.clear();
-                move_compact_selection(
-                    &mut self.state,
-                    &self.filtered,
-                    if key.code == KeyCode::Char('j') {
-                        Direction::Down
-                    } else {
-                        Direction::Up
-                    },
-                    navigation_height,
-                );
+                let direction = if key.code == KeyCode::Char('j') {
+                    Direction::Down
+                } else {
+                    Direction::Up
+                };
+                if self.uses_sections() {
+                    self.move_focused_pane(direction);
+                    return None;
+                }
+                move_compact_selection(&mut self.state, &self.filtered, direction, navigation_height);
             }
-            KeyCode::Char(ch) if self.input == InputMode::Numbers && ch.is_ascii_digit() => {
+            // Numbered addressing is a property of the compact list, which
+            // renders the row numbers it reads. `render_sections` draws none,
+            // so in the sidebar a digit would address rows nobody can see —
+            // spec §5's "numbers: address rows in the focused section" is
+            // unbuilt, and until it is, digits are swallowed rather than
+            // steering an invisible cursor onto an unrendered window.
+            KeyCode::Char(ch)
+                if self.input == InputMode::Numbers
+                    && ch.is_ascii_digit()
+                    && !self.uses_sections() =>
+            {
                 if let Some(card) = push_numbered_choice(
                     &mut self.numbered_input,
                     ch,
@@ -675,7 +803,7 @@ impl SwitcherUi {
                 }
                 keep_compact_selection_visible(&mut self.state, &self.filtered, navigation_height);
             }
-            KeyCode::Char(',') if self.input == InputMode::Numbers => {
+            KeyCode::Char(',') if self.input == InputMode::Numbers && !self.uses_sections() => {
                 if accept_numbered_session(&mut self.numbered_input, &self.filtered) {
                     sync_numbered_selection(
                         &self.numbered_input,
@@ -718,45 +846,43 @@ impl SwitcherUi {
     ) -> Option<Option<SwitcherAction>> {
         match ch {
             'c' => return Some(None),
-            'j' => {
+            'j' | 'k' => {
+                let direction = if ch == 'j' {
+                    Direction::Down
+                } else {
+                    Direction::Up
+                };
+                if self.uses_sections() {
+                    self.move_focused_pane(direction);
+                    return self.select_target();
+                }
                 if let Some(card) = select_compact_relative(
                     &mut self.state,
                     &self.filtered,
-                    Direction::Down,
+                    direction,
                     1,
                     navigation_height,
                 ) {
                     return Some(Some(SwitcherAction::Select(card)));
                 }
             }
-            'k' => {
-                if let Some(card) = select_compact_relative(
-                    &mut self.state,
-                    &self.filtered,
-                    Direction::Up,
-                    1,
-                    navigation_height,
-                ) {
-                    return Some(Some(SwitcherAction::Select(card)));
+            'n' | 'p' => {
+                let direction = if ch == 'n' {
+                    Direction::Down
+                } else {
+                    Direction::Up
+                };
+                if self.uses_sections() {
+                    self.move_focused_pane(direction);
+                    return None;
                 }
-            }
-            'n' => {
-                move_compact_selection(
-                    &mut self.state,
-                    &self.filtered,
-                    Direction::Down,
-                    navigation_height,
-                );
-            }
-            'p' => {
-                move_compact_selection(
-                    &mut self.state,
-                    &self.filtered,
-                    Direction::Up,
-                    navigation_height,
-                );
+                move_compact_selection(&mut self.state, &self.filtered, direction, navigation_height);
             }
             'h' => {
+                if self.uses_sections() {
+                    self.collapse_selected();
+                    return None;
+                }
                 move_compact_selection(
                     &mut self.state,
                     &self.filtered,
@@ -765,6 +891,10 @@ impl SwitcherUi {
                 );
             }
             'l' => {
+                if self.uses_sections() {
+                    self.toggle_expanded();
+                    return None;
+                }
                 move_compact_selection(
                     &mut self.state,
                     &self.filtered,
@@ -797,16 +927,7 @@ impl SwitcherUi {
     ) -> Option<Option<SwitcherAction>> {
         match ch {
             'q' => return Some(None),
-            ' ' => {
-                if self.uses_sections() {
-                    return self
-                        .selected_row()
-                        .map(|row| Some(SwitcherAction::Select(row.target.clone())));
-                }
-                if let Some(card) = self.state.selected_card(&self.filtered) {
-                    return Some(Some(SwitcherAction::Select(card.clone())));
-                }
-            }
+            ' ' => return self.select_target(),
             '?' => self.toggle_help(terminal_size),
             'n' => self.open_new_window_prompt(),
             'N' => self.open_new_session_prompt(),
@@ -829,7 +950,14 @@ impl SwitcherUi {
                     );
                 }
             }
+            // Spec §5 leaves the session-edge jumps unbound in the Sessions
+            // section: once a session is itself a row, `j`/`k` already walks
+            // between sessions and an "edge" has nothing left to mean. An
+            // explicit no-op, not a silent move of a cursor nothing draws.
             'H' => {
+                if self.uses_sections() {
+                    return None;
+                }
                 move_compact_session_edge(
                     &mut self.state,
                     &self.filtered,
@@ -839,8 +967,11 @@ impl SwitcherUi {
             }
             'j' | 'k' => {
                 if self.uses_sections() {
-                    let delta = if ch == 'j' { 1 } else { -1 };
-                    self.focused_pane_mut().move_by(delta);
+                    self.move_focused_pane(if ch == 'j' {
+                        Direction::Down
+                    } else {
+                        Direction::Up
+                    });
                     return None;
                 }
                 if let Some((direction, count)) =
@@ -881,6 +1012,9 @@ impl SwitcherUi {
                 }
             }
             'L' => {
+                if self.uses_sections() {
+                    return None;
+                }
                 move_compact_session_edge(
                     &mut self.state,
                     &self.filtered,
@@ -888,7 +1022,14 @@ impl SwitcherUi {
                     navigation_height,
                 );
             }
+            // The count addresses the compact list's relative row numbers, and
+            // the sections render none — so `j`/`k` there could never consume
+            // one. Swallow the digit rather than accumulating a count that
+            // silently disappears at the next motion.
             _ if ch.is_ascii_digit() => {
+                if self.uses_sections() {
+                    return None;
+                }
                 push_matching_movement_count(
                     &mut self.movement_count,
                     ch,
@@ -979,12 +1120,7 @@ fn run_tui_loop(
             compact_lines(&ui.filtered).len(),
         )
         .preview;
-        let preview_card = if ui.uses_sections() {
-            ui.selected_row().map(|row| &row.target)
-        } else {
-            ui.state.selected_card(&ui.filtered)
-        };
-        preview.refresh_for(preview_card, preview_area, now);
+        preview.refresh_for(ui.selected_target(), preview_area, now);
         if now.duration_since(last_full_redraw) >= FULL_REDRAW_INTERVAL {
             queue_full_repaint(terminal)?;
             last_full_redraw = now;
@@ -1041,25 +1177,80 @@ mod tests {
     use crate::model::{AgentKind, AgentState, AgentStatus};
     use crate::test_support::test_card;
 
-    // `SwitcherUi::new` reads the real `EXPANDED_OPTION` tmux global (via
-    // `initial_expanded`) and shells out to load the session order, so tests
-    // must not depend on the developer's live tmux state. Reset the
-    // expansion set and rebuild before returning, so every assertion starts
-    // from a known collapsed state regardless of what tmux happens to have.
+    // `SwitcherUi::new` reads the real tmux globals for the view, the input
+    // mode and the expansion set, so tests go through `with_settings` and
+    // inject all three: every assertion then starts from the default sidebar,
+    // in Keys mode, with nothing remembered as expanded, regardless of what
+    // the developer's tmux server happens to hold.
     fn ui_with(cards: Vec<WindowCard>) -> SwitcherUi {
-        let mut ui = SwitcherUi::new(
+        ui_with_current(cards, None)
+    }
+
+    fn ui_with_current(cards: Vec<WindowCard>, current_window_id: Option<&str>) -> SwitcherUi {
+        SwitcherUi::with_settings(
+            cards,
+            current_window_id,
+            size(),
+            HashSet::new(),
+            ViewMode::Sidebar,
+            InputMode::Keys,
+        )
+    }
+
+    /// The view the branch deliberately left on the flat `GridState` list.
+    fn palette_ui(cards: Vec<WindowCard>) -> SwitcherUi {
+        SwitcherUi::with_settings(
             cards,
             None,
-            Rect {
-                x: 0,
-                y: 0,
-                width: 80,
-                height: 40,
-            },
-        );
-        ui.expanded.clear();
-        ui.rebuild_panes();
-        ui
+            size(),
+            HashSet::new(),
+            ViewMode::Palette,
+            InputMode::Keys,
+        )
+    }
+
+    /// Three single-window sessions, so section rows and grid rows line up
+    /// one-to-one and a test can name exactly which window a key acted on.
+    fn three_sessions() -> Vec<WindowCard> {
+        ["alpha", "bravo", "charlie"]
+            .into_iter()
+            .map(|name| {
+                let mut card = test_card(name, "0");
+                card.window_name = format!("{name}-win");
+                card
+            })
+            .collect()
+    }
+
+    fn ctrl(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    fn alt(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::ALT)
+    }
+
+    /// The window a closing result opens, by session name.
+    fn opened(result: &Option<Option<SwitcherAction>>) -> Option<&str> {
+        match result {
+            Some(Some(SwitcherAction::Select(card))) => Some(card.session_name.as_str()),
+            _ => None,
+        }
+    }
+
+    fn session_names(sessions: &[SessionGroup]) -> Vec<&str> {
+        sessions
+            .iter()
+            .map(|session| session.session_name.as_str())
+            .collect()
+    }
+
+    fn window_ids(session: &SessionGroup) -> Vec<&str> {
+        session
+            .cards
+            .iter()
+            .map(|card| card.window_id.as_str())
+            .collect()
     }
 
     #[test]
@@ -1310,6 +1501,317 @@ mod tests {
     /// nothing. Enter then does nothing and leaves the switcher open, the
     /// same as the palette's `select_key_action` does when nothing is
     /// selected.
+    // ---- The sections cursor is the one every key acts on --------------
+    //
+    // Tasks 5-8 moved navigation and selection onto the two panes, but every
+    // other key kept reading `GridState` — a cursor section navigation never
+    // touches and the sidebar never draws. Each test below drives the visible
+    // cursor off row 0 first, so a key still reading `GridState` acts on a
+    // different, nameable window.
+
+    #[test]
+    fn ctrl_j_opens_the_window_below_the_sections_cursor() {
+        let mut ui = ui_with(three_sessions());
+        ui.handle_key(key(KeyCode::Char('j')), size());
+        assert_eq!(ui.sessions_pane.cursor, 1);
+
+        let result = ui.handle_key(ctrl(KeyCode::Char('j')), size());
+
+        assert_eq!(opened(&result), Some("charlie"));
+    }
+
+    #[test]
+    fn ctrl_k_opens_the_window_above_the_sections_cursor() {
+        let mut ui = ui_with(three_sessions());
+        ui.handle_key(key(KeyCode::Char('j')), size());
+        ui.handle_key(key(KeyCode::Char('j')), size());
+        assert_eq!(ui.sessions_pane.cursor, 2);
+
+        let result = ui.handle_key(ctrl(KeyCode::Char('k')), size());
+
+        assert_eq!(opened(&result), Some("bravo"));
+    }
+
+    /// The destructive one: the prompt pre-filled from `GridState` and renamed
+    /// that window id, so `r` silently renamed a window the user was not
+    /// looking at.
+    #[test]
+    fn r_prefills_the_rename_prompt_from_the_row_under_the_cursor() {
+        let mut ui = ui_with(three_sessions());
+        ui.handle_key(key(KeyCode::Char('j')), size());
+
+        ui.handle_key(key(KeyCode::Char('r')), size());
+
+        let prompt = ui.prompt.expect("a rename prompt");
+        assert_eq!(
+            prompt.kind,
+            PromptKind::RenameWindow {
+                window_id: "@bravo-0".to_owned()
+            }
+        );
+        assert_eq!(prompt.input, "bravo-win");
+    }
+
+    #[test]
+    fn n_opens_a_new_window_in_the_session_under_the_cursor() {
+        let mut ui = ui_with(three_sessions());
+        ui.handle_key(key(KeyCode::Char('j')), size());
+
+        ui.handle_key(key(KeyCode::Char('n')), size());
+
+        assert_eq!(
+            ui.prompt.expect("a new-window prompt").kind,
+            PromptKind::NewWindow {
+                session_name: "bravo".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn shift_j_reorders_the_session_under_the_cursor() {
+        let mut ui = ui_with(three_sessions());
+        ui.handle_key(key(KeyCode::Char('j')), size());
+
+        ui.handle_key(key(KeyCode::Char('J')), size());
+
+        assert_eq!(session_names(&ui.sessions), ["alpha", "charlie", "bravo"]);
+        // The rows are rebuilt, and the cursor rides along with the session it
+        // moved rather than staying on the index it used to sit at.
+        assert_eq!(ui.sessions_pane.cursor, 2);
+        assert_eq!(
+            row_key(ui.sessions_pane.selected().expect("a selected row")),
+            "bravo"
+        );
+    }
+
+    #[test]
+    fn alt_j_swaps_the_window_under_the_cursor() {
+        let cards = vec![
+            test_card("alpha", "0"),
+            test_card("alpha", "1"),
+            test_card("alpha", "2"),
+        ];
+        let mut ui = ui_with(cards);
+        ui.handle_key(key(KeyCode::Char('l')), size());
+        ui.handle_key(key(KeyCode::Char('j')), size());
+        ui.handle_key(key(KeyCode::Char('j')), size());
+
+        ui.handle_key(alt(KeyCode::Char('j')), size());
+
+        assert_eq!(
+            window_ids(&ui.sessions[0]),
+            ["@alpha-0", "@alpha-2", "@alpha-1"]
+        );
+        // Rebuilt rows, so the sidebar shows the move before the next refresh.
+        assert_eq!(
+            ui.sessions_pane
+                .selected()
+                .expect("a selected row")
+                .target
+                .window_id,
+            "@alpha-1"
+        );
+    }
+
+    /// Spec §5 leaves the session-edge jumps unbound in the Sessions section.
+    /// They were not unbound — they moved the cursor nothing draws.
+    #[test]
+    fn shift_h_and_shift_l_are_unbound_in_the_sections() {
+        let mut ui = ui_with(three_sessions());
+        ui.handle_key(key(KeyCode::Char('j')), size());
+        let grid = ui.state.clone();
+
+        ui.handle_key(key(KeyCode::Char('L')), size());
+        ui.handle_key(key(KeyCode::Char('H')), size());
+
+        assert_eq!(ui.sessions_pane.cursor, 1);
+        assert_eq!(ui.state, grid);
+    }
+
+    /// Scrolling worked before the branch and stopped working with it: two
+    /// wheel events left the sections cursor at 0.
+    #[test]
+    fn the_mouse_wheel_scrolls_the_focused_section() {
+        let mut ui = ui_with(three_sessions());
+
+        ui.handle_mouse(MouseEventKind::ScrollDown, 40);
+        ui.handle_mouse(MouseEventKind::ScrollDown, 40);
+        assert_eq!(ui.sessions_pane.cursor, 2);
+
+        ui.handle_mouse(MouseEventKind::ScrollUp, 40);
+        assert_eq!(ui.sessions_pane.cursor, 1);
+    }
+
+    /// `render_sections` draws no row numbers, so a digit has nothing on
+    /// screen to address. It still drove the hidden grid, and `2,1` opened a
+    /// window the sidebar never showed.
+    #[test]
+    fn numbered_addressing_is_inert_in_the_sections() {
+        let mut ui = ui_with(three_sessions());
+        ui.input = InputMode::Numbers;
+        let grid = ui.state.clone();
+
+        assert_eq!(ui.handle_key(key(KeyCode::Char('2')), size()), None);
+        assert_eq!(ui.handle_key(key(KeyCode::Char(',')), size()), None);
+        assert_eq!(ui.handle_key(key(KeyCode::Char('1')), size()), None);
+
+        assert!(ui.numbered_input.is_empty());
+        assert_eq!(ui.state, grid);
+        assert_eq!(ui.sessions_pane.cursor, 0);
+    }
+
+    /// j/k still navigate in Numbers mode, and there too they drive the
+    /// visible cursor.
+    #[test]
+    fn j_moves_the_focused_section_in_numbers_mode() {
+        let mut ui = ui_with(three_sessions());
+        ui.input = InputMode::Numbers;
+
+        ui.handle_key(key(KeyCode::Char('j')), size());
+
+        assert_eq!(ui.sessions_pane.cursor, 1);
+    }
+
+    /// The count prefix accumulated but `j`/`k` short-circuited before
+    /// consuming it, so `2` then `j` moved one row and swallowed the count.
+    #[test]
+    fn a_count_prefix_is_swallowed_in_the_sections() {
+        let mut ui = ui_with(three_sessions());
+
+        ui.handle_key(key(KeyCode::Char('2')), size());
+        assert_eq!(ui.movement_count, None);
+
+        ui.handle_key(key(KeyCode::Char('j')), size());
+        assert_eq!(ui.sessions_pane.cursor, 1);
+    }
+
+    /// The "open pre-moved" launcher binding (`Ctrl+j` opens the switcher
+    /// already moved one down) applied to `GridState` only, leaving it inert
+    /// in the sidebar.
+    #[test]
+    fn the_initial_move_drives_the_sections_cursor() {
+        let mut ui = ui_with(three_sessions());
+
+        ui.apply_initial_move(Direction::Down, size());
+
+        assert_eq!(ui.sessions_pane.cursor, 1);
+    }
+
+    /// Spec §4: the attached session starts expanded, and the switcher opens
+    /// on the window you are in — the sections cursor used to start at 0
+    /// however deep in the list that window was.
+    #[test]
+    fn opening_puts_the_cursor_on_the_current_window() {
+        let cards = vec![
+            test_card("alpha", "0"),
+            test_card("bravo", "0"),
+            test_card("bravo", "1"),
+        ];
+
+        let ui = ui_with_current(cards, Some("@bravo-1"));
+
+        assert!(ui.expanded.contains("bravo"));
+        let selected = ui.sessions_pane.selected().expect("a selected row");
+        assert_eq!(selected.target.window_id, "@bravo-1");
+        assert!(matches!(selected.kind, RowKind::Window { .. }));
+    }
+
+    /// With the session collapsed there is no window row to land on, so the
+    /// cursor takes the session row that stands in for it.
+    #[test]
+    fn a_collapsed_current_session_takes_the_cursor_on_its_session_row() {
+        let cards = vec![
+            test_card("alpha", "0"),
+            test_card("bravo", "0"),
+            test_card("bravo", "1"),
+        ];
+
+        let ui = SwitcherUi::with_settings(
+            cards,
+            Some("@bravo-0"),
+            size(),
+            // A non-empty remembered set is the user's own choice and is taken
+            // as-is, so "bravo" stays collapsed.
+            HashSet::from(["alpha".to_owned()]),
+            ViewMode::Sidebar,
+            InputMode::Keys,
+        );
+
+        assert!(!ui.expanded.contains("bravo"));
+        let selected = ui.sessions_pane.selected().expect("a selected row");
+        assert_eq!(selected.target.window_id, "@bravo-0");
+        assert!(matches!(selected.kind, RowKind::Session { .. }));
+    }
+
+    /// The palette is deliberately still on `GridState`, and none of the
+    /// above may have leaked into it: counts accumulate, `L` jumps to the
+    /// session edge, and `Ctrl-j` opens relative to the grid cursor.
+    #[test]
+    fn the_palette_still_drives_the_grid_cursor() {
+        let mut ui = palette_ui(three_sessions());
+
+        ui.handle_key(key(KeyCode::Char('2')), size());
+        assert_eq!(ui.movement_count, Some(2));
+
+        ui.handle_key(key(KeyCode::Char('L')), size());
+        assert_eq!(ui.state.selected_row, 1);
+
+        let result = ui.handle_key(ctrl(KeyCode::Char('j')), size());
+        assert_eq!(opened(&result), Some("charlie"));
+    }
+
+    /// The 300ms card refresh rebuilt the rows with the auto-expansion set
+    /// `refilter` had computed for the *previous* card list, so a window that
+    /// appeared while a query stood stayed hidden inside a collapsed session —
+    /// exactly what auto-expansion exists to prevent.
+    #[test]
+    fn a_refresh_expands_a_session_the_live_query_has_just_narrowed() {
+        let mut alpha = test_card("dotfiles", "0");
+        alpha.window_name = "alpha".to_owned();
+        let other = test_card("other", "0");
+        let mut ui = ui_with(vec![alpha.clone(), other.clone()]);
+
+        ui.query = "zzzneedle".to_owned();
+        ui.refilter(40);
+        assert!(ui.search_expanded.is_empty());
+
+        let mut needle = test_card("dotfiles", "1");
+        needle.window_name = "zzzneedle".to_owned();
+        ui.refresh_cards(vec![alpha, needle.clone(), other], 40);
+
+        assert!(ui.search_expanded.contains("dotfiles"));
+        // Never into the persisted set.
+        assert!(ui.expanded.is_empty());
+        assert!(ui.sessions_pane.items().iter().any(|row| {
+            matches!(row.kind, RowKind::Window { .. }) && row.target.window_id == needle.window_id
+        }));
+    }
+
+    /// Focus must not strand on a section that is no longer rendered. The
+    /// reset lives in `rebuild_panes`; this drives it through the refresh
+    /// path, which is how an agent actually disappears.
+    #[test]
+    fn focus_returns_to_sessions_when_the_last_agent_exits() {
+        let mut agent = test_card("dotfiles", "0");
+        agent.agent_status = AgentStatus {
+            agent: Some(AgentKind::Claude),
+            state: AgentState::Working,
+            seen: true,
+            run_started_at: None,
+        };
+        let plain = test_card("dotfiles", "1");
+        let mut ui = ui_with(vec![agent.clone(), plain.clone()]);
+        ui.handle_key(key(KeyCode::Tab), size());
+        assert_eq!(ui.focus, SectionFocus::Agents);
+
+        let mut stopped = agent;
+        stopped.agent_status = AgentStatus::unknown();
+        ui.refresh_cards(vec![stopped, plain], 40);
+
+        assert!(ui.agents_pane.is_empty());
+        assert_eq!(ui.focus, SectionFocus::Sessions);
+    }
+
     #[test]
     fn enter_does_nothing_when_the_focused_pane_is_empty() {
         let mut ui = ui_with(vec![test_card("dotfiles", "0")]);

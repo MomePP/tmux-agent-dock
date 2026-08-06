@@ -172,6 +172,37 @@ pub(crate) fn section_heights(body: Rect, agent_row_count: usize) -> (Rect, Opti
     (sessions, Some(agents))
 }
 
+/// The session holding the window the switcher was opened from.
+fn attached_session_name(
+    sessions: &[SessionGroup],
+    current_window_id: Option<&str>,
+) -> Option<String> {
+    let window_id = current_window_id?;
+    sessions
+        .iter()
+        .find(|session| session.cards.iter().any(|card| card.window_id == window_id))
+        .map(|session| session.session_name.clone())
+}
+
+/// The expansion set the switcher opens with. Spec §4 starts the session you
+/// are attached to expanded — but only on a fresh server: once the persisted
+/// option carries a set, it is the user's own choice, and re-expanding what
+/// they collapsed would fight them every open.
+pub(crate) fn initial_expanded_set(
+    persisted: HashSet<String>,
+    sessions: &[SessionGroup],
+    current_window_id: Option<&str>,
+) -> HashSet<String> {
+    let mut expanded = persisted;
+    if !expanded.is_empty() {
+        return expanded;
+    }
+    if let Some(name) = attached_session_name(sessions, current_window_id) {
+        expanded.insert(name);
+    }
+    expanded
+}
+
 /// Session names may contain spaces, so the persisted set is tab-separated.
 const EXPANDED_SEPARATOR: char = '\t';
 
@@ -467,6 +498,37 @@ mod tests {
     fn parsing_an_empty_option_yields_nothing_expanded() {
         assert!(parse_expanded("").is_empty());
         assert!(parse_expanded("\t\t").is_empty());
+    }
+
+    /// Spec §4: "The attached session starts expanded; everything else starts
+    /// collapsed." Task 4 built only the persistence half, so on a fresh tmux
+    /// server everything opened collapsed.
+    #[test]
+    fn a_fresh_server_opens_with_the_attached_session_expanded() {
+        let sessions = fixture();
+        let current = sessions[1].cards[0].window_id.clone();
+
+        let expanded = initial_expanded_set(HashSet::new(), &sessions, Some(&current));
+
+        assert_eq!(expanded, HashSet::from(["gogo".to_owned()]));
+    }
+
+    /// Once something was remembered, the remembered set is the whole answer —
+    /// re-adding the attached session would undo a deliberate collapse.
+    #[test]
+    fn a_remembered_set_is_left_exactly_as_it_was() {
+        let sessions = fixture();
+        let current = sessions[1].cards[0].window_id.clone();
+        let persisted = HashSet::from(["dotfiles".to_owned()]);
+
+        let expanded = initial_expanded_set(persisted.clone(), &sessions, Some(&current));
+
+        assert_eq!(expanded, persisted);
+    }
+
+    #[test]
+    fn nothing_is_expanded_when_the_current_window_is_unknown() {
+        assert!(initial_expanded_set(HashSet::new(), &fixture(), None).is_empty());
     }
 
     #[test]
