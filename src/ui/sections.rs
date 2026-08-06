@@ -161,22 +161,60 @@ pub(crate) fn agent_rows(sessions: &[SessionGroup]) -> Vec<Row> {
     rows
 }
 
-/// Screen lines one row occupies: a name line and a dim detail line beneath it.
+/// Screen lines one row occupies, which differs by section.
 ///
-/// Every row in both sections is the same height, which is what lets the
-/// renderer, the click resolver and the scroll clamp share one conversion
-/// instead of each carrying its own idea of where a row starts.
-pub(crate) const ROW_LINES: u16 = 2;
-
-/// How many rows fit in `height` screen lines, given each row's title line is
-/// already accounted for by the caller.
-pub(crate) fn rows_per_height(height: u16) -> usize {
-    (height / ROW_LINES) as usize
+/// Sessions is a tree you scan: with a dozen sessions expanded, a second line
+/// per row halves how much of it fits on screen, and the only thing that line
+/// carried — the window count and the fold arrow — fits on the name line's
+/// right edge. Agents keeps its pair, because `working · claude_2` is the
+/// whole point of the row and there is nowhere else for it to go.
+///
+/// This is the one authority on row height: the renderer, the click resolver
+/// and the scroll clamp all convert through it, so none of them can disagree
+/// about where a row starts.
+pub(crate) fn row_lines(section: SectionFocus) -> u16 {
+    match section {
+        SectionFocus::Sessions => 1,
+        SectionFocus::Agents => 2,
+    }
 }
 
-/// Below this the body cannot carry two titles plus a row each, so the split is
-/// abandoned and Sessions keeps everything.
-const MIN_SPLIT_HEIGHT: u16 = 6;
+/// How many rows fit in `height` screen lines.
+pub(crate) fn rows_per_height(height: u16, section: SectionFocus) -> usize {
+    (height / row_lines(section)) as usize
+}
+
+/// Lines a section spends above its first row.
+///
+/// Sessions: the title, then a blank line. Agents: a rule marking the boundary
+/// between the two halves, then the same title and blank. The rule belongs to
+/// the section below it rather than to the one above, because Sessions rarely
+/// fills its half — hanging the rule off the end of the session list would put
+/// it in a different place every time a session was expanded.
+pub(crate) fn header_lines(section: SectionFocus) -> u16 {
+    match section {
+        SectionFocus::Sessions => 2,
+        SectionFocus::Agents => 3,
+    }
+}
+
+/// The part of a section's area its rows are drawn into, below the header.
+/// The renderer, the click resolver and the scroll clamp all go through this,
+/// so none of them can disagree about where row 0 starts.
+pub(crate) fn rows_area(area: Rect, section: SectionFocus) -> Rect {
+    let header = header_lines(section);
+    Rect {
+        y: area.y.saturating_add(header),
+        height: area.height.saturating_sub(header),
+        ..area
+    }
+}
+
+/// Below this the body cannot carry both headers plus a row each, so the split
+/// is abandoned and Sessions keeps everything. The Agents half is the binding
+/// constraint: three header lines and a two-line row is five, and it gets the
+/// smaller half of an odd body.
+const MIN_SPLIT_HEIGHT: u16 = 10;
 
 /// Divides the body in half between the two sections. The split does not depend
 /// on how many agents are running: an Agents section that resizes itself moves
@@ -360,7 +398,13 @@ pub(crate) fn row_at(
 ) -> ClickTarget {
     let (sessions_area, agents_area) = section_heights(body);
 
-    if let Some(target) = hit(sessions_area, click_y, sessions_len, sessions_offset) {
+    if let Some(target) = hit(
+        sessions_area,
+        click_y,
+        sessions_len,
+        sessions_offset,
+        SectionFocus::Sessions,
+    ) {
         return match target {
             Some(index) => ClickTarget::Row {
                 section: SectionFocus::Sessions,
@@ -373,7 +417,13 @@ pub(crate) fn row_at(
     let Some(agents_area) = agents_area else {
         return ClickTarget::None;
     };
-    match hit(agents_area, click_y, agents_len, agents_offset) {
+    match hit(
+        agents_area,
+        click_y,
+        agents_len,
+        agents_offset,
+        SectionFocus::Agents,
+    ) {
         Some(Some(index)) => ClickTarget::Row {
             section: SectionFocus::Agents,
             index,
@@ -386,17 +436,27 @@ pub(crate) fn row_at(
 /// `None` when the click is outside this section; `Some(None)` when it is on
 /// the title or past the last row; `Some(Some(index))` when it is on a row.
 #[allow(dead_code)] // Task 3: mouse event handler
-fn hit(area: Rect, click_y: u16, len: usize, offset: usize) -> Option<Option<usize>> {
+fn hit(
+    area: Rect,
+    click_y: u16,
+    len: usize,
+    offset: usize,
+    section: SectionFocus,
+) -> Option<Option<usize>> {
     if area.height == 0 || click_y < area.y || click_y >= area.y.saturating_add(area.height) {
         return None;
     }
-    // Line 0 of the section is its title.
-    let Some(line) = click_y.checked_sub(area.y).filter(|line| *line > 0) else {
+    // The section's header — its rule, title and the blank line under them —
+    // is not a row: clicking it focuses the section and selects nothing.
+    let Some(line) = click_y
+        .checked_sub(area.y)
+        .and_then(|line| line.checked_sub(header_lines(section)))
+    else {
         return Some(None);
     };
-    // A row spans ROW_LINES lines, so either of them resolves to the same item:
-    // clicking an agent's `working · claude_1` detail means its name.
-    let index = offset.saturating_add(usize::from((line - 1) / ROW_LINES));
+    // An Agents row spans two lines, so either of them resolves to the same
+    // item: clicking `working · claude_1` means the agent above it.
+    let index = offset.saturating_add(usize::from(line / row_lines(section)));
     Some((index < len).then_some(index))
 }
 
@@ -646,16 +706,27 @@ mod tests {
         assert_eq!(few.1.expect("agents section").y, 10);
     }
 
-    /// The shortest body that still splits: a title plus one two-line row in
-    /// each half.
+    /// The shortest body that still splits. Agents is the binding half: its
+    /// rule, title and blank line, plus a two-line row, is five.
     #[test]
     fn the_shortest_splittable_body_gives_each_section_half() {
-        let (sessions, agents) = section_heights(body(6));
+        let (sessions, agents) = section_heights(body(10));
         let agents = agents.expect("agents section");
 
-        assert_eq!(agents.height, 3);
-        assert_eq!(sessions.height, 3);
-        assert_eq!(agents.y, 3);
+        assert_eq!(agents.height, 5);
+        assert_eq!(sessions.height, 5);
+        assert_eq!(agents.y, 5);
+        // Each half has exactly one row's worth of space left under its header.
+        assert_eq!(
+            rows_per_height(rows_area(agents, SectionFocus::Agents).height, SectionFocus::Agents),
+            1
+        );
+        assert!(
+            rows_per_height(
+                rows_area(sessions, SectionFocus::Sessions).height,
+                SectionFocus::Sessions
+            ) >= 1
+        );
     }
 
     /// An odd body cannot halve evenly; the extra row goes to Sessions, which
@@ -672,9 +743,11 @@ mod tests {
 
     #[test]
     fn a_body_too_short_to_split_stays_one_section() {
-        let (sessions, agents) = section_heights(body(5));
+        // One line short of splitting: the Agents half could not have fit a
+        // row under its header, so Sessions keeps the whole body instead.
+        let (sessions, agents) = section_heights(body(9));
 
-        assert_eq!(sessions, body(5));
+        assert_eq!(sessions, body(9));
         assert_eq!(agents, None);
     }
 
@@ -831,31 +904,31 @@ mod tests {
         assert!(expand.is_empty());
     }
 
-    /// body(20) splits into Sessions rows 0..10 and Agents rows 10..20, each
-    /// with a title on its first row.
+    /// body(20) splits into Sessions 0..10 and Agents 10..20. Sessions spends
+    /// y=0 on its title and y=1 blank, so its rows start at y=2; Agents spends
+    /// y=10 on the rule, y=11 on its title and y=12 blank, so its rows start
+    /// at y=13.
     #[test]
     fn a_click_on_a_row_resolves_to_that_row() {
         let area = body(20);
 
-        // Sessions title is y=0; its first row is y=1.
         assert_eq!(
-            row_at(area, 1, 5, 0, 3, 0),
+            row_at(area, 2, 5, 0, 3, 0),
             ClickTarget::Row {
                 section: SectionFocus::Sessions,
                 index: 0
             }
         );
-        // Rows are two lines tall: lines 1-2 are item 0, lines 3-4 item 1.
+        // Sessions rows are one line tall, so the next line is the next item.
         assert_eq!(
-            row_at(area, 3, 5, 0, 3, 0),
+            row_at(area, 4, 5, 0, 3, 0),
             ClickTarget::Row {
                 section: SectionFocus::Sessions,
-                index: 1
+                index: 2
             }
         );
-        // Agents starts at y=10; its title is y=10, first row y=11.
         assert_eq!(
-            row_at(area, 11, 5, 0, 3, 0),
+            row_at(area, 13, 5, 0, 3, 0),
             ClickTarget::Row {
                 section: SectionFocus::Agents,
                 index: 0
@@ -863,40 +936,73 @@ mod tests {
         );
     }
 
-    /// Clicking a title focuses that section without moving its cursor —
-    /// clicking a heading should not teleport you to a window.
+    /// Clicking a header — the rule, the title, or the blank line under it —
+    /// focuses that section without moving its cursor. Clicking a heading
+    /// should not teleport you to a window.
     #[test]
-    fn a_click_on_a_title_focuses_without_selecting() {
+    fn a_click_on_a_header_focuses_without_selecting() {
         let area = body(20);
 
-        assert_eq!(row_at(area, 0, 5, 0, 3, 0), ClickTarget::Section(SectionFocus::Sessions));
-        assert_eq!(row_at(area, 10, 5, 0, 3, 0), ClickTarget::Section(SectionFocus::Agents));
+        for line in [0, 1] {
+            assert_eq!(
+                row_at(area, line, 5, 0, 3, 0),
+                ClickTarget::Section(SectionFocus::Sessions),
+                "line {line} is Sessions header"
+            );
+        }
+        for line in [10, 11, 12] {
+            assert_eq!(
+                row_at(area, line, 5, 0, 3, 0),
+                ClickTarget::Section(SectionFocus::Agents),
+                "line {line} is Agents header"
+            );
+        }
     }
 
-    /// Both lines of a row mean the same entry — clicking an agent's
-    /// `working · claude_1` detail is clicking the agent.
+    /// Both lines of an Agents row mean the same entry — clicking an agent's
+    /// `working · claude_1` detail is clicking the agent. Sessions rows are a
+    /// single line, so there is no second line to get this wrong on.
     #[test]
-    fn either_line_of_a_row_resolves_to_the_same_item() {
+    fn either_line_of_an_agent_row_resolves_to_the_same_item() {
         let area = body(20);
 
-        for line in [1, 2] {
+        // Agents rows start at y=13: item 0 spans y=13..=14, item 1 y=15..=16.
+        for line in [13, 14] {
             assert_eq!(
                 row_at(area, line, 5, 0, 3, 0),
                 ClickTarget::Row {
-                    section: SectionFocus::Sessions,
+                    section: SectionFocus::Agents,
                     index: 0
                 },
                 "line {line} should be item 0"
             );
         }
-        for line in [3, 4] {
+        for line in [15, 16] {
             assert_eq!(
                 row_at(area, line, 5, 0, 3, 0),
                 ClickTarget::Row {
-                    section: SectionFocus::Sessions,
+                    section: SectionFocus::Agents,
                     index: 1
                 },
                 "line {line} should be item 1"
+            );
+        }
+    }
+
+    /// Each Sessions line is its own row, which is the whole point of the
+    /// section being one line tall: a click never lands an item short.
+    #[test]
+    fn consecutive_session_lines_are_consecutive_items() {
+        let area = body(20);
+
+        for (line, index) in [(2u16, 0usize), (3, 1), (4, 2), (5, 3)] {
+            assert_eq!(
+                row_at(area, line, 8, 0, 3, 0),
+                ClickTarget::Row {
+                    section: SectionFocus::Sessions,
+                    index
+                },
+                "line {line} should be item {index}"
             );
         }
     }
@@ -906,10 +1012,10 @@ mod tests {
     fn a_click_past_the_last_row_focuses_the_section_only() {
         let area = body(20);
 
-        // Sessions holds 2 rows: y=1 and y=2. y=5 is past them.
+        // Sessions holds 2 rows: y=2 and y=3. y=5 is past them.
         assert_eq!(row_at(area, 5, 2, 0, 3, 0), ClickTarget::Section(SectionFocus::Sessions));
-        // Agents holds 1 row at y=11. y=15 is past it.
-        assert_eq!(row_at(area, 15, 2, 0, 1, 0), ClickTarget::Section(SectionFocus::Agents));
+        // Agents holds 1 row, y=13..=14. y=17 is past it.
+        assert_eq!(row_at(area, 17, 2, 0, 1, 0), ClickTarget::Section(SectionFocus::Agents));
     }
 
     /// A scrolled section resolves through its offset: the first visible row is
@@ -919,14 +1025,14 @@ mod tests {
         let area = body(20);
 
         assert_eq!(
-            row_at(area, 1, 40, 12, 3, 0),
+            row_at(area, 2, 40, 12, 3, 0),
             ClickTarget::Row {
                 section: SectionFocus::Sessions,
                 index: 12
             }
         );
         assert_eq!(
-            row_at(area, 12, 40, 12, 30, 7),
+            row_at(area, 13, 40, 12, 30, 7),
             ClickTarget::Row {
                 section: SectionFocus::Agents,
                 index: 7
@@ -940,7 +1046,7 @@ mod tests {
         let area = body(5);
 
         assert_eq!(
-            row_at(area, 1, 5, 0, 3, 0),
+            row_at(area, 2, 5, 0, 3, 0),
             ClickTarget::Row {
                 section: SectionFocus::Sessions,
                 index: 0

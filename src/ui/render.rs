@@ -12,7 +12,10 @@ use ratatui::{
 use super::{
     layout::{dock_layout, inset_rect, switcher_layout_for_input},
     pane::Pane,
-    sections::{rows_per_height, section_heights, Row, RowKind, SectionFocus},
+    sections::{
+        header_lines, row_lines, rows_area, rows_per_height, section_heights, Row, RowKind,
+        SectionFocus,
+    },
     state::{
         char_byte_index, compact_card_positions, compact_lines, numbered_session_index,
         CompactLine, GridState, InputMode, PromptState, ViewMode,
@@ -238,6 +241,7 @@ pub(crate) fn render_sections(
     render_section(
         frame,
         sessions_area,
+        SectionFocus::Sessions,
         "Sessions",
         sessions,
         focus == SectionFocus::Sessions,
@@ -249,6 +253,7 @@ pub(crate) fn render_sections(
         render_section(
             frame,
             agents_area,
+            SectionFocus::Agents,
             "Agents",
             agents,
             focus == SectionFocus::Agents,
@@ -258,9 +263,11 @@ pub(crate) fn render_sections(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_section(
     frame: &mut Frame,
     area: Rect,
+    section: SectionFocus,
     title: &str,
     pane: &Pane<Row>,
     focused: bool,
@@ -271,26 +278,40 @@ fn render_section(
         return;
     }
 
+    // The Agents half opens with a rule, which is the only thing marking the
+    // boundary now that neither section is dimmed. The title then sits a line
+    // below it, and the rows a line below that.
+    let mut line = area.y;
+    if header_lines(section) > 2 {
+        frame.render_widget(
+            Paragraph::new("\u{2500}".repeat(area.width as usize))
+                .style(Style::default().fg(DETAIL_GRAY)),
+            Rect {
+                y: line,
+                height: 1,
+                ..area
+            },
+        );
+        line = line.saturating_add(1);
+    }
+
     // Both titles stay white whether or not their section has focus. They are
     // headings, not state: dimming one made the sidebar look half switched-off,
-    // and which section holds the keyboard is already said by its rows going
-    // grey and by the cursor being drawn there.
+    // and which section holds the keyboard is already said by the cursor being
+    // drawn there.
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             title.to_owned(),
             Style::default().fg(Color::White),
         ))),
         Rect {
+            y: line,
             height: 1,
             ..area
         },
     );
 
-    let rows_area = Rect {
-        y: area.y.saturating_add(1),
-        height: area.height.saturating_sub(1),
-        ..area
-    };
+    let rows_area = rows_area(area, section);
     if rows_area.height == 0 {
         return;
     }
@@ -301,22 +322,22 @@ fn render_section(
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 format!("  {empty_hint}"),
-                Style::default().fg(Color::Gray),
+                Style::default().fg(DETAIL_GRAY),
             ))),
             rows_area,
         );
         return;
     }
 
-    // Rows are two screen lines tall, so the pane is asked how many *rows*
-    // fit rather than how many lines.
-    let visible = pane.visible_range(rows_per_height(rows_area.height));
+    // A row is one screen line in Sessions and two in Agents, so the pane is
+    // asked how many *rows* fit rather than how many lines.
+    let visible = pane.visible_range(rows_per_height(rows_area.height, section));
     let lines: Vec<Line> = pane.items()[visible.clone()]
         .iter()
         .enumerate()
         .flat_map(|(offset, row)| {
             let selected = focused && visible.start + offset == pane.cursor;
-            section_row_lines(row, selected, spinner_frame, rows_area.width)
+            section_row_lines(row, section, selected, spinner_frame, rows_area.width)
         })
         .collect();
 
@@ -361,12 +382,16 @@ fn fit_row_text(left: &str, right: &str, width: usize) -> String {
     format!("{left}{}{right}", " ".repeat(padding))
 }
 
-/// One row as its [`ROW_LINES`] screen lines: a name line, and a dim detail
-/// line beneath it. The pair reads as one entry, which is what gives the list
-/// its rhythm — a status and a tool crammed onto the name line cost more than
-/// they explained.
+/// One row as the [`row_lines`] screen lines its section gives it.
+///
+/// A Sessions row is a single line — the tree is long and scanned, so its
+/// window count and fold arrow ride the name line's right edge rather than
+/// costing a line each. An Agents row is a name line plus a detail line, which
+/// is where `working · claude_2` lives; there are only ever a few of them, and
+/// the state is the reason the section exists.
 fn section_row_lines(
     row: &Row,
+    section: SectionFocus,
     selected: bool,
     spinner_frame: usize,
     width: u16,
@@ -377,10 +402,16 @@ fn section_row_lines(
     let body_width = (width as usize).saturating_sub(icon.chars().count() + 1);
     let body = match &row.kind {
         RowKind::Session {
-            name, attached, ..
+            name,
+            window_count,
+            expanded,
+            ..
         } => fit_row_text(
             name,
-            if *attached { "\u{25b8}" } else { "" },
+            &format!(
+                "{window_count} {}",
+                if *expanded { "\u{25be}" } else { "\u{25b8}" }
+            ),
             body_width,
         ),
         RowKind::Window {
@@ -398,29 +429,22 @@ fn section_row_lines(
         RowKind::Agent { window_name, .. } => truncate_ellipsis(window_name, body_width),
     };
 
-    // The second line: what the entry is doing, not what it is called.
-    let detail = match &row.kind {
-        RowKind::Session {
-            window_count,
-            expanded,
-            ..
-        } => format!(
-            "{window_count} window{} {}",
-            if *window_count == 1 { "" } else { "s" },
-            if *expanded { "\u{25be}" } else { "\u{25b8}" }
-        ),
-        RowKind::Window { .. } => String::new(),
-        RowKind::Agent { tool, .. } => {
-            format!("{} \u{b7} {tool}", format_agent_state(row.status.state))
-        }
-    };
-
     // Names are full contrast in both sections. Dimming the unfocused one made
     // half the sidebar look switched off, and focus is already unmistakable
-    // from the highlighted row — which is how herdr does it too.
+    // from the cursor row — which is how herdr does it too.
+    //
+    // The cursor is weight, not a block of white. `REVERSED` painted the whole
+    // row's width, which in a narrow sidebar is a slab of background that
+    // pulls the eye harder than the name it is marking.
     let mut style = Style::default();
     if selected {
-        style = style.add_modifier(Modifier::REVERSED);
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    // The session you are attached to. The right edge now belongs to the fold
+    // arrow, so "you are here" is said in the accent colour rather than with a
+    // marker — and in colour rather than weight, which the cursor has taken.
+    if matches!(row.kind, RowKind::Session { attached: true, .. }) {
+        style = style.fg(TMUX_ORANGE);
     }
 
     // The status icon keeps its colour in the unfocused section. Dimming it too
@@ -429,12 +453,24 @@ fn section_row_lines(
     // has the keyboard.
     let icon_style = agent_status_style(row.status);
 
+    let name_line = Line::from(vec![
+        Span::styled(format!("{icon} "), icon_style),
+        Span::styled(body, style),
+    ]);
+    if row_lines(section) < 2 {
+        return vec![name_line];
+    }
+
+    // The second line: what the entry is doing, not what it is called.
+    let detail = match &row.kind {
+        RowKind::Agent { tool, .. } => {
+            format!("{} \u{b7} {tool}", format_agent_state(row.status.state))
+        }
+        RowKind::Session { .. } | RowKind::Window { .. } => String::new(),
+    };
     let indent = " ".repeat(icon.chars().count() + 1);
     vec![
-        Line::from(vec![
-            Span::styled(format!("{icon} "), icon_style),
-            Span::styled(body, style),
-        ]),
+        name_line,
         Line::from(Span::styled(
             format!("{indent}{}", truncate_ellipsis(&detail, body_width)),
             detail_style(row),
@@ -442,10 +478,15 @@ fn section_row_lines(
     ]
 }
 
-/// The detail line is one step quieter than the name above it, and no quieter.
+/// The detail line's grey.
 ///
-/// It has been through `Color::Black` (invisible on a dark background) and
-/// `DarkGray` (still too faint to read), so it is `Gray` in both sections now.
+/// `Color::Gray` is SGR 37 — the terminal's *normal* white, so a detail line
+/// asking for it came out looking undimmed against the white name above it.
+/// `Color::Black` was the other end and vanished into a dark background.
+/// `DarkGray` (SGR 90) is the one that reads as grey.
+const DETAIL_GRAY: Color = Color::DarkGray;
+
+/// The detail line is one step quieter than the name above it, and no quieter.
 /// Focus is carried by the highlighted row, not by draining the colour out of
 /// half the sidebar.
 ///
@@ -455,7 +496,7 @@ fn detail_style(row: &Row) -> Style {
     if matches!(row.kind, RowKind::Agent { .. }) && row.status.state == AgentState::Blocked {
         return agent_status_style(row.status);
     }
-    Style::default().fg(Color::Gray)
+    Style::default().fg(DETAIL_GRAY)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1242,10 +1283,11 @@ mod tests {
         assert_eq!(buffer.get(27, 39).symbol(), "┘");
         // Sections render top-anchored (unlike the old compact list, which
         // pushed short content down to the search bar): the "Sessions" title
-        // sits right under the top border, with the row directly beneath it.
+        // sits right under the top border, a blank line, then the first row.
         assert_eq!(buffer.get(2, 2).symbol(), "S");
-        assert_eq!(buffer.get(2, 3).symbol(), "○");
-        assert_eq!(buffer.get(4, 3).symbol(), "w");
+        assert_eq!(buffer.get(2, 3).symbol(), " ");
+        assert_eq!(buffer.get(2, 4).symbol(), "○");
+        assert_eq!(buffer.get(4, 4).symbol(), "w");
         assert_eq!(buffer.get(2, 36).symbol(), "─");
         assert_eq!(buffer.get(2, 37).symbol(), "❯");
     }
@@ -1471,33 +1513,97 @@ mod tests {
         assert!(!rendered.contains("tab: focus section"));
     }
 
-    /// Spec §3 puts the window count (and the attached marker) at the right
-    /// edge of a session row; spec §4 truncates the name with `…`. Before the
-    /// row was width-budgeted both fell off the end of a real 28-column
-    /// sidebar, taking away everything the row carried beyond its name.
+    fn row_text(line: &Line) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+    }
+
+    /// A session row is one line: the count and fold arrow sit at its right
+    /// edge and the name absorbs the truncation. Spec §3 puts the count at the
+    /// edge and §4 truncates with `…`; before the row was width-budgeted both
+    /// fell off the end of a real 28-column sidebar.
     #[test]
-    fn a_long_session_name_truncates_and_keeps_its_count_and_marker() {
+    fn a_session_row_is_one_line_keeping_its_count_and_fold_arrow() {
         let mut card = test_card("a-very-long-session-name-indeed", "0");
         card.window_flags = "*".to_owned();
         let groups = group_cards_by_session(vec![card]);
         let rows = session_rows(&groups, &HashSet::new(), Some(&groups[0].cards[0].window_id));
 
-        let lines = section_row_lines(&rows[0], false, 0, 26);
-        let text = |line: &Line| {
-            line.spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>()
-        };
+        let lines = section_row_lines(&rows[0], SectionFocus::Sessions, false, 0, 26);
 
-        assert_eq!(lines.len(), 2, "a row is a name line and a detail line");
-        let name = text(&lines[0]);
+        assert_eq!(
+            lines.len(),
+            1,
+            "Sessions rows are single-line: the tree is long and gets scanned"
+        );
+        let name = row_text(&lines[0]);
         assert_eq!(name.chars().count(), 26);
-        assert!(name.ends_with('▸'), "the attached marker survives: {name:?}");
+        // Collapsed, so the arrow points right; the count keeps its place.
+        assert!(name.ends_with("1 \u{25b8}"), "count and arrow survive: {name:?}");
         assert!(name.contains('…'), "the name truncates: {name:?}");
         assert!(name.contains("a-very-long"));
-        // The count moved to the detail line, where it has room to spell itself.
-        assert!(text(&lines[1]).contains("1 window"), "{:?}", text(&lines[1]));
+    }
+
+    /// An expanded session flips the arrow rather than growing a second line.
+    #[test]
+    fn an_expanded_session_row_points_its_arrow_down() {
+        let groups = group_cards_by_session(vec![test_card("work", "0"), test_card("work", "1")]);
+        let expanded = HashSet::from(["work".to_owned()]);
+        let rows = session_rows(&groups, &expanded, None);
+
+        let lines = section_row_lines(&rows[0], SectionFocus::Sessions, false, 0, 26);
+
+        assert_eq!(lines.len(), 1);
+        assert!(row_text(&lines[0]).ends_with("2 \u{25be}"));
+        // Its windows are rows in their own right, and one line each too.
+        let child = section_row_lines(&rows[1], SectionFocus::Sessions, false, 0, 26);
+        assert_eq!(child.len(), 1);
+    }
+
+    /// The cursor is weight, not a slab of reversed background across a narrow
+    /// sidebar; the attached session is colour, since the right edge it used to
+    /// mark itself on now belongs to the fold arrow.
+    #[test]
+    fn the_cursor_is_bold_and_the_attached_session_is_accented() {
+        let mut card = test_card("work", "0");
+        card.window_flags = "*".to_owned();
+        let groups = group_cards_by_session(vec![card]);
+        let attached = session_rows(&groups, &HashSet::new(), Some(&groups[0].cards[0].window_id));
+        let detached = session_rows(&groups, &HashSet::new(), None);
+
+        let selected = section_row_lines(&detached[0], SectionFocus::Sessions, true, 0, 26);
+        let name_style = |lines: &[Line]| lines[0].spans[1].style;
+
+        assert!(name_style(&selected).add_modifier.contains(Modifier::BOLD));
+        assert!(
+            !name_style(&selected).add_modifier.contains(Modifier::REVERSED),
+            "the cursor should not paint the row's full width"
+        );
+        assert_eq!(
+            name_style(&section_row_lines(
+                &detached[0],
+                SectionFocus::Sessions,
+                false,
+                0,
+                26
+            ))
+            .fg,
+            None,
+            "an unattached session takes no accent"
+        );
+        assert_eq!(
+            name_style(&section_row_lines(
+                &attached[0],
+                SectionFocus::Sessions,
+                false,
+                0,
+                26
+            ))
+            .fg,
+            Some(TMUX_ORANGE)
+        );
     }
 
     /// The agent row's tool name is its right-hand cell for the same reason.
@@ -1512,20 +1618,18 @@ mod tests {
         let groups = group_cards_by_session(vec![card]);
         let rows = agent_rows(&groups);
 
-        let lines = section_row_lines(&rows[0], false, 0, 26);
-        let text = |line: &Line| {
-            line.spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>()
-        };
+        let lines = section_row_lines(&rows[0], SectionFocus::Agents, false, 0, 26);
 
-        assert_eq!(lines.len(), 2);
-        let name = text(&lines[0]);
+        assert_eq!(
+            lines.len(),
+            2,
+            "Agents rows keep their detail line — the state is the point"
+        );
+        let name = row_text(&lines[0]);
         assert!(name.contains('…'), "the window name truncates: {name:?}");
         // The tool is on the detail line now, beside the agent's state, so a
         // long window name can no longer crowd it out.
-        let detail = text(&lines[1]);
+        let detail = row_text(&lines[1]);
         assert!(detail.contains("claude"), "tool survives: {detail:?}");
     }
 
@@ -1755,17 +1859,24 @@ mod tests {
         assert_eq!(buffer.get(27, 0).symbol(), "┐");
         assert_eq!(buffer.get(0, 39).symbol(), "└");
         assert_eq!(buffer.get(27, 39).symbol(), "┘");
-        // Sections render top-anchored: "Sessions" title, then two-line rows —
-        // a name line with the status icon, and a dim detail line beneath it.
+        // Sections render top-anchored: the "Sessions" title, a blank line,
+        // then one line per session — status icon, name, and the count and
+        // fold arrow at the right edge.
         assert_eq!(buffer.get(2, 2).symbol(), "S");
-        assert_eq!(buffer.get(2, 3).symbol(), "○");
-        assert_eq!(buffer.get(4, 3).symbol(), "w");
-        let detail = (0..28)
+        assert_eq!(buffer.get(2, 4).symbol(), "○");
+        let first = (0..28)
             .map(|x| buffer.get(x, 4).symbol())
             .collect::<String>();
         assert!(
-            detail.contains("window"),
-            "row 0's detail line should sit directly under its name: {detail:?}"
+            first.contains("1 \u{25b8}"),
+            "the count and fold arrow ride the name line: {first:?}"
+        );
+        let second = (0..28)
+            .map(|x| buffer.get(x, 5).symbol())
+            .collect::<String>();
+        assert!(
+            second.contains("ops"),
+            "the next session sits on the very next line, not two below: {second:?}"
         );
 
         let modal_top = (0..100)
@@ -2344,10 +2455,11 @@ mod tests {
         assert!(!rendered.contains("Agents"));
     }
 
-    /// Focus is carried by the highlighted row, not by draining colour out of
-    /// half the sidebar. The unfocused section keeps full-contrast names, `Gray`
-    /// details and its status colours — `Black` was invisible and `DarkGray`
-    /// was still too faint to read.
+    /// Focus is carried by the cursor row, not by draining colour out of half
+    /// the sidebar. The unfocused section keeps full-contrast names, `DarkGray`
+    /// details and its status colours — `Black` was invisible against the
+    /// background and `Gray` is the terminal's normal white, which left the
+    /// detail line looking no quieter than the name above it.
     #[test]
     fn an_unfocused_section_stays_readable() {
         let mut agent_card = crate::test_support::test_card("dotfiles", "0");
@@ -2385,8 +2497,14 @@ mod tests {
             .unwrap();
 
         let buffer = terminal.backend().buffer();
-        let title_cell = buffer.get(agents_area.x, agents_area.y);
-        let icon_cell = buffer.get(agents_area.x, agents_area.y.saturating_add(1));
+        // The Agents half opens with a rule, then its title, then a blank
+        // line, then the row: name line and detail line.
+        let rule_cell = buffer.get(agents_area.x, agents_area.y);
+        let title_cell = buffer.get(agents_area.x, agents_area.y.saturating_add(1));
+        let icon_cell = buffer.get(agents_area.x, agents_area.y.saturating_add(3));
+
+        assert_eq!(rule_cell.symbol(), "\u{2500}", "the halves need a boundary");
+        assert_eq!(rule_cell.fg, DETAIL_GRAY);
 
         // Headings are not state: both titles stay white whether or not their
         // section has focus.
@@ -2413,17 +2531,12 @@ mod tests {
 
         // The detail line beneath the name. It rendered `Color::Black` here
         // once, which on a dark background is not dim — it is invisible.
-        let detail_cell = buffer.get(agents_area.x + 2, agents_area.y.saturating_add(2));
+        let detail_cell = buffer.get(agents_area.x + 2, agents_area.y.saturating_add(4));
         assert_ne!(
             detail_cell.fg,
             Color::Black,
             "a detail line must stay readable, not vanish into the background"
         );
-        assert_ne!(
-            detail_cell.fg,
-            Color::DarkGray,
-            "DarkGray reads as too faint here"
-        );
-        assert_eq!(detail_cell.fg, Color::Gray);
+        assert_eq!(detail_cell.fg, DETAIL_GRAY);
     }
 }

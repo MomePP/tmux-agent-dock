@@ -47,7 +47,7 @@ use pane::Pane;
 use render::{draw, Surface};
 use sections::{
     agent_rows, format_expanded, initial_expanded_set, parse_expand_default, parse_expanded, row_at, row_key,
-    rows_per_height, section_heights, session_rows, sessions_matching_windows, ClickTarget, ExpandDefault, Row, RowKind,
+    rows_area, rows_per_height, section_heights, session_rows, sessions_matching_windows, ClickTarget, ExpandDefault, Row, RowKind,
     SectionFocus,
 };
 use state::{
@@ -1258,14 +1258,18 @@ fn keep_sections_visible(ui: &mut SwitcherUi, terminal_size: Rect) {
     // disagreed with either would clamp the cursor against the wrong height.
     let (sessions_area, agents_area) = section_heights(ui.body_rect(terminal_size));
 
-    // Each section spends one line on its title, and each row is two lines
-    // tall — the same conversion the renderer and the click resolver use, so
-    // scrolling cannot clamp against a height none of them drew.
-    ui.sessions_pane
-        .keep_visible(rows_per_height(sessions_area.height.saturating_sub(1)));
+    // `rows_area` strips each section's header and `rows_per_height` converts
+    // what is left — the same two the renderer and the click resolver go
+    // through, so scrolling cannot clamp against a height none of them drew.
+    ui.sessions_pane.keep_visible(rows_per_height(
+        rows_area(sessions_area, SectionFocus::Sessions).height,
+        SectionFocus::Sessions,
+    ));
     if let Some(agents_area) = agents_area {
-        ui.agents_pane
-            .keep_visible(rows_per_height(agents_area.height.saturating_sub(1)));
+        ui.agents_pane.keep_visible(rows_per_height(
+            rows_area(agents_area, SectionFocus::Agents).height,
+            SectionFocus::Agents,
+        ));
     }
 }
 
@@ -1843,7 +1847,7 @@ mod tests {
         let mut ui = dock_ui(three_sessions());
         let body = dock_layout(size(), ui.show_help, ui.input).sessions;
 
-        let result = ui.handle_mouse(click(2, body.y + 1), 40, size());
+        let result = ui.handle_mouse(click(2, body.y + 2), 40, size());
 
         assert_eq!(ui.sessions_pane.cursor, 0);
         assert_eq!(opened(&result), Some("alpha"));
@@ -1863,8 +1867,8 @@ mod tests {
         let mut ui = ui_with(three_sessions());
         let body = sections_body(&ui);
 
-        // Line 0 is the title; a row is two lines, so lines 1-2 are the first
-        // session and line 3 starts the second.
+        // Sessions spends line 0 on its title and line 1 blank, and its rows
+        // are one line each: line 2 is the first session, line 3 the second.
         let result = ui.handle_mouse(click(2, body.y + 3), 40, size());
 
         assert_eq!(ui.focus, SectionFocus::Sessions);

@@ -185,6 +185,12 @@ pub(crate) fn compact_navigation_height(
         .saturating_add(1)
 }
 
+/// One column of breathing room down the dock's left edge. The popup gets this
+/// for free from the border it sits inside; the dock has no border, so without
+/// it every row starts hard against the pane divider — and a column off from
+/// the status line above, which is where the eye picks up the alignment.
+const DOCK_LEFT_PAD: u16 = 1;
+
 /// Geometry for the docked sidebar: the pane is the list. No modal inset,
 /// because there is no border to sit inside, and no preview, because the work
 /// pane beside the dock is the thing a preview would have been showing.
@@ -204,20 +210,27 @@ pub(crate) fn dock_layout(area: Rect, show_help: bool, input: InputMode) -> Swit
     } else {
         0
     };
+    // Every content rect starts one column in; `list_overlay` keeps the pane's
+    // own bounds, since it is what the surface clears and measures against.
+    let content = Rect {
+        x: area.x.saturating_add(DOCK_LEFT_PAD),
+        width: area.width.saturating_sub(DOCK_LEFT_PAD),
+        ..area
+    };
 
     let sessions = Rect {
         height: body_height.saturating_sub(help_height),
-        ..area
+        ..content
     };
     let help = (help_height > 0).then_some(Rect {
         y: area.y.saturating_add(sessions.height),
         height: help_height,
-        ..area
+        ..content
     });
     let search = Rect {
         y: area.y.saturating_add(body_height),
         height: search_height,
-        ..area
+        ..content
     };
 
     SwitcherLayout {
@@ -422,10 +435,12 @@ mod tests {
 
         let layout = dock_layout(area, false, InputMode::Keys);
 
-        // No border to inset past: the list starts at the pane's own edge.
+        // No border to inset past, but one column of left padding so rows line
+        // up with the status line above rather than hugging the pane divider.
         assert_eq!(layout.list_overlay, area);
-        assert_eq!(layout.sessions.x, 0);
-        assert_eq!(layout.sessions.width, 30);
+        assert_eq!(layout.sessions.x, DOCK_LEFT_PAD);
+        assert_eq!(layout.sessions.width, 30 - DOCK_LEFT_PAD);
+        assert_eq!(layout.search.x, DOCK_LEFT_PAD);
         // Nothing to preview beside a pane that fills its own width.
         assert_eq!(layout.preview.width, 0);
         assert_eq!(layout.preview.height, 0);
