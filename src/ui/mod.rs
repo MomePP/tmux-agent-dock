@@ -18,7 +18,7 @@ use anyhow::Result;
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-        MouseEventKind,
+        MouseButton, MouseEvent, MouseEventKind,
     },
     execute, queue,
     style::force_color_output,
@@ -43,8 +43,9 @@ use layout::{compact_navigation_height, switcher_layout, switcher_layout_for_inp
 use pane::Pane;
 use render::draw;
 use sections::{
-    agent_rows, format_expanded, initial_expanded_set, parse_expanded, row_key, section_heights,
-    session_rows, sessions_matching_windows, Row, RowKind, SectionFocus,
+    agent_rows, format_expanded, initial_expanded_set, parse_expanded, row_at, row_key,
+    section_heights, session_rows, sessions_matching_windows, ClickTarget, Row, RowKind,
+    SectionFocus,
 };
 use state::{
     accept_numbered_session, compact_lines, format_input_mode, format_view_mode, handle_prompt_key,
@@ -559,18 +560,71 @@ impl SwitcherUi {
         }
     }
 
-    fn handle_mouse(&mut self, kind: MouseEventKind, navigation_height: u16) {
-        let direction = match kind {
-            MouseEventKind::ScrollDown => Direction::Down,
-            MouseEventKind::ScrollUp => Direction::Up,
-            _ => return,
-        };
+    /// Feeds one mouse event into the switcher. Same contract as
+    /// [`SwitcherUi::handle_key`]: `Some(..)` closes with that outcome, `None`
+    /// keeps it open.
+    ///
+    /// tmux's default `MouseDown1Pane` binding is `select-pane -t = ; send -M`,
+    /// so a single click both focuses the pane and arrives here — clicking a
+    /// row is one action, not two.
+    fn handle_mouse(
+        &mut self,
+        mouse: MouseEvent,
+        navigation_height: u16,
+        terminal_size: Rect,
+    ) -> Option<Option<SwitcherAction>> {
         self.numbered_input.clear();
-        if self.uses_sections() {
-            self.move_focused_pane(direction);
-            return;
+
+        if let Some(direction) = match mouse.kind {
+            MouseEventKind::ScrollDown => Some(Direction::Down),
+            MouseEventKind::ScrollUp => Some(Direction::Up),
+            _ => None,
+        } {
+            if self.uses_sections() {
+                self.move_focused_pane(direction);
+            } else {
+                move_compact_selection(
+                    &mut self.state,
+                    &self.filtered,
+                    direction,
+                    navigation_height,
+                );
+            }
+            return None;
         }
-        move_compact_selection(&mut self.state, &self.filtered, direction, navigation_height);
+
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) || !self.uses_sections() {
+            return None;
+        }
+
+        let body = switcher_layout_for_input(
+            terminal_size,
+            self.show_help,
+            self.view,
+            compact_lines(&self.filtered).len(),
+            self.input,
+        )
+        .sessions;
+
+        match row_at(
+            body,
+            mouse.row,
+            self.sessions_pane.items().len(),
+            self.sessions_pane.offset,
+            self.agents_pane.items().len(),
+            self.agents_pane.offset,
+        ) {
+            ClickTarget::Row { section, index } => {
+                self.focus = section;
+                self.focused_pane_mut().cursor = index;
+                self.select_target()
+            }
+            ClickTarget::Section(section) => {
+                self.focus = section;
+                None
+            }
+            ClickTarget::None => None,
+        }
     }
 
     /// Feeds one key into the switcher. `Some(result)` closes it with that
@@ -1180,8 +1234,11 @@ fn run_tui_loop(
 
         match event::read()? {
             Event::Mouse(mouse) if ui.prompt.is_none() => {
-                let navigation_height = ui.navigation_height(terminal.size()?);
-                ui.handle_mouse(mouse.kind, navigation_height);
+                let terminal_size = terminal.size()?;
+                let navigation_height = ui.navigation_height(terminal_size);
+                if let Some(result) = ui.handle_mouse(mouse, navigation_height, terminal_size) {
+                    return Ok(result);
+                }
             }
             Event::Resize(_, _) => terminal.clear()?,
             Event::Key(key) => {
@@ -1251,6 +1308,39 @@ mod tests {
 
     fn alt(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::ALT)
+    }
+
+    fn click(column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        }
+    }
+
+    /// A wheel event. Its coordinates never matter — scrolling drives whichever
+    /// section has focus, not whatever is under the pointer.
+    fn wheel(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        }
+    }
+
+    /// The body rect the renderer hands the sections — the same rect
+    /// `handle_mouse` resolves clicks against.
+    fn sections_body(ui: &SwitcherUi) -> Rect {
+        switcher_layout_for_input(
+            size(),
+            ui.show_help,
+            ui.view,
+            compact_lines(&ui.filtered).len(),
+            ui.input,
+        )
+        .sessions
     }
 
     /// The window a closing result opens, by session name.
@@ -1576,6 +1666,51 @@ mod tests {
     }
 
     #[test]
+    fn clicking_a_session_row_selects_that_session() {
+        let mut ui = ui_with(three_sessions());
+        let body = sections_body(&ui);
+
+        // Row 0 of a section is its title, so the second content row is +2.
+        let result = ui.handle_mouse(click(2, body.y + 2), 40, size());
+
+        assert_eq!(ui.focus, SectionFocus::Sessions);
+        assert_eq!(ui.sessions_pane.cursor, 1);
+        assert_eq!(opened(&result), Some("bravo"));
+    }
+
+    #[test]
+    fn clicking_a_title_focuses_the_section_without_selecting() {
+        let mut agent = test_card("dotfiles", "0");
+        agent.agent_status = AgentStatus {
+            agent: Some(AgentKind::Claude),
+            state: AgentState::Working,
+            seen: true,
+            run_started_at: None,
+        };
+        let mut ui = ui_with(vec![agent, test_card("gogo", "0")]);
+        let body = sections_body(&ui);
+        let agents_area = section_heights(body).1.expect("agents section");
+
+        let result = ui.handle_mouse(click(2, agents_area.y), 40, size());
+
+        assert_eq!(ui.focus, SectionFocus::Agents);
+        assert!(result.is_none(), "a title click must not select");
+    }
+
+    /// The palette keeps the flat `GridState` list, so a click there must not
+    /// reach the sections resolver at all.
+    #[test]
+    fn clicking_in_the_palette_selects_nothing() {
+        let mut ui = palette_ui(three_sessions());
+        let before = ui.state.clone();
+
+        let result = ui.handle_mouse(click(2, 3), 40, size());
+
+        assert!(result.is_none());
+        assert_eq!(ui.state, before);
+    }
+
+    #[test]
     fn ctrl_l_expands_and_ctrl_h_collapses_the_selected_session() {
         let mut ui = ui_with(vec![test_card("dotfiles", "0"), test_card("dotfiles", "1")]);
         assert_eq!(ui.sessions_pane.len(), 1);
@@ -1740,11 +1875,11 @@ mod tests {
     fn the_mouse_wheel_scrolls_the_focused_section() {
         let mut ui = ui_with(three_sessions());
 
-        ui.handle_mouse(MouseEventKind::ScrollDown, 40);
-        ui.handle_mouse(MouseEventKind::ScrollDown, 40);
+        assert!(ui.handle_mouse(wheel(MouseEventKind::ScrollDown), 40, size()).is_none());
+        ui.handle_mouse(wheel(MouseEventKind::ScrollDown), 40, size());
         assert_eq!(ui.sessions_pane.cursor, 2);
 
-        ui.handle_mouse(MouseEventKind::ScrollUp, 40);
+        ui.handle_mouse(wheel(MouseEventKind::ScrollUp), 40, size());
         assert_eq!(ui.sessions_pane.cursor, 1);
     }
 
