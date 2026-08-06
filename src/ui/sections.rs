@@ -195,6 +195,24 @@ pub(crate) fn format_expanded(expanded: &HashSet<String>) -> String {
     names.join(&EXPANDED_SEPARATOR.to_string())
 }
 
+/// Sessions whose window list was narrowed by the active query. Those get
+/// expanded for as long as the query stands — a match hidden inside a
+/// collapsed session looks like a search that does not work.
+pub(crate) fn sessions_matching_windows(
+    filtered: &[SessionGroup],
+    all: &[SessionGroup],
+) -> HashSet<String> {
+    filtered
+        .iter()
+        .filter(|session| {
+            all.iter()
+                .find(|candidate| candidate.session_name == session.session_name)
+                .is_some_and(|candidate| candidate.cards.len() > session.cards.len())
+        })
+        .map(|session| session.session_name.clone())
+        .collect()
+}
+
 /// Which section the keyboard is driving. The other keeps its cursor and
 /// scroll position and renders dim.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -437,5 +455,27 @@ mod tests {
     fn focus_toggles_between_the_two_sections() {
         assert_eq!(SectionFocus::Sessions.toggled(), SectionFocus::Agents);
         assert_eq!(SectionFocus::Agents.toggled(), SectionFocus::Sessions);
+    }
+
+    #[test]
+    fn a_query_that_matched_only_some_windows_marks_that_session_for_expansion() {
+        let all = fixture();
+        // Simulate a filter that kept only window 1 of "dotfiles".
+        let filtered = vec![SessionGroup {
+            session_name: "dotfiles".to_owned(),
+            cards: vec![all[0].cards[1].clone()],
+        }];
+
+        let expand = sessions_matching_windows(&filtered, &all);
+
+        assert!(expand.contains("dotfiles"));
+    }
+
+    #[test]
+    fn an_unfiltered_session_is_not_force_expanded() {
+        let all = fixture();
+        let expand = sessions_matching_windows(&all, &all);
+
+        assert!(expand.is_empty());
     }
 }

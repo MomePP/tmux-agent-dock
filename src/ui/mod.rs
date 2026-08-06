@@ -43,8 +43,8 @@ use layout::{compact_navigation_height, switcher_layout, switcher_layout_for_inp
 use pane::Pane;
 use render::draw;
 use sections::{
-    agent_rows, format_expanded, parse_expanded, row_key, section_heights, session_rows, Row,
-    RowKind, SectionFocus,
+    agent_rows, format_expanded, parse_expanded, row_key, section_heights, session_rows,
+    sessions_matching_windows, Row, RowKind, SectionFocus,
 };
 use state::{
     accept_numbered_session, compact_lines, format_input_mode, format_view_mode, handle_prompt_key,
@@ -180,6 +180,11 @@ struct SwitcherUi {
     agents_pane: Pane<Row>,
     focus: SectionFocus,
     expanded: HashSet<String>,
+    /// Sessions auto-expanded because the active query narrowed their window
+    /// list. Transient — never persisted, and unioned with `expanded` only
+    /// when building rows, so a search never rewrites the remembered
+    /// collapse state.
+    search_expanded: HashSet<String>,
     current_window_id: Option<String>,
 }
 
@@ -205,6 +210,7 @@ impl SwitcherUi {
             agents_pane: Pane::new(Vec::new()),
             focus: SectionFocus::Sessions,
             expanded: initial_expanded(),
+            search_expanded: HashSet::new(),
             current_window_id: current_window_id.map(str::to_owned),
         };
         ui.rebuild_panes();
@@ -239,9 +245,14 @@ impl SwitcherUi {
             .selected()
             .map(|row| row_key(row).to_owned());
 
+        let effective: HashSet<String> = self
+            .expanded
+            .union(&self.search_expanded)
+            .cloned()
+            .collect();
         let sessions = session_rows(
             &self.filtered,
-            &self.expanded,
+            &effective,
             self.current_window_id.as_deref(),
         );
         let agents = agent_rows(&self.filtered);
@@ -256,7 +267,6 @@ impl SwitcherUi {
         }
     }
 
-    #[allow(dead_code)] // Consumed by a later task (open/select the focused row)
     fn focused_pane(&self) -> &Pane<Row> {
         match self.focus {
             SectionFocus::Sessions => &self.sessions_pane,
@@ -271,7 +281,6 @@ impl SwitcherUi {
         }
     }
 
-    #[allow(dead_code)] // Consumed by Task 6 (key handling)
     fn selected_row(&self) -> Option<&Row> {
         self.focused_pane().selected()
     }
@@ -327,6 +336,12 @@ impl SwitcherUi {
             &self.query,
             navigation_height,
         );
+        self.search_expanded = if self.query.trim().is_empty() {
+            HashSet::new()
+        } else {
+            sessions_matching_windows(&self.filtered, &self.sessions)
+        };
+        self.rebuild_panes();
     }
 
     fn refresh_cards(&mut self, cards: Vec<WindowCard>, navigation_height: u16) {
@@ -484,6 +499,11 @@ impl SwitcherUi {
                 self.refilter(navigation_height);
             }
             KeyCode::Enter => {
+                if self.uses_sections() {
+                    return self
+                        .selected_row()
+                        .map(|row| Some(SwitcherAction::Select(row.target.clone())));
+                }
                 if self.input == InputMode::Numbers {
                     if self.numbered_input.contains(',') {
                         if let Some(card) = sync_numbered_selection(
@@ -778,6 +798,11 @@ impl SwitcherUi {
         match ch {
             'q' => return Some(None),
             ' ' => {
+                if self.uses_sections() {
+                    return self
+                        .selected_row()
+                        .map(|row| Some(SwitcherAction::Select(row.target.clone())));
+                }
                 if let Some(card) = self.state.selected_card(&self.filtered) {
                     return Some(Some(SwitcherAction::Select(card.clone())));
                 }
@@ -954,7 +979,12 @@ fn run_tui_loop(
             compact_lines(&ui.filtered).len(),
         )
         .preview;
-        preview.refresh_for(ui.state.selected_card(&ui.filtered), preview_area, now);
+        let preview_card = if ui.uses_sections() {
+            ui.selected_row().map(|row| &row.target)
+        } else {
+            ui.state.selected_card(&ui.filtered)
+        };
+        preview.refresh_for(preview_card, preview_area, now);
         if now.duration_since(last_full_redraw) >= FULL_REDRAW_INTERVAL {
             queue_full_repaint(terminal)?;
             last_full_redraw = now;
@@ -1193,5 +1223,102 @@ mod tests {
             .sessions_pane
             .visible_range(row_height)
             .contains(&ui.sessions_pane.cursor));
+    }
+
+    /// A query narrowing a session's windows must auto-expand it for as long
+    /// as the query stands, without ever writing into `expanded` — that field
+    /// is persisted to a tmux global option, so a query leaking into it would
+    /// silently rewrite the user's remembered collapse state.
+    #[test]
+    fn typing_a_query_expands_the_matching_session_without_touching_persisted_state() {
+        let mut alpha = test_card("dotfiles", "0");
+        alpha.window_name = "alpha".to_owned();
+        let mut needle = test_card("dotfiles", "1");
+        needle.window_name = "zzzneedle".to_owned();
+        let other = test_card("other", "0");
+        let mut ui = ui_with(vec![alpha, needle, other]);
+        assert!(ui.expanded.is_empty());
+        assert!(ui.search_expanded.is_empty());
+
+        ui.query = "zzzneedle".to_owned();
+        ui.refilter(40);
+
+        assert!(ui.search_expanded.contains("dotfiles"));
+        assert!(ui.expanded.is_empty());
+        assert_eq!(ui.sessions_pane.len(), 2);
+        assert!(matches!(
+            ui.sessions_pane.items()[0].kind,
+            RowKind::Session { expanded: true, .. }
+        ));
+        assert!(matches!(
+            ui.sessions_pane.items()[1].kind,
+            RowKind::Window { .. }
+        ));
+
+        ui.query.clear();
+        ui.refilter(40);
+
+        assert!(ui.search_expanded.is_empty());
+        assert!(ui.expanded.is_empty());
+        assert!(matches!(
+            ui.sessions_pane.items()[0].kind,
+            RowKind::Session { expanded: false, .. }
+        ));
+    }
+
+    #[test]
+    fn enter_selects_the_focused_session_row() {
+        let card = test_card("dotfiles", "0");
+        let mut ui = ui_with(vec![card.clone()]);
+
+        let result = ui.handle_key(key(KeyCode::Enter), size());
+
+        assert_eq!(result, Some(Some(SwitcherAction::Select(card))));
+    }
+
+    #[test]
+    fn enter_selects_the_focused_agent_row_after_tab() {
+        let mut agent = test_card("dotfiles", "0");
+        agent.agent_status = AgentStatus {
+            agent: Some(AgentKind::Claude),
+            state: AgentState::Working,
+            seen: true,
+            run_started_at: None,
+        };
+        let plain = test_card("dotfiles", "1");
+        let mut ui = ui_with(vec![agent.clone(), plain]);
+        ui.handle_key(key(KeyCode::Tab), size());
+        assert_eq!(ui.focus, SectionFocus::Agents);
+
+        let result = ui.handle_key(key(KeyCode::Enter), size());
+
+        assert_eq!(result, Some(Some(SwitcherAction::Select(agent))));
+    }
+
+    #[test]
+    fn space_selects_the_focused_row_in_keys_mode() {
+        let card = test_card("dotfiles", "0");
+        let mut ui = ui_with(vec![card.clone()]);
+        assert_eq!(ui.input, InputMode::Keys);
+
+        let result = ui.handle_key(key(KeyCode::Char(' ')), size());
+
+        assert_eq!(result, Some(Some(SwitcherAction::Select(card))));
+    }
+
+    /// No row is focused when the query has filtered the focused section to
+    /// nothing. Enter then does nothing and leaves the switcher open, the
+    /// same as the palette's `select_key_action` does when nothing is
+    /// selected.
+    #[test]
+    fn enter_does_nothing_when_the_focused_pane_is_empty() {
+        let mut ui = ui_with(vec![test_card("dotfiles", "0")]);
+        ui.query = "nomatch-zzz".to_owned();
+        ui.refilter(40);
+        assert!(ui.sessions_pane.is_empty());
+
+        let result = ui.handle_key(key(KeyCode::Enter), size());
+
+        assert_eq!(result, None);
     }
 }

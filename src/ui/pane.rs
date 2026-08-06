@@ -73,7 +73,6 @@ impl<T> Pane<T> {
 
     /// Scrolls the minimum distance needed to bring the cursor into a window of
     /// `height` rows.
-    #[allow(dead_code)]
     pub(crate) fn keep_visible(&mut self, height: usize) {
         if height == 0 {
             self.offset = 0;
