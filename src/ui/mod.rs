@@ -151,16 +151,35 @@ fn initial_view_mode() -> ViewMode {
         .unwrap_or(ViewMode::Sidebar)
 }
 
+/// Writes global tmux options, chaining several into one round trip so a
+/// reader can never catch them half-applied.
+///
+/// A no-op under `cfg(test)`. The unit tests drive the very keys that persist —
+/// `v`, `S-tab`, `h`/`l` — against a `SwitcherUi` built from fixtures, so left
+/// ungated a plain `cargo test` rewrites the developer's own live tmux globals
+/// with fixture data. It really does: a test run set
+/// `@tmux_agent_switcher_known` to `dotfiles`, a session that exists only in
+/// `sections::tests::fixture`.
+fn set_global_options(pairs: &[(&str, &str)]) {
+    if cfg!(test) {
+        return;
+    }
+
+    let mut args: Vec<&str> = Vec::new();
+    for (index, (name, value)) in pairs.iter().enumerate() {
+        if index > 0 {
+            args.push(";");
+        }
+        args.extend(["set-option", "-g", name, value]);
+    }
+    let _ = tmux_status(Command::new("tmux").args(args));
+}
+
 /// Remember a toggled view style for the tmux server's lifetime so the next
 /// open reuses it (the launcher reads this option back). Best-effort: a failure
 /// only loses the stickiness.
 fn persist_view_mode(view: ViewMode) {
-    let _ = tmux_status(Command::new("tmux").args([
-        "set-option",
-        "-g",
-        VIEW_MODE_OPTION,
-        format_view_mode(view),
-    ]));
+    set_global_options(&[(VIEW_MODE_OPTION, format_view_mode(view))]);
 }
 
 /// The input mode the switcher opens with: the launcher passes the configured
@@ -181,12 +200,7 @@ fn initial_expand_default() -> ExpandDefault {
 
 /// Same stickiness as [`persist_view_mode`], for the Tab-toggled input mode.
 fn persist_input_mode(input: InputMode) {
-    let _ = tmux_status(Command::new("tmux").args([
-        "set-option",
-        "-g",
-        INPUT_MODE_OPTION,
-        format_input_mode(input),
-    ]));
+    set_global_options(&[(INPUT_MODE_OPTION, format_input_mode(input))]);
 }
 
 /// Which sessions were left expanded, and which the switcher had an opinion
@@ -213,17 +227,9 @@ fn focus_work_pane() {
 /// together: a `known` that lagged behind `expanded` would read a session the
 /// user just collapsed as one that had never been seen, and re-expand it.
 fn persist_expanded(expanded: &HashSet<String>, sessions: &[SessionGroup]) {
-    let _ = tmux_status(Command::new("tmux").args([
-        "set-option",
-        "-g",
-        EXPANDED_OPTION,
-        &format_expanded(expanded.iter().cloned()),
-        ";",
-        "set-option",
-        "-g",
-        KNOWN_OPTION,
-        &format_expanded(known_session_names(sessions)),
-    ]));
+    let expanded = format_expanded(expanded.iter().cloned());
+    let known = format_expanded(known_session_names(sessions));
+    set_global_options(&[(EXPANDED_OPTION, &expanded), (KNOWN_OPTION, &known)]);
 }
 
 /// Everything the switcher tracks while open: the full and filtered session
