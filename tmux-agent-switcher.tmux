@@ -97,3 +97,22 @@ if [[ "$nav" == "on" ]]; then
   tmux unbind-key -q -T tree-mode C-j 2>/dev/null || true
   tmux unbind-key -q -T tree-mode C-k 2>/dev/null || true
 fi
+
+# --- docked sidebar -------------------------------------------------------
+# A pane, not a popup: it stays while you work and follows you between windows.
+dock_key="$(tmux_option @agent_switcher_dock_key b)"
+LAUNCHER="$CURRENT_DIR/bin/tmux-agent-switcher"
+
+if [[ -n "$dock_key" ]]; then
+  tmux bind-key "$dock_key" run-shell -b "$LAUNCHER dock-toggle"
+fi
+
+# Hooks are arrays. Writing at a reserved index is idempotent across the config
+# reloads that re-run this file, and leaves any other plugin's entry at another
+# index alone — a plain `set-hook -g` would replace it silently.
+#
+# `session-window-changed` covers prefix+n, select-window and tree mode;
+# `client-session-changed` covers session switches. tmux has no
+# `after-switch-client` hook, so that pair is the whole surface.
+tmux set-hook -g "session-window-changed[50]" "run-shell -b '$LAUNCHER dock-follow'"
+tmux set-hook -g "client-session-changed[50]" "run-shell -b '$LAUNCHER dock-follow'"
