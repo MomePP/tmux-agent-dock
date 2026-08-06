@@ -301,7 +301,7 @@ fn render_section(
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 format!("  {empty_hint}"),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::Gray),
             ))),
             rows_area,
         );
@@ -316,7 +316,7 @@ fn render_section(
         .enumerate()
         .flat_map(|(offset, row)| {
             let selected = focused && visible.start + offset == pane.cursor;
-            section_row_lines(row, selected, focused, spinner_frame, rows_area.width)
+            section_row_lines(row, selected, spinner_frame, rows_area.width)
         })
         .collect();
 
@@ -368,7 +368,6 @@ fn fit_row_text(left: &str, right: &str, width: usize) -> String {
 fn section_row_lines(
     row: &Row,
     selected: bool,
-    focused: bool,
     spinner_frame: usize,
     width: u16,
 ) -> Vec<Line<'static>> {
@@ -416,14 +415,10 @@ fn section_row_lines(
         }
     };
 
-    // The name line: full contrast when the section has the keyboard, one step
-    // down when it does not — but still clearly readable, since the unfocused
-    // section is the one you are most likely reading rather than driving.
-    let mut style = if focused {
-        Style::default()
-    } else {
-        Style::default().fg(Color::Gray)
-    };
+    // Names are full contrast in both sections. Dimming the unfocused one made
+    // half the sidebar look switched off, and focus is already unmistakable
+    // from the highlighted row — which is how herdr does it too.
+    let mut style = Style::default();
     if selected {
         style = style.add_modifier(Modifier::REVERSED);
     }
@@ -442,30 +437,25 @@ fn section_row_lines(
         ]),
         Line::from(Span::styled(
             format!("{indent}{}", truncate_ellipsis(&detail, body_width)),
-            detail_style(row, focused),
+            detail_style(row),
         )),
     ]
 }
 
-/// The detail line sits one step below the name above it, and never below
-/// `DarkGray`.
+/// The detail line is one step quieter than the name above it, and no quieter.
 ///
-/// It used to render `Color::Black` in an unfocused section, which on a dark
-/// background is not dim — it is gone. Two steps of contrast say "secondary"
-/// well enough without making the text unreadable, and the section that has
-/// the keyboard is already obvious from its cursor.
+/// It has been through `Color::Black` (invisible on a dark background) and
+/// `DarkGray` (still too faint to read), so it is `Gray` in both sections now.
+/// Focus is carried by the highlighted row, not by draining the colour out of
+/// half the sidebar.
 ///
-/// A blocked agent keeps its colour here either way, because "blocked" is the
-/// word worth noticing whether or not you are looking at that section.
-fn detail_style(row: &Row, focused: bool) -> Style {
+/// A blocked agent keeps its own colour here, because "blocked" is the word
+/// worth noticing whether or not you are looking at that section.
+fn detail_style(row: &Row) -> Style {
     if matches!(row.kind, RowKind::Agent { .. }) && row.status.state == AgentState::Blocked {
         return agent_status_style(row.status);
     }
-    if focused {
-        Style::default().fg(Color::Gray)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    }
+    Style::default().fg(Color::Gray)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1492,7 +1482,7 @@ mod tests {
         let groups = group_cards_by_session(vec![card]);
         let rows = session_rows(&groups, &HashSet::new(), Some(&groups[0].cards[0].window_id));
 
-        let lines = section_row_lines(&rows[0], false, true, 0, 26);
+        let lines = section_row_lines(&rows[0], false, 0, 26);
         let text = |line: &Line| {
             line.spans
                 .iter()
@@ -1522,7 +1512,7 @@ mod tests {
         let groups = group_cards_by_session(vec![card]);
         let rows = agent_rows(&groups);
 
-        let lines = section_row_lines(&rows[0], false, true, 0, 26);
+        let lines = section_row_lines(&rows[0], false, 0, 26);
         let text = |line: &Line| {
             line.spans
                 .iter()
@@ -2354,13 +2344,12 @@ mod tests {
         assert!(!rendered.contains("Agents"));
     }
 
-    /// The unfocused section steps its title and row text down to a dimmer
-    /// colour rather than stacking `Modifier::DIM` on an already-dark grey,
-    /// which some terminals render almost invisibly. The status icon keeps its
-    /// colour either way — whether an agent is blocked is the one thing the
-    /// Agents section exists to show.
+    /// Focus is carried by the highlighted row, not by draining colour out of
+    /// half the sidebar. The unfocused section keeps full-contrast names, `Gray`
+    /// details and its status colours — `Black` was invisible and `DarkGray`
+    /// was still too faint to read.
     #[test]
-    fn unfocused_section_dims_its_text_but_keeps_status_colour() {
+    fn an_unfocused_section_stays_readable() {
         let mut agent_card = crate::test_support::test_card("dotfiles", "0");
         agent_card.window_name = "config".to_owned();
         agent_card.agent_status = AgentStatus {
@@ -2406,6 +2395,7 @@ mod tests {
             Color::White,
             "the Agents title should stay white while unfocused"
         );
+        assert_ne!(title_cell.fg, Color::DarkGray);
         assert!(
             !title_cell.modifier.contains(Modifier::DIM),
             "a title should never be dimmed"
@@ -2427,8 +2417,13 @@ mod tests {
         assert_ne!(
             detail_cell.fg,
             Color::Black,
-            "an unfocused detail line must stay readable, not vanish into the background"
+            "a detail line must stay readable, not vanish into the background"
         );
-        assert_eq!(detail_cell.fg, Color::DarkGray);
+        assert_ne!(
+            detail_cell.fg,
+            Color::DarkGray,
+            "DarkGray reads as too faint here"
+        );
+        assert_eq!(detail_cell.fg, Color::Gray);
     }
 }
