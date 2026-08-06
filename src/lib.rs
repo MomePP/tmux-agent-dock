@@ -19,6 +19,7 @@ pub const TMUX_ORANGE: Color = Color::Indexed(202);
 mod cards;
 mod daemon;
 mod detect;
+mod dock;
 mod embed;
 mod model;
 mod preview;
@@ -35,6 +36,7 @@ pub use cards::{
 };
 pub use daemon::{ensure_status_daemon, poll_agent_status_once, run_status_daemon, Debounce};
 pub use detect::{detect_agent_from_process_name, detect_agent_state};
+pub use dock::{follow as dock_follow, toggle as dock_toggle};
 pub use embed::embedded_session_hosts;
 pub use model::{
     AgentEvidence, AgentKind, AgentState, AgentStatus, SessionGroup, SwitcherAction, TmuxPane,
