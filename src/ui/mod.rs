@@ -1090,7 +1090,7 @@ fn keep_sections_visible(ui: &mut SwitcherUi, terminal_size: Rect) {
         ui.input,
     )
     .sessions;
-    let (sessions_area, agents_area) = section_heights(body, ui.agents_pane.len());
+    let (sessions_area, agents_area) = section_heights(body);
 
     // Each section spends one row on its title before the rows start.
     ui.sessions_pane
@@ -1415,7 +1415,7 @@ mod tests {
             ui.input,
         )
         .sessions;
-        let (sessions_area, _) = section_heights(body, ui.agents_pane.len());
+        let (sessions_area, _) = section_heights(body);
         let row_height = sessions_area.height.saturating_sub(1) as usize;
 
         assert!(ui

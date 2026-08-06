@@ -142,21 +142,23 @@ pub(crate) fn agent_rows(sessions: &[SessionGroup]) -> Vec<Row> {
 /// abandoned and Sessions keeps everything.
 const MIN_SPLIT_HEIGHT: u16 = 4;
 
-/// Divides the body between the two sections. Agents is sized to its content
-/// but never more than half, so a couple of agents cannot strand half the
-/// sidebar empty while the session list scrolls.
-pub(crate) fn section_heights(body: Rect, agent_row_count: usize) -> (Rect, Option<Rect>) {
-    if agent_row_count == 0 || body.height < MIN_SPLIT_HEIGHT {
+/// Divides the body in half between the two sections. The split does not depend
+/// on how many agents are running: an Agents section that resizes itself moves
+/// the boundary under the user every time an agent starts or exits, and with no
+/// agents at all the section is worth keeping as a visible "none running"
+/// statement rather than silently vanishing.
+pub(crate) fn section_heights(body: Rect) -> (Rect, Option<Rect>) {
+    if body.height < MIN_SPLIT_HEIGHT {
         return (body, None);
     }
 
-    let wanted = u16::try_from(agent_row_count)
-        .unwrap_or(u16::MAX)
-        .saturating_add(1); // title row
-    // No lower bound: `agent_row_count` is at least 1 here, so `wanted` is
-    // already at least a title plus a row, and the `MIN_SPLIT_HEIGHT` guard
-    // above keeps `body.height / 2` at 2 or more.
-    let agents_height = wanted.min(body.height / 2);
+    // A fixed half each, so the Agents title sits on the body's midpoint and
+    // stays there. Sizing the section to its content instead parked the title
+    // just above the search bar and moved it every time an agent came or went,
+    // which read as the section drifting rather than as a boundary.
+    // Halved from the Agents side so an odd body gives its spare row to
+    // Sessions, which holds the longer list.
+    let agents_height = body.height / 2;
     let sessions_height = body.height.saturating_sub(agents_height);
 
     let sessions = Rect {
@@ -425,41 +427,35 @@ mod tests {
         }
     }
 
+    /// The boundary is the point of the split, so it holds still even with no
+    /// agents running — a section that appears and disappears moves every row
+    /// beneath it.
     #[test]
-    fn no_agents_gives_the_whole_body_to_sessions() {
-        let (sessions, agents) = section_heights(body(20), 0);
-
-        assert_eq!(sessions, body(20));
-        assert_eq!(agents, None);
-    }
-
-    #[test]
-    fn agents_take_only_what_they_need() {
-        // Two agents: one title row plus two rows.
-        let (sessions, agents) = section_heights(body(20), 2);
+    fn no_agents_still_gets_its_half() {
+        let (sessions, agents) = section_heights(body(20));
         let agents = agents.expect("agents section");
 
-        assert_eq!(agents.height, 3);
-        assert_eq!(sessions.height, 17);
-        assert_eq!(sessions.y, 0);
-        assert_eq!(agents.y, 17);
-    }
-
-    #[test]
-    fn agents_never_exceed_half_the_body() {
-        // Twenty agents would want 21 rows; half of 20 is 10.
-        let (sessions, agents) = section_heights(body(20), 20);
-        let agents = agents.expect("agents section");
-
-        assert_eq!(agents.height, 10);
         assert_eq!(sessions.height, 10);
+        assert_eq!(agents.height, 10);
+        assert_eq!(agents.y, 10);
     }
 
-    /// The shortest body that still splits: `body.height / 2` is exactly the
-    /// two rows a one-agent section wants, so the cap and the content agree.
+    /// The split is fixed: one agent and twenty produce the same boundary, so
+    /// an agent starting or exiting never shifts the Sessions list.
+    #[test]
+    fn the_boundary_does_not_move_with_the_agent_count() {
+        let few = section_heights(body(20));
+        let many = section_heights(body(20));
+
+        assert_eq!(few, many);
+        assert_eq!(few.1.expect("agents section").y, 10);
+    }
+
+    /// The shortest body that still splits: one row of content each under two
+    /// titles.
     #[test]
     fn the_shortest_splittable_body_gives_each_section_half() {
-        let (sessions, agents) = section_heights(body(4), 1);
+        let (sessions, agents) = section_heights(body(4));
         let agents = agents.expect("agents section");
 
         assert_eq!(agents.height, 2);
@@ -467,10 +463,11 @@ mod tests {
         assert_eq!(agents.y, 2);
     }
 
-    /// An odd body cannot halve evenly; the extra row goes to Sessions.
+    /// An odd body cannot halve evenly; the extra row goes to Sessions, which
+    /// holds the longer list.
     #[test]
     fn an_odd_body_gives_the_spare_row_to_sessions() {
-        let (sessions, agents) = section_heights(body(21), 20);
+        let (sessions, agents) = section_heights(body(21));
         let agents = agents.expect("agents section");
 
         assert_eq!(agents.height, 10);
@@ -480,7 +477,7 @@ mod tests {
 
     #[test]
     fn a_body_too_short_to_split_stays_one_section() {
-        let (sessions, agents) = section_heights(body(3), 5);
+        let (sessions, agents) = section_heights(body(3));
 
         assert_eq!(sessions, body(3));
         assert_eq!(agents, None);

@@ -215,7 +215,7 @@ pub(crate) fn render_sections(
     focus: SectionFocus,
     spinner_frame: usize,
 ) {
-    let (sessions_area, agents_area) = section_heights(body, agents.len());
+    let (sessions_area, agents_area) = section_heights(body);
 
     render_section(
         frame,
@@ -224,6 +224,7 @@ pub(crate) fn render_sections(
         sessions,
         focus == SectionFocus::Sessions,
         spinner_frame,
+        "no sessions",
     );
 
     if let Some(agents_area) = agents_area {
@@ -234,6 +235,7 @@ pub(crate) fn render_sections(
             agents,
             focus == SectionFocus::Agents,
             spinner_frame,
+            "none running",
         );
     }
 }
@@ -245,19 +247,20 @@ fn render_section(
     pane: &Pane<Row>,
     focused: bool,
     spinner_frame: usize,
+    empty_hint: &str,
 ) {
     if area.height == 0 {
         return;
     }
 
-    // The unfocused section dims as a whole, title included, so it reads at a
-    // glance which one the keyboard drives.
+    // The unfocused section steps down to a dimmer colour, not `Modifier::DIM`
+    // on top of one. Terminals implement DIM with wildly different strength —
+    // stacked on an already-dark grey it washed the whole section out to barely
+    // legible. A plain colour step reads the same everywhere.
     let title_style = if focused {
         Style::default().fg(Color::Gray)
     } else {
-        Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::DIM)
+        Style::default().fg(Color::DarkGray)
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(title.to_owned(), title_style))),
@@ -273,6 +276,19 @@ fn render_section(
         ..area
     };
     if rows_area.height == 0 {
+        return;
+    }
+
+    // The section keeps its half whether or not it has rows, so an empty one
+    // has to say why it is empty — a reserved but blank half reads as broken.
+    if pane.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("  {empty_hint}"),
+                Style::default().fg(Color::DarkGray),
+            ))),
+            rows_area,
+        );
         return;
     }
 
@@ -370,20 +386,17 @@ fn section_row_line(
     let mut style = if focused {
         Style::default()
     } else {
-        Style::default().add_modifier(Modifier::DIM)
+        Style::default().fg(Color::DarkGray)
     };
     if selected {
         style = style.add_modifier(Modifier::REVERSED);
     }
 
-    // The icon carries the same dim/full-contrast state as the rest of the
-    // row, so an unfocused section dims completely rather than leaving its
-    // status icons full-brightness.
-    let icon_style = if focused {
-        agent_status_style(row.status)
-    } else {
-        agent_status_style(row.status).add_modifier(Modifier::DIM)
-    };
+    // The status icon keeps its colour in the unfocused section. Dimming it too
+    // de-emphasised the one thing the Agents section exists to show — whether an
+    // agent is blocked — and the row text going grey already says which section
+    // has the keyboard.
+    let icon_style = agent_status_style(row.status);
 
     Line::from(vec![
         Span::styled(format!("{icon} "), icon_style),
@@ -2250,12 +2263,13 @@ mod tests {
         assert!(!rendered.contains("Agents"));
     }
 
-    /// Regression test for a review finding: the status icon and the section
-    /// title used to stay full-brightness in the unfocused section while only
-    /// the row text after the icon dimmed. The spec requires the whole row —
-    /// icon and title included — to dim together.
+    /// The unfocused section steps its title and row text down to a dimmer
+    /// colour rather than stacking `Modifier::DIM` on an already-dark grey,
+    /// which some terminals render almost invisibly. The status icon keeps its
+    /// colour either way — whether an agent is blocked is the one thing the
+    /// Agents section exists to show.
     #[test]
-    fn unfocused_section_dims_its_title_and_status_icon() {
+    fn unfocused_section_dims_its_text_but_keeps_status_colour() {
         let mut agent_card = crate::test_support::test_card("dotfiles", "0");
         agent_card.window_name = "config".to_owned();
         agent_card.agent_status = AgentStatus {
@@ -2277,7 +2291,7 @@ mod tests {
             width: 28,
             height: 12,
         };
-        let (_, agents_area) = section_heights(body, agents.len());
+        let (_, agents_area) = section_heights(body);
         let agents_area = agents_area.expect("agents section");
 
         let backend = ratatui::backend::TestBackend::new(28, 12);
@@ -2294,13 +2308,24 @@ mod tests {
         let title_cell = buffer.get(agents_area.x, agents_area.y);
         let icon_cell = buffer.get(agents_area.x, agents_area.y.saturating_add(1));
 
-        assert!(
-            title_cell.modifier.contains(Modifier::DIM),
-            "unfocused Agents title was not dimmed"
+        assert_eq!(
+            title_cell.fg,
+            Color::DarkGray,
+            "unfocused Agents title should step down to a dimmer colour"
         );
         assert!(
-            icon_cell.modifier.contains(Modifier::DIM),
-            "unfocused Agents status icon was not dimmed"
+            !title_cell.modifier.contains(Modifier::DIM),
+            "unfocused title should not stack DIM on top of a dark colour"
+        );
+        // Working -> yellow. The icon must survive the section losing focus.
+        assert_eq!(
+            icon_cell.fg,
+            Color::Yellow,
+            "unfocused Agents status icon lost its colour"
+        );
+        assert!(
+            !icon_cell.modifier.contains(Modifier::DIM),
+            "status icon should not be dimmed"
         );
     }
 }

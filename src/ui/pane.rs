@@ -20,6 +20,10 @@ impl<T> Pane<T> {
         &self.items
     }
 
+    /// Test-only: the row counts assertions are written against. Production
+    /// code stopped needing a length once the section split became a fixed
+    /// half rather than a function of the agent count.
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.items.len()
     }
