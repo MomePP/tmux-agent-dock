@@ -19,8 +19,9 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::daemon::ProcessTree;
 use crate::model::{TmuxPane, TmuxWindow};
-use crate::tmux::tmux_output;
+use crate::tmux::{parse_panes, parse_windows, tmux_output};
 
 /// Depth cap for the ancestry walk. A client sits a handful of processes below
 /// its pane; anything deeper is a cycle in a malformed `ps` snapshot.
@@ -39,6 +40,51 @@ pub fn embedded_session_hosts(
         &tmux_output(&["list-clients", "-F", "#{session_name}\t#{client_pid}"]).unwrap_or_default(),
     );
     resolve_embedded(&clients, parents, windows, panes)
+}
+
+/// The tty of a client that is not itself running inside a tmux pane, or `None`
+/// when nothing is embedded — in which case the acting client is already right.
+///
+/// Driving the switcher from a sidekick float means the acting client is the
+/// *nested* one. Switching that client to an outer session attaches a session
+/// inside one of its own panes, and tmux renders that recursively: panes jump,
+/// the layout looks broken, and it is hard to get out of. Every client-scoped
+/// command must therefore name the outer client rather than inheriting
+/// whichever one happened to run it.
+pub fn outer_client_tty() -> Option<String> {
+    let windows = parse_windows(
+        &tmux_output(&[
+            "list-windows",
+            "-a",
+            "-F",
+            "#{window_id}\t#{session_name}\t#{window_index}\t#{window_name}\t#{window_flags}",
+        ])
+        .ok()?,
+    )
+    .ok()?;
+    let panes = parse_panes(
+        &tmux_output(&[
+            "list-panes",
+            "-a",
+            "-F",
+            "#{pane_id}\t#{window_id}\t#{pane_active}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_title}\t#{pane_pid}",
+        ])
+        .ok()?,
+    )
+    .ok()?;
+
+    let processes = ProcessTree::snapshot();
+    let embedded = embedded_session_hosts(&windows, &panes, processes.parents());
+    if embedded.is_empty() {
+        return None;
+    }
+
+    tmux_output(&["list-clients", "-F", "#{session_name}\t#{client_tty}"])
+        .ok()?
+        .lines()
+        .filter_map(|line| line.rsplit_once('\t'))
+        .find(|(session, _)| !embedded.contains_key(*session))
+        .map(|(_, tty)| tty.trim().to_owned())
 }
 
 /// The panes of embedded sessions, keyed by the pane hosting them.

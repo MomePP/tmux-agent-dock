@@ -145,7 +145,18 @@ pub fn env_tmux_value(name: &str) -> Option<String> {
 }
 
 pub fn select_card(card: &crate::model::WindowCard) -> Result<()> {
-    tmux_status(Command::new("tmux").args(["switch-client", "-t", &card.session_name]))?;
+    // `switch-client` is the only client-scoped command here, and it must name
+    // the outer client. Driven from a sidekick float the acting client is the
+    // nested one, and switching that to an outer session attaches a session
+    // inside its own pane — tmux renders it recursively and the layout breaks.
+    let mut switch = vec!["switch-client".to_owned()];
+    if let Some(tty) = crate::embed::outer_client_tty() {
+        switch.push("-c".to_owned());
+        switch.push(tty);
+    }
+    switch.push("-t".to_owned());
+    switch.push(card.session_name.clone());
+    tmux_status(Command::new("tmux").args(&switch))?;
     tmux_status(Command::new("tmux").args(["select-window", "-t", &card.window_id]))?;
     tmux_status(Command::new("tmux").args(["select-pane", "-t", &card.target_pane_id]))?;
     clear_unread_for_pane(&card.target_pane_id);

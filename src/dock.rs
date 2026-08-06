@@ -16,12 +16,19 @@ pub(crate) const DOCK_PANE_OPTION: &str = "@tmux_agent_switcher_dock_pane";
 pub(crate) const DOCK_MOVING_OPTION: &str = "@tmux_agent_switcher_dock_moving";
 pub(crate) const DOCK_LAYOUT_OPTION: &str = "@tmux_agent_switcher_dock_layout";
 pub(crate) const DOCK_WIDTH_OPTION: &str = "@agent_switcher_dock_width";
+/// The outer client the dock belongs to, resolved once when it opens.
+pub(crate) const DOCK_CLIENT_OPTION: &str = "@tmux_agent_switcher_dock_client";
 pub(crate) const DEFAULT_DOCK_WIDTH: u16 = 30;
 
-/// Creates the dock pane on the left of the current window. `-d` leaves the
-/// user in the pane they were working in; `-P -F` prints the new pane's id so
-/// the caller can record it.
-pub(crate) fn split_args(width: u16, exe: &str) -> Vec<String> {
+/// Creates the dock pane on the left of `target_window`. `-d` leaves the user
+/// in the pane they were working in; `-P -F` prints the new pane's id so the
+/// caller can record it.
+///
+/// The window is named explicitly rather than left to the acting client:
+/// pressed inside a sidekick float that client is the nested one, and the dock
+/// would be built inside the embedded session instead of beside the Neovim
+/// hosting it.
+pub(crate) fn split_args(width: u16, exe: &str, target_window: &str) -> Vec<String> {
     vec![
         "split-window".to_owned(),
         "-b".to_owned(),
@@ -29,6 +36,8 @@ pub(crate) fn split_args(width: u16, exe: &str) -> Vec<String> {
         "-d".to_owned(),
         "-l".to_owned(),
         width.to_string(),
+        "-t".to_owned(),
+        target_window.to_owned(),
         "-P".to_owned(),
         "-F".to_owned(),
         "#{pane_id}".to_owned(),
@@ -166,13 +175,18 @@ pub fn toggle() -> Result<()> {
         run(&["kill-pane".to_owned(), "-t".to_owned(), pane])?;
         restore_layout(&host);
         unset_global(DOCK_PANE_OPTION);
+        unset_global(DOCK_CLIENT_OPTION);
         return Ok(());
     }
 
     let dock_width = width();
-    let window_width = option(&["display-message", "-p", "#{window_width}"])
-        .parse::<u16>()
-        .unwrap_or(0);
+    let outer = crate::embed::outer_client_tty();
+    let window_width = match &outer {
+        Some(tty) => option(&["display-message", "-p", "-c", tty, "#{window_width}"]),
+        None => option(&["display-message", "-p", "#{window_width}"]),
+    }
+    .parse::<u16>()
+    .unwrap_or(0);
     if !has_room(window_width, dock_width) {
         let _ = run(&[
             "display-message".to_owned(),
@@ -184,11 +198,23 @@ pub fn toggle() -> Result<()> {
         return Ok(());
     }
 
-    let host = option(&["display-message", "-p", "#{window_id}"]);
+    // Resolve through the outer client. Pressed inside a sidekick float the
+    // acting client is the nested one, and the dock would be built inside that
+    // embedded session — invisible to the real Neovim, and gone when the float
+    // closes. Remember it so `follow` asks the same client every time.
+    let client = outer;
+    let host = match &client {
+        Some(tty) => option(&["display-message", "-p", "-c", tty, "#{window_id}"]),
+        None => option(&["display-message", "-p", "#{window_id}"]),
+    };
+    if host.is_empty() {
+        return Ok(());
+    }
+    let _ = set_global(DOCK_CLIENT_OPTION, client.as_deref().unwrap_or(""));
     save_layout(&host);
 
     let exe = std::env::current_exe()?.to_string_lossy().into_owned();
-    let args = split_args(dock_width, &exe);
+    let args = split_args(dock_width, &exe, &host);
     let pane = tmux_output(&args.iter().map(String::as_str).collect::<Vec<_>>())?
         .trim()
         .to_owned();
@@ -210,17 +236,21 @@ pub fn follow() -> Result<()> {
         "#{window_id}\t#{pane_id}\t#{window_layout}\t",
         "#{@tmux_agent_switcher_dock_pane}\t",
         "#{@tmux_agent_switcher_dock_moving}\t",
-        "#{@agent_switcher_dock_width}"
+        "#{@agent_switcher_dock_width}\t",
+        "#{@tmux_agent_switcher_dock_client}"
     );
 
+    // Globals only, so this is client-independent and safe to ask of whichever
+    // client triggered the hook.
     let probe = option(&["display-message", "-p", CLIENT_PROBE]);
     let mut fields = probe.split('\t');
-    let current = fields.next().unwrap_or_default().to_owned();
-    let target = fields.next().unwrap_or_default().to_owned();
-    let current_layout = fields.next().unwrap_or_default().to_owned();
+    let _ = fields.next();
+    let _ = fields.next();
+    let _ = fields.next();
     let pane = fields.next().unwrap_or_default().to_owned();
     let moving = fields.next().unwrap_or_default().to_owned();
     let dock_width = parse_width(fields.next().unwrap_or_default());
+    let client = fields.next().unwrap_or_default().trim().to_owned();
 
     if pane.is_empty() {
         return Ok(());
@@ -234,6 +264,25 @@ pub fn follow() -> Result<()> {
     // Targeting the recorded pane doubles as the aliveness check: tmux fails
     // when it no longer exists, and a stale recording is cleared so the next
     // toggle opens cleanly instead of trying to kill a pane that is gone.
+    // Where the dock should be is wherever the OUTER client is looking. Asking
+    // the triggering client instead would carry the dock into a sidekick float's
+    // embedded session the moment its window changed.
+    let mut destination = vec!["display-message".to_owned(), "-p".to_owned()];
+    if !client.is_empty() {
+        destination.push("-c".to_owned());
+        destination.push(client.clone());
+    }
+    destination.push("#{window_id}\t#{pane_id}\t#{window_layout}".to_owned());
+    let Ok(dest) = tmux_output(&destination.iter().map(String::as_str).collect::<Vec<_>>()) else {
+        // The remembered client is gone (detached). Leave the dock where it is
+        // rather than guessing and moving it somewhere the user is not.
+        return Ok(());
+    };
+    let mut dest_fields = dest.trim_end_matches('\n').split('\t');
+    let current = dest_fields.next().unwrap_or_default().to_owned();
+    let target = dest_fields.next().unwrap_or_default().to_owned();
+    let current_layout = dest_fields.next().unwrap_or_default().to_owned();
+
     let Ok(host_probe) = tmux_output(&[
         "display-message",
         "-p",
@@ -303,7 +352,7 @@ mod tests {
 
     #[test]
     fn split_puts_the_dock_left_without_taking_focus() {
-        let args = split_args(30, "/opt/bin/tmux-agent-switcher");
+        let args = split_args(30, "/opt/bin/tmux-agent-switcher", "@7");
 
         assert_eq!(
             args,
@@ -314,6 +363,8 @@ mod tests {
                 "-d",
                 "-l",
                 "30",
+                "-t",
+                "@7",
                 "-P",
                 "-F",
                 "#{pane_id}",
