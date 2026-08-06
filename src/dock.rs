@@ -197,34 +197,103 @@ pub fn toggle() -> Result<()> {
 }
 
 /// The follow hook: carries the dock into whatever window just became active.
+///
+/// This runs on every window and session change, so its cost is the cost of
+/// switching. Each `tmux` call is a fork, an exec and a socket round trip, and
+/// doing them one at a time made the dock visibly arrive after the window had
+/// already been drawn. Formats can read options (`#{@name}`) and one invocation
+/// can carry several commands, so the whole hook is three round trips: read
+/// everything about the client, read everything about the dock, then mutate.
+/// Chaining the mutations also means tmux redraws once rather than after each.
 pub fn follow() -> Result<()> {
-    let Some(pane) = dock_pane() else {
-        // Clear a stale recording so the next toggle opens cleanly rather than
-        // trying to kill a pane that is already gone.
-        unset_global(DOCK_PANE_OPTION);
-        return Ok(());
-    };
+    const CLIENT_PROBE: &str = concat!(
+        "#{window_id}\t#{pane_id}\t#{window_layout}\t",
+        "#{@tmux_agent_switcher_dock_pane}\t",
+        "#{@tmux_agent_switcher_dock_moving}\t",
+        "#{@agent_switcher_dock_width}"
+    );
 
+    let probe = option(&["display-message", "-p", CLIENT_PROBE]);
+    let mut fields = probe.split('\t');
+    let current = fields.next().unwrap_or_default().to_owned();
+    let target = fields.next().unwrap_or_default().to_owned();
+    let current_layout = fields.next().unwrap_or_default().to_owned();
+    let pane = fields.next().unwrap_or_default().to_owned();
+    let moving = fields.next().unwrap_or_default().to_owned();
+    let dock_width = parse_width(fields.next().unwrap_or_default());
+
+    if pane.is_empty() {
+        return Ok(());
+    }
     // `move-pane` changes the active window and re-fires the hooks that called
     // us. Without this guard the second call moves the dock straight back.
-    if !option(&["show-option", "-gqv", DOCK_MOVING_OPTION]).is_empty() {
+    if !moving.is_empty() {
         return Ok(());
     }
 
-    let current = option(&["display-message", "-p", "#{window_id}"]);
-    let host = window_of(&pane);
+    // Targeting the recorded pane doubles as the aliveness check: tmux fails
+    // when it no longer exists, and a stale recording is cleared so the next
+    // toggle opens cleanly instead of trying to kill a pane that is gone.
+    let Ok(host_probe) = tmux_output(&[
+        "display-message",
+        "-p",
+        "-t",
+        &pane,
+        "#{window_id}\t#{@tmux_agent_switcher_dock_layout}",
+    ]) else {
+        unset_global(DOCK_PANE_OPTION);
+        return Ok(());
+    };
+    let mut host_fields = host_probe.trim_end_matches('\n').split('\t');
+    let host = host_fields.next().unwrap_or_default().to_owned();
+    let host_layout = host_fields.next().unwrap_or_default().to_owned();
+
     if current.is_empty() || current == host {
         return Ok(());
     }
 
-    set_global(DOCK_MOVING_OPTION, "1")?;
+    // One invocation: guard, remember the destination's geometry, move, put the
+    // window we left back, forget its layout, release the guard.
+    let mut batch = vec![
+        "set-option".to_owned(),
+        "-g".to_owned(),
+        DOCK_MOVING_OPTION.to_owned(),
+        "1".to_owned(),
+        ";".to_owned(),
+        "set-option".to_owned(),
+        "-w".to_owned(),
+        "-t".to_owned(),
+        current.clone(),
+        DOCK_LAYOUT_OPTION.to_owned(),
+        current_layout,
+        ";".to_owned(),
+    ];
+    batch.extend(move_args(dock_width, &pane, &target));
+    if !host_layout.is_empty() {
+        batch.push(";".to_owned());
+        batch.extend(restore_layout_args(&host, &host_layout));
+    }
+    batch.extend([
+        ";".to_owned(),
+        "set-option".to_owned(),
+        "-w".to_owned(),
+        "-u".to_owned(),
+        "-t".to_owned(),
+        host,
+        DOCK_LAYOUT_OPTION.to_owned(),
+        ";".to_owned(),
+        "set-option".to_owned(),
+        "-g".to_owned(),
+        "-u".to_owned(),
+        DOCK_MOVING_OPTION.to_owned(),
+    ]);
 
-    save_layout(&current);
-    let target = option(&["display-message", "-p", "-t", &current, "#{pane_id}"]);
-    let moved = run(&move_args(width(), &pane, &target));
-    restore_layout(&host);
-
-    unset_global(DOCK_MOVING_OPTION);
+    let moved = run(&batch);
+    if moved.is_err() {
+        // The batch stops at the failure, so the guard would stay set and the
+        // dock would never follow again.
+        unset_global(DOCK_MOVING_OPTION);
+    }
     moved
 }
 

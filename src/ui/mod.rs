@@ -1315,7 +1315,11 @@ fn run_tui_loop(
                     }
                 }
             }
-            Event::Resize(_, _) => terminal.clear()?,
+            // Not `terminal.clear()`: that flushes its escape immediately, so
+            // the pane blanks and stays blank until the next draw. The dock
+            // resizes every time it is carried into another window, which made
+            // that blank flash the visible cost of switching.
+            Event::Resize(_, _) => queue_full_repaint(terminal)?,
             Event::Key(key) => {
                 if let Some(result) = ui.handle_key(key, terminal.size()?) {
                     if surface == Surface::Dock {
