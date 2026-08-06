@@ -36,6 +36,16 @@ const SECTIONS_KEYS_PLACEHOLDER: &str = "j/k move · tab section";
 const SWITCHER_NAME: &str = "agent-switcher";
 const HELP_LABEL: &str = "[?] Help";
 
+/// Which host the switcher is rendering into. The popup owns the whole screen
+/// and draws a modal frame over it; the dock is one pane beside the work you
+/// are doing and draws none of that.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)] // Consumed by Task 4.
+pub(crate) enum Surface {
+    Popup,
+    Dock,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn draw(
     frame: &mut Frame,

@@ -185,6 +185,55 @@ pub(crate) fn compact_navigation_height(
         .saturating_add(1)
 }
 
+/// Geometry for the docked sidebar: the pane is the list. No modal inset,
+/// because there is no border to sit inside, and no preview, because the work
+/// pane beside the dock is the thing a preview would have been showing.
+///
+/// Row order matches the popup so the two surfaces feel the same: list on top,
+/// help below it, search prompt on the bottom row.
+#[allow(dead_code)] // Consumed by Task 4.
+pub(crate) fn dock_layout(area: Rect, show_help: bool, input: InputMode) -> SwitcherLayout {
+    let search_height = if matches!(input, InputMode::Search) {
+        area.height.min(SEARCH_BAR_ROWS)
+    } else {
+        0
+    };
+    let body_height = area.height.saturating_sub(search_height);
+    let help_height = if show_help {
+        HELP_LINE_COUNT.min(body_height)
+    } else {
+        0
+    };
+
+    let sessions = Rect {
+        height: body_height.saturating_sub(help_height),
+        ..area
+    };
+    let help = (help_height > 0).then_some(Rect {
+        y: area.y.saturating_add(sessions.height),
+        height: help_height,
+        ..area
+    });
+    let search = Rect {
+        y: area.y.saturating_add(body_height),
+        height: search_height,
+        ..area
+    };
+
+    SwitcherLayout {
+        list_overlay: area,
+        search,
+        sessions,
+        help,
+        preview: Rect {
+            x: area.x,
+            y: area.y,
+            width: 0,
+            height: 0,
+        },
+    }
+}
+
 fn percentage_length(total: u16, percent: u16) -> u16 {
     if total == 0 {
         return 0;
@@ -360,5 +409,62 @@ mod tests {
             numbers.sessions.height,
             search.sessions.height + SEARCH_BAR_ROWS
         );
+    }
+
+    #[test]
+    fn dock_layout_uses_the_whole_pane_with_no_modal_inset() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 40,
+        };
+
+        let layout = dock_layout(area, false, InputMode::Keys);
+
+        // No border to inset past: the list starts at the pane's own edge.
+        assert_eq!(layout.list_overlay, area);
+        assert_eq!(layout.sessions.x, 0);
+        assert_eq!(layout.sessions.width, 30);
+        // Nothing to preview beside a pane that fills its own width.
+        assert_eq!(layout.preview.width, 0);
+        assert_eq!(layout.preview.height, 0);
+        // Keys mode hides the search bar, so the list takes the full height.
+        assert_eq!(layout.sessions.height, 40);
+        assert_eq!(layout.help, None);
+    }
+
+    #[test]
+    fn dock_layout_puts_the_search_bar_at_the_bottom_in_search_mode() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 40,
+        };
+
+        let layout = dock_layout(area, false, InputMode::Search);
+
+        assert_eq!(layout.search.height, SEARCH_BAR_ROWS);
+        assert_eq!(layout.search.y, 40 - SEARCH_BAR_ROWS);
+        assert_eq!(layout.sessions.height, 40 - SEARCH_BAR_ROWS);
+        assert_eq!(layout.sessions.y, 0);
+    }
+
+    #[test]
+    fn dock_layout_gives_help_the_rows_below_the_list() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 40,
+        };
+
+        let layout = dock_layout(area, true, InputMode::Keys);
+        let help = layout.help.expect("help area");
+
+        assert_eq!(help.height, HELP_LINE_COUNT);
+        assert_eq!(layout.sessions.height, 40 - HELP_LINE_COUNT);
+        assert_eq!(help.y, layout.sessions.height);
     }
 }
