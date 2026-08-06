@@ -46,7 +46,7 @@ use layout::{compact_navigation_height, dock_layout, switcher_layout, switcher_l
 use pane::Pane;
 use render::{draw, Surface};
 use sections::{
-    agent_rows, format_expanded, initial_expanded_set, parse_expand_default, parse_expanded, row_at, row_key,
+    agent_rows, format_expanded, initial_expanded_set, known_session_names, parse_expand_default, parse_expanded, row_at, row_key,
     rows_area, rows_per_height, section_heights, session_rows, sessions_matching_windows, ClickTarget, ExpandDefault, Row, RowKind,
     SectionFocus,
 };
@@ -72,6 +72,8 @@ const TUI_TICK_INTERVAL: Duration = Duration::from_millis(50);
 const VIEW_MODE_OPTION: &str = "@tmux_agent_switcher_view";
 const INPUT_MODE_OPTION: &str = "@tmux_agent_switcher_input";
 const EXPANDED_OPTION: &str = "@tmux_agent_switcher_expanded";
+/// Every session the switcher had an opinion about when it last closed.
+const KNOWN_OPTION: &str = "@tmux_agent_switcher_known";
 const EXPAND_DEFAULT_OPTION: &str = "@agent_switcher_expand_default";
 
 pub fn run_tui(cards: Vec<WindowCard>) -> Result<Option<SwitcherAction>> {
@@ -187,19 +189,14 @@ fn persist_input_mode(input: InputMode) {
     ]));
 }
 
-/// Which sessions were left expanded, remembered for the tmux server's
-/// lifetime the same way the view and input modes are. `None` means the option
-/// was never written — a fresh server — which is deliberately distinct from an
-/// empty set, the state a user reaches by collapsing everything.
-///
-/// The two look identical through `show-option -gqv`, which yields "" either
-/// way. `show-options -g <name>` tells them apart: it fails on an unset option
-/// and succeeds on one set to "". Reading the value still goes through `-gqv`,
-/// because the plural form quotes and escapes what it prints.
-fn initial_expanded() -> Option<HashSet<String>> {
-    tmux_output(&["show-options", "-g", EXPANDED_OPTION]).ok()?;
-    let value = tmux_output(&["show-option", "-gqv", EXPANDED_OPTION]).unwrap_or_default();
-    Some(parse_expanded(&value))
+/// Which sessions were left expanded, and which the switcher had an opinion
+/// about at all — remembered for the tmux server's lifetime the same way the
+/// view and input modes are. See [`initial_expanded_set`] for why both are
+/// needed; an empty pair simply means nothing is remembered yet, so every
+/// session follows `@agent_switcher_expand_default`.
+fn initial_expanded() -> (HashSet<String>, HashSet<String>) {
+    let read = |option| parse_expanded(&tmux_output(&["show-option", "-gqv", option]).unwrap_or_default());
+    (read(EXPANDED_OPTION), read(KNOWN_OPTION))
 }
 
 /// Hands the keyboard back to the pane the user was working in. `select-pane -l`
@@ -212,12 +209,20 @@ fn focus_work_pane() {
     }
 }
 
-fn persist_expanded(expanded: &HashSet<String>) {
+/// Writes both halves of the memory in one tmux round trip. They must move
+/// together: a `known` that lagged behind `expanded` would read a session the
+/// user just collapsed as one that had never been seen, and re-expand it.
+fn persist_expanded(expanded: &HashSet<String>, sessions: &[SessionGroup]) {
     let _ = tmux_status(Command::new("tmux").args([
         "set-option",
         "-g",
         EXPANDED_OPTION,
-        &format_expanded(expanded),
+        &format_expanded(expanded.iter().cloned()),
+        ";",
+        "set-option",
+        "-g",
+        KNOWN_OPTION,
+        &format_expanded(known_session_names(sessions)),
     ]));
 }
 
@@ -267,7 +272,7 @@ impl SwitcherUi {
         cards: Vec<WindowCard>,
         current_window_id: Option<&str>,
         terminal_size: Rect,
-        expanded: Option<HashSet<String>>,
+        remembered: (HashSet<String>, HashSet<String>),
         expand_default: ExpandDefault,
         view: ViewMode,
         input: InputMode,
@@ -277,8 +282,14 @@ impl SwitcherUi {
             apply_session_order(&mut sessions, &order);
         }
         let filtered = filter_sessions(&sessions, "");
-        let expanded =
-            initial_expanded_set(expanded, &sessions, current_window_id, expand_default);
+        let (remembered_expanded, remembered_known) = remembered;
+        let expanded = initial_expanded_set(
+            &remembered_expanded,
+            &remembered_known,
+            &sessions,
+            current_window_id,
+            expand_default,
+        );
         // Numbers is unusable in the sections views and its own cycle no longer
         // reaches it — but the mode is persisted across opens, so anyone who
         // landed there before is still carrying it. Coerce on the way in rather
@@ -530,7 +541,7 @@ impl SwitcherUi {
         };
         let name = name.clone();
         self.expanded.insert(name);
-        persist_expanded(&self.expanded);
+        persist_expanded(&self.expanded, &self.sessions);
         self.rebuild_panes();
     }
 
@@ -545,7 +556,7 @@ impl SwitcherUi {
             _ => row.target.session_name.clone(),
         };
         self.expanded.remove(&name);
-        persist_expanded(&self.expanded);
+        persist_expanded(&self.expanded, &self.sessions);
         self.rebuild_panes();
     }
 
@@ -1395,8 +1406,8 @@ mod tests {
             cards,
             current_window_id,
             size(),
-            Some(HashSet::new()),
-            ExpandDefault::Attached,
+            (HashSet::new(), HashSet::new()),
+            ExpandDefault::None,
             ViewMode::Sidebar,
             InputMode::Keys,
         )
@@ -1408,8 +1419,8 @@ mod tests {
             cards,
             None,
             size(),
-            Some(HashSet::new()),
-            ExpandDefault::Attached,
+            (HashSet::new(), HashSet::new()),
+            ExpandDefault::None,
             ViewMode::Palette,
             InputMode::Keys,
         )
@@ -1450,8 +1461,8 @@ mod tests {
             cards,
             None,
             size(),
-            Some(HashSet::new()),
-            ExpandDefault::Attached,
+            (HashSet::new(), HashSet::new()),
+            ExpandDefault::None,
             ViewMode::Sidebar,
             InputMode::Keys,
         );
@@ -1797,8 +1808,8 @@ mod tests {
             three_sessions(),
             None,
             size(),
-            Some(HashSet::new()),
-            ExpandDefault::Attached,
+            (HashSet::new(), HashSet::new()),
+            ExpandDefault::None,
             ViewMode::Sidebar,
             InputMode::Numbers,
         );
@@ -2215,7 +2226,7 @@ mod tests {
             cards,
             Some("@bravo-1"),
             size(),
-            None,
+            (HashSet::new(), HashSet::new()),
             ExpandDefault::Attached,
             ViewMode::Sidebar,
             InputMode::Keys,
@@ -2241,9 +2252,12 @@ mod tests {
             cards,
             Some("@bravo-0"),
             size(),
-            // A non-empty remembered set is the user's own choice and is taken
-            // as-is, so "bravo" stays collapsed.
-            Some(HashSet::from(["alpha".to_owned()])),
+            // Both sessions are remembered, "alpha" expanded and "bravo" not,
+            // so the default gets no vote and "bravo" stays collapsed.
+            (
+                HashSet::from(["alpha".to_owned()]),
+                HashSet::from(["alpha".to_owned(), "bravo".to_owned()]),
+            ),
             ExpandDefault::Attached,
             ViewMode::Sidebar,
             InputMode::Keys,

@@ -283,39 +283,50 @@ pub(crate) fn parse_expand_default(value: &str) -> ExpandDefault {
     }
 }
 
-/// The expansion set the switcher opens with.
+/// The expansion set the switcher opens with, decided one session at a time.
 ///
-/// The default only decides what a *fresh* server looks like. Once the
-/// persisted option carries a set it is the user's own choice, and re-applying
-/// a default over it would fight them on every open.
+/// Two sets are remembered, not one: `expanded` is what was left open, and
+/// `known` is every session the switcher had an opinion about when it last
+/// closed. A session in `known` keeps whatever the user left it as — including
+/// collapsed, which is why collapsing everything survives the next open. A
+/// session that is *not* in `known` is new since then, and follows `default`.
 ///
-/// `persisted` is `None` only when the option was never written. An explicitly
-/// empty set arrives as `Some(empty)` and is honoured as-is — collapsing every
-/// session is a deliberate act, and seeding anything back in would undo it on
-/// the very next open.
+/// Remembering only `expanded` conflated "you collapsed this" with "this did
+/// not exist yet", so `@agent_switcher_expand_default = all` never applied to a
+/// session created after the first close — and a server whose remembered set
+/// had gone empty stayed fully collapsed forever, with no way back short of
+/// unsetting the option by hand.
 pub(crate) fn initial_expanded_set(
-    persisted: Option<HashSet<String>>,
+    expanded: &HashSet<String>,
+    known: &HashSet<String>,
     sessions: &[SessionGroup],
     current_window_id: Option<&str>,
     default: ExpandDefault,
 ) -> HashSet<String> {
-    if let Some(expanded) = persisted {
-        return expanded;
-    }
+    let attached = attached_session_name(sessions, current_window_id);
 
-    match default {
-        ExpandDefault::All => sessions
-            .iter()
-            .map(|session| session.session_name.clone())
-            .collect(),
-        ExpandDefault::None => HashSet::new(),
-        ExpandDefault::Attached => attached_session_name(sessions, current_window_id)
-            .into_iter()
-            .collect(),
-    }
+    sessions
+        .iter()
+        .map(|session| &session.session_name)
+        .filter(|name| {
+            if known.contains(*name) {
+                return expanded.contains(*name);
+            }
+            match default {
+                ExpandDefault::All => true,
+                ExpandDefault::None => false,
+                ExpandDefault::Attached => attached.as_ref() == Some(*name),
+            }
+        })
+        .cloned()
+        .collect()
 }
 
-/// Session names may contain spaces, so the persisted set is tab-separated.
+/// Session names may contain spaces, so the persisted sets are tab-separated.
+///
+/// Expanded and known live in two tmux options rather than one marked-up
+/// value: tmux accepts `:`, `.` and `!` in a session name, so there is no
+/// character an in-band "collapsed" marker could safely use.
 const EXPANDED_SEPARATOR: char = '\t';
 
 pub(crate) fn parse_expanded(value: &str) -> HashSet<String> {
@@ -327,10 +338,19 @@ pub(crate) fn parse_expanded(value: &str) -> HashSet<String> {
         .collect()
 }
 
-pub(crate) fn format_expanded(expanded: &HashSet<String>) -> String {
-    let mut names: Vec<&str> = expanded.iter().map(String::as_str).collect();
+pub(crate) fn format_expanded(names: impl IntoIterator<Item = String>) -> String {
+    let mut names: Vec<String> = names.into_iter().collect();
     names.sort_unstable(); // stable option value, so no pointless tmux writes
     names.join(&EXPANDED_SEPARATOR.to_string())
+}
+
+/// Every session on the server: what gets remembered as "had an opinion about"
+/// so the next open can tell a collapsed session from a brand new one.
+pub(crate) fn known_session_names(sessions: &[SessionGroup]) -> HashSet<String> {
+    sessions
+        .iter()
+        .map(|session| session.session_name.clone())
+        .collect()
 }
 
 /// Sessions whose window list was narrowed by the active query. Those get
@@ -750,16 +770,25 @@ mod tests {
         assert_eq!(agents, None);
     }
 
+    fn names(values: &[&str]) -> HashSet<String> {
+        values.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    /// Nothing remembered yet: every session follows the default.
+    fn fresh() -> (HashSet<String>, HashSet<String>) {
+        (HashSet::new(), HashSet::new())
+    }
+
     #[test]
     fn expanded_state_round_trips_through_a_tab_separated_option() {
-        let expanded = HashSet::from([
-            "dotfiles-config".to_owned(),
+        let expanded = names(&[
+            "dotfiles-config",
             // Session names can contain spaces, which is why the separator is
             // a tab rather than whitespace.
-            "claude_1 b9f9f91c".to_owned(),
+            "claude_1 b9f9f91c",
         ]);
 
-        let restored = parse_expanded(&format_expanded(&expanded));
+        let restored = parse_expanded(&format_expanded(expanded.iter().cloned()));
 
         assert_eq!(restored, expanded);
     }
@@ -777,29 +806,39 @@ mod tests {
     fn a_fresh_server_opens_with_the_attached_session_expanded() {
         let sessions = fixture();
         let current = sessions[1].cards[0].window_id.clone();
+        let (expanded, known) = fresh();
 
-        let expanded =
-            initial_expanded_set(None, &sessions, Some(&current), ExpandDefault::Attached);
+        let opened = initial_expanded_set(
+            &expanded,
+            &known,
+            &sessions,
+            Some(&current),
+            ExpandDefault::Attached,
+        );
 
-        assert_eq!(expanded, HashSet::from(["gogo".to_owned()]));
+        assert_eq!(opened, names(&["gogo"]));
     }
 
-    /// Once something was remembered, the remembered set is the whole answer —
-    /// re-adding the attached session would undo a deliberate collapse.
+    /// A session the switcher has seen keeps whatever the user left it as, and
+    /// the default does not get a second vote on it.
     #[test]
-    fn a_remembered_set_is_left_exactly_as_it_was() {
+    fn a_remembered_session_keeps_what_the_user_left_it_as() {
         let sessions = fixture();
         let current = sessions[1].cards[0].window_id.clone();
-        let persisted = HashSet::from(["dotfiles".to_owned()]);
 
-        let expanded = initial_expanded_set(
-            Some(persisted.clone()),
+        let opened = initial_expanded_set(
+            &names(&["dotfiles"]),
+            &names(&["dotfiles", "gogo"]),
             &sessions,
             Some(&current),
             ExpandDefault::All,
         );
 
-        assert_eq!(expanded, persisted);
+        assert_eq!(
+            opened,
+            names(&["dotfiles"]),
+            "`gogo` was remembered as collapsed and must stay collapsed"
+        );
     }
 
     /// `@agent_switcher_expand_default` decides what a fresh server shows.
@@ -807,16 +846,14 @@ mod tests {
     fn the_expand_default_decides_a_fresh_servers_tree() {
         let sessions = fixture();
         let current = sessions[1].cards[0].window_id.clone();
+        let (expanded, known) = fresh();
+        let open = |default| {
+            initial_expanded_set(&expanded, &known, &sessions, Some(&current), default)
+        };
 
-        assert_eq!(
-            initial_expanded_set(None, &sessions, Some(&current), ExpandDefault::All),
-            HashSet::from(["dotfiles".to_owned(), "gogo".to_owned()])
-        );
-        assert!(initial_expanded_set(None, &sessions, Some(&current), ExpandDefault::None).is_empty());
-        assert_eq!(
-            initial_expanded_set(None, &sessions, Some(&current), ExpandDefault::Attached),
-            HashSet::from(["gogo".to_owned()])
-        );
+        assert_eq!(open(ExpandDefault::All), names(&["dotfiles", "gogo"]));
+        assert!(open(ExpandDefault::None).is_empty());
+        assert_eq!(open(ExpandDefault::Attached), names(&["gogo"]));
     }
 
     /// An unreadable setting lands on the documented default rather than a
@@ -834,45 +871,80 @@ mod tests {
         assert_eq!(ExpandDefault::default(), ExpandDefault::All);
     }
 
-    /// The default only shapes a fresh server. Once anything is remembered it is
-    /// the whole answer, or `all` would re-expand what the user just collapsed.
-    #[test]
-    fn a_remembered_set_outranks_the_default() {
-        let sessions = fixture();
-        let persisted = HashSet::from(["dotfiles".to_owned()]);
-
-        let expanded =
-            initial_expanded_set(Some(persisted.clone()), &sessions, None, ExpandDefault::All);
-
-        assert_eq!(expanded, persisted);
-    }
-
-    /// Collapsing every session persists an empty set, which is NOT the same as
-    /// never having been written. Seeding the attached session back in here
-    /// would silently re-expand it on the very next open.
+    /// Collapsing every session must survive the next open. It is remembered as
+    /// an empty `expanded` against a full `known`, which is what tells it apart
+    /// from a server that has never been opened.
     #[test]
     fn collapsing_every_session_survives_the_next_open() {
         let sessions = fixture();
         let current = sessions[1].cards[0].window_id.clone();
 
-        let expanded = initial_expanded_set(
-            Some(HashSet::new()),
+        let opened = initial_expanded_set(
+            &HashSet::new(),
+            &known_session_names(&sessions),
             &sessions,
             Some(&current),
             ExpandDefault::All,
         );
 
         assert!(
-            expanded.is_empty(),
-            "an explicitly emptied set was re-seeded: {expanded:?}"
+            opened.is_empty(),
+            "a deliberate full collapse was re-seeded: {opened:?}"
         );
+    }
+
+    /// The bug this two-set memory exists for. A session created after the last
+    /// close was never collapsed by anyone — it simply did not exist — so it
+    /// follows the default instead of inheriting "absent means collapsed".
+    #[test]
+    fn a_session_created_since_the_last_close_follows_the_default() {
+        let sessions = fixture();
+
+        let opened = initial_expanded_set(
+            &HashSet::new(),
+            &names(&["dotfiles"]),
+            &sessions,
+            None,
+            ExpandDefault::All,
+        );
+
+        assert_eq!(
+            opened,
+            names(&["gogo"]),
+            "`dotfiles` was collapsed on purpose; `gogo` is new and takes the default"
+        );
+    }
+
+    /// A server whose remembered state was written by an older build, or lost,
+    /// reads as "nothing known" and heals back to the default rather than
+    /// staying collapsed forever with no way out but unsetting the option.
+    #[test]
+    fn a_server_with_no_memory_heals_to_the_default() {
+        let sessions = fixture();
+        let (expanded, known) = fresh();
+
+        let opened =
+            initial_expanded_set(&expanded, &known, &sessions, None, ExpandDefault::All);
+
+        assert_eq!(opened, names(&["dotfiles", "gogo"]));
+    }
+
+    #[test]
+    fn known_names_are_every_session_on_the_server() {
+        assert_eq!(known_session_names(&fixture()), names(&["dotfiles", "gogo"]));
     }
 
     #[test]
     fn nothing_is_expanded_when_the_current_window_is_unknown() {
-        assert!(
-            initial_expanded_set(None, &fixture(), None, ExpandDefault::Attached).is_empty()
-        );
+        let (expanded, known) = fresh();
+        assert!(initial_expanded_set(
+            &expanded,
+            &known,
+            &fixture(),
+            None,
+            ExpandDefault::Attached
+        )
+        .is_empty());
     }
 
     #[test]
