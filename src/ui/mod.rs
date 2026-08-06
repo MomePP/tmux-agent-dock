@@ -225,6 +225,17 @@ impl SwitcherUi {
         }
         let filtered = filter_sessions(&sessions, "");
         let expanded = initial_expanded_set(expanded, &sessions, current_window_id);
+        // Numbers is unusable in the sections views and its own cycle no longer
+        // reaches it — but the mode is persisted across opens, so anyone who
+        // landed there before is still carrying it. Coerce on the way in rather
+        // than opening a sidebar that ignores every letter.
+        let input = if matches!(view, ViewMode::Sidebar | ViewMode::SidebarRight)
+            && input == InputMode::Numbers
+        {
+            InputMode::Keys
+        } else {
+            input
+        };
         let mut ui = Self {
             sessions,
             filtered,
@@ -661,7 +672,11 @@ impl SwitcherUi {
                 // non-printable: in Search mode every printable key is text and
                 // Esc closes the switcher rather than leaving the mode, so this
                 // is the only way out.
-                self.input = self.input.toggled();
+                self.input = if self.uses_sections() {
+                    self.input.toggled_without_numbers()
+                } else {
+                    self.input.toggled()
+                };
                 self.numbered_input.clear();
                 persist_input_mode(self.input);
                 let navigation_height = self.navigation_height(terminal_size);
@@ -1517,6 +1532,49 @@ mod tests {
     /// `handle_ctrl_char`, which runs in every input mode — including Search,
     /// where a plain `l` is text. Without these two tests, dropping either
     /// `uses_sections()` branch would still pass the whole suite.
+    /// Numbers swallows every plain character (`h`, `l`, even `q`), so in the
+    /// sections views it is a mode where the sidebar answers only the arrows
+    /// and looks broken. Shift-Tab must step straight over it.
+    #[test]
+    fn the_sections_input_cycle_skips_the_unusable_numbers_mode() {
+        let mut ui = ui_with(three_sessions());
+        assert_eq!(ui.input, InputMode::Keys);
+
+        ui.handle_key(key(KeyCode::BackTab), size());
+        assert_eq!(ui.input, InputMode::Search);
+
+        ui.handle_key(key(KeyCode::BackTab), size());
+        assert_eq!(ui.input, InputMode::Keys);
+    }
+
+    /// The palette renders the row numbers Numbers mode addresses, so it keeps
+    /// the full three-way cycle.
+    #[test]
+    fn the_palette_input_cycle_still_offers_numbers() {
+        let mut ui = palette_ui(three_sessions());
+        assert_eq!(ui.input, InputMode::Keys);
+
+        ui.handle_key(key(KeyCode::BackTab), size());
+
+        assert_eq!(ui.input, InputMode::Numbers);
+    }
+
+    /// Numbers is persisted across opens, so someone who reached it before the
+    /// cycle skipped it would otherwise open a sidebar that ignores `h`/`l`.
+    #[test]
+    fn a_persisted_numbers_mode_is_coerced_out_of_the_sections_views() {
+        let ui = SwitcherUi::with_settings(
+            three_sessions(),
+            None,
+            size(),
+            Some(HashSet::new()),
+            ViewMode::Sidebar,
+            InputMode::Numbers,
+        );
+
+        assert_eq!(ui.input, InputMode::Keys);
+    }
+
     #[test]
     fn ctrl_l_expands_and_ctrl_h_collapses_the_selected_session() {
         let mut ui = ui_with(vec![test_card("dotfiles", "0"), test_card("dotfiles", "1")]);

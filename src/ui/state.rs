@@ -77,6 +77,21 @@ impl InputMode {
             InputMode::Search => InputMode::Keys,
         }
     }
+
+    /// The cycle the sections views use, skipping [`InputMode::Numbers`].
+    ///
+    /// Numbered addressing is a property of the compact list, which renders the
+    /// row numbers it reads. `render_sections` draws none, so in the sidebar a
+    /// digit addresses nothing — and the mode swallows every other plain
+    /// character too (`h`, `l`, even `q`), leaving a sidebar that answers only
+    /// the arrow keys and looks broken. A mode that cannot work is worse than
+    /// one that is not offered.
+    pub(crate) fn toggled_without_numbers(self) -> Self {
+        match self {
+            InputMode::Keys => InputMode::Search,
+            InputMode::Numbers | InputMode::Search => InputMode::Keys,
+        }
+    }
 }
 
 pub(crate) fn parse_input_mode(value: &str) -> Option<InputMode> {

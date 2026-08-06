@@ -859,7 +859,7 @@ fn render_modal_top_bar(frame: &mut Frame, area: Rect) {
 const SECTIONS_HELP: [&str; 14] = [
     "Shortcuts",
     "tab: focus section",
-    "S-tab: keys/nums/search",
+    "S-tab: keys/search",
     "v: cycle view",
     "j/k · ↑/↓: move",
     "h/l ←/→ C-h/C-l: fold",
@@ -1343,7 +1343,7 @@ mod tests {
             .any(|row| row.contains("tab: focus section")));
         assert!(help_rows
             .iter()
-            .any(|row| row.contains("S-tab: keys/nums/search")));
+            .any(|row| row.contains("S-tab: keys/search")));
         assert!(help_rows.iter().any(|row| row.contains("v: cycle view")));
         assert!(help_rows.iter().any(|row| row.contains("j/k · ↑/↓: move")));
         // C-h/C-l fold too, and reach the sections from every input mode —
