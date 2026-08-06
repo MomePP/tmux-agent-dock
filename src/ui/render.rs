@@ -2376,7 +2376,7 @@ mod tests {
         let sessions = Pane::new(session_rows(&sessions_group, &HashSet::new(), None));
         let agents = Pane::new(agent_rows(&sessions_group));
 
-        let backend = ratatui::backend::TestBackend::new(28, 12);
+        let backend = ratatui::backend::TestBackend::new(28, 16);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
@@ -2386,7 +2386,7 @@ mod tests {
                         x: 0,
                         y: 0,
                         width: 28,
-                        height: 12,
+                        height: 16,
                     },
                     &sessions,
                     &agents,
@@ -2478,12 +2478,12 @@ mod tests {
             x: 0,
             y: 0,
             width: 28,
-            height: 12,
+            height: 16,
         };
         let (_, agents_area) = section_heights(body);
         let agents_area = agents_area.expect("agents section");
 
-        let backend = ratatui::backend::TestBackend::new(28, 12);
+        let backend = ratatui::backend::TestBackend::new(28, 16);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {

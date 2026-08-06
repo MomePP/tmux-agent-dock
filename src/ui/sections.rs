@@ -209,29 +209,37 @@ pub(crate) fn rows_area(area: Rect, section: SectionFocus) -> Rect {
     }
 }
 
-/// Below this the body cannot carry both headers plus a row each, so the split
-/// is abandoned and Sessions keeps everything. The Agents half is the binding
-/// constraint: three header lines and a two-line row is five, and it gets the
-/// smaller half of an odd body.
-const MIN_SPLIT_HEIGHT: u16 = 10;
+/// The share of the body the Agents section takes.
+///
+/// Not half. There are only ever a handful of agents — two, on the sidebar
+/// this was tuned against — while an expanded session tree runs to dozens of
+/// rows, so an even split spent most of the lower half on blank space that the
+/// upper half was scrolling for want of.
+const AGENTS_PERCENT: u16 = 40;
 
-/// Divides the body in half between the two sections. The split does not depend
-/// on how many agents are running: an Agents section that resizes itself moves
-/// the boundary under the user every time an agent starts or exits, and with no
-/// agents at all the section is worth keeping as a visible "none running"
-/// statement rather than silently vanishing.
+/// Below this the body cannot carry both headers plus a row each, so the split
+/// is abandoned and Sessions keeps everything. Agents is the binding section:
+/// it needs three header lines and a two-line row, and 40% of 13 is exactly
+/// that.
+const MIN_SPLIT_HEIGHT: u16 = 13;
+
+/// Divides the body between the two sections, Sessions on top. The split does
+/// not depend on how many agents are running: an Agents section that resizes
+/// itself moves the boundary under the user every time an agent starts or
+/// exits, and with no agents at all the section is worth keeping as a visible
+/// "none running" statement rather than silently vanishing.
 pub(crate) fn section_heights(body: Rect) -> (Rect, Option<Rect>) {
     if body.height < MIN_SPLIT_HEIGHT {
         return (body, None);
     }
 
-    // A fixed half each, so the Agents title sits on the body's midpoint and
-    // stays there. Sizing the section to its content instead parked the title
-    // just above the search bar and moved it every time an agent came or went,
-    // which read as the section drifting rather than as a boundary.
-    // Halved from the Agents side so an odd body gives its spare row to
-    // Sessions, which holds the longer list.
-    let agents_height = body.height / 2;
+    // A fixed share each, so the Agents title lands in one place and stays
+    // there. Sizing the section to its content instead parked the title just
+    // above the search bar and moved it every time an agent came or went, which
+    // read as the section drifting rather than as a boundary.
+    // Rounded down from the Agents side, so a body that does not divide evenly
+    // gives its spare rows to Sessions, which holds the longer list.
+    let agents_height = body.height * AGENTS_PERCENT / 100;
     let sessions_height = body.height.saturating_sub(agents_height);
 
     let sessions = Rect {
@@ -703,15 +711,16 @@ mod tests {
 
     /// The boundary is the point of the split, so it holds still even with no
     /// agents running — a section that appears and disappears moves every row
-    /// beneath it.
+    /// beneath it. Agents takes 40%, not half: a handful of agents against a
+    /// tree of dozens of rows.
     #[test]
-    fn no_agents_still_gets_its_half() {
+    fn no_agents_still_gets_its_share() {
         let (sessions, agents) = section_heights(body(20));
         let agents = agents.expect("agents section");
 
-        assert_eq!(sessions.height, 10);
-        assert_eq!(agents.height, 10);
-        assert_eq!(agents.y, 10);
+        assert_eq!(sessions.height, 12);
+        assert_eq!(agents.height, 8);
+        assert_eq!(agents.y, 12);
     }
 
     /// The split is fixed: one agent and twenty produce the same boundary, so
@@ -722,19 +731,20 @@ mod tests {
         let many = section_heights(body(20));
 
         assert_eq!(few, many);
-        assert_eq!(few.1.expect("agents section").y, 10);
+        assert_eq!(few.1.expect("agents section").y, 12);
     }
 
-    /// The shortest body that still splits. Agents is the binding half: its
-    /// rule, title and blank line, plus a two-line row, is five.
+    /// The shortest body that still splits. Agents is the binding section: its
+    /// rule, title and blank line, plus a two-line row, is five — which is what
+    /// 40% of 13 rounds to.
     #[test]
-    fn the_shortest_splittable_body_gives_each_section_half() {
-        let (sessions, agents) = section_heights(body(10));
+    fn the_shortest_splittable_body_still_fits_a_row_in_each() {
+        let (sessions, agents) = section_heights(body(13));
         let agents = agents.expect("agents section");
 
         assert_eq!(agents.height, 5);
-        assert_eq!(sessions.height, 5);
-        assert_eq!(agents.y, 5);
+        assert_eq!(sessions.height, 8);
+        assert_eq!(agents.y, 8);
         // Each half has exactly one row's worth of space left under its header.
         assert_eq!(
             rows_per_height(rows_area(agents, SectionFocus::Agents).height, SectionFocus::Agents),
@@ -748,25 +758,25 @@ mod tests {
         );
     }
 
-    /// An odd body cannot halve evenly; the extra row goes to Sessions, which
-    /// holds the longer list.
+    /// The share rounds down from the Agents side, so whatever does not divide
+    /// evenly goes to Sessions, which holds the longer list.
     #[test]
-    fn an_odd_body_gives_the_spare_row_to_sessions() {
+    fn the_spare_rows_go_to_sessions() {
         let (sessions, agents) = section_heights(body(21));
         let agents = agents.expect("agents section");
 
-        assert_eq!(agents.height, 10);
-        assert_eq!(sessions.height, 11);
-        assert_eq!(agents.y, 11);
+        assert_eq!(agents.height, 8); // 21 * 40 / 100 == 8.4, rounded down
+        assert_eq!(sessions.height, 13);
+        assert_eq!(agents.y, 13);
     }
 
     #[test]
     fn a_body_too_short_to_split_stays_one_section() {
-        // One line short of splitting: the Agents half could not have fit a
-        // row under its header, so Sessions keeps the whole body instead.
-        let (sessions, agents) = section_heights(body(9));
+        // One line short of splitting: Agents could not have fit a row under
+        // its header, so Sessions keeps the whole body instead.
+        let (sessions, agents) = section_heights(body(12));
 
-        assert_eq!(sessions, body(9));
+        assert_eq!(sessions, body(12));
         assert_eq!(agents, None);
     }
 
@@ -975,10 +985,10 @@ mod tests {
         assert!(expand.is_empty());
     }
 
-    /// body(20) splits into Sessions 0..10 and Agents 10..20. Each half opens
-    /// with three header lines — a leading line (blank for Sessions, the rule
-    /// for Agents), the title, then a blank — so Sessions rows start at y=3
-    /// and Agents rows at y=13.
+    /// body(20) splits 12/8: Sessions 0..12 and Agents 12..20. Each opens with
+    /// three header lines — a leading line (blank for Sessions, the rule for
+    /// Agents), the title, then a blank — so Sessions rows start at y=3 and
+    /// Agents rows at y=15.
     #[test]
     fn a_click_on_a_row_resolves_to_that_row() {
         let area = body(20);
@@ -999,7 +1009,7 @@ mod tests {
             }
         );
         assert_eq!(
-            row_at(area, 13, 5, 0, 3, 0),
+            row_at(area, 15, 5, 0, 3, 0),
             ClickTarget::Row {
                 section: SectionFocus::Agents,
                 index: 0
@@ -1021,7 +1031,7 @@ mod tests {
                 "line {line} is Sessions header"
             );
         }
-        for line in [10, 11, 12] {
+        for line in [12, 13, 14] {
             assert_eq!(
                 row_at(area, line, 5, 0, 3, 0),
                 ClickTarget::Section(SectionFocus::Agents),
@@ -1037,8 +1047,8 @@ mod tests {
     fn either_line_of_an_agent_row_resolves_to_the_same_item() {
         let area = body(20);
 
-        // Agents rows start at y=13: item 0 spans y=13..=14, item 1 y=15..=16.
-        for line in [13, 14] {
+        // Agents rows start at y=15: item 0 spans y=15..=16, item 1 y=17..=18.
+        for line in [15, 16] {
             assert_eq!(
                 row_at(area, line, 5, 0, 3, 0),
                 ClickTarget::Row {
@@ -1048,7 +1058,7 @@ mod tests {
                 "line {line} should be item 0"
             );
         }
-        for line in [15, 16] {
+        for line in [17, 18] {
             assert_eq!(
                 row_at(area, line, 5, 0, 3, 0),
                 ClickTarget::Row {
@@ -1085,8 +1095,8 @@ mod tests {
 
         // Sessions holds 2 rows: y=3 and y=4. y=6 is past them.
         assert_eq!(row_at(area, 6, 2, 0, 3, 0), ClickTarget::Section(SectionFocus::Sessions));
-        // Agents holds 1 row, y=13..=14. y=17 is past it.
-        assert_eq!(row_at(area, 17, 2, 0, 1, 0), ClickTarget::Section(SectionFocus::Agents));
+        // Agents holds 1 row, y=15..=16. y=19 is past it.
+        assert_eq!(row_at(area, 19, 2, 0, 1, 0), ClickTarget::Section(SectionFocus::Agents));
     }
 
     /// A scrolled section resolves through its offset: the first visible row is
@@ -1103,7 +1113,7 @@ mod tests {
             }
         );
         assert_eq!(
-            row_at(area, 13, 40, 12, 30, 7),
+            row_at(area, 15, 40, 12, 30, 7),
             ClickTarget::Row {
                 section: SectionFocus::Agents,
                 index: 7
