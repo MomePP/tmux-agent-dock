@@ -27,7 +27,10 @@ use crate::{
 };
 
 const SEARCH_PLACEHOLDER: &str = "type to filter";
+/// Counts only address rows the compact list numbers, so the `[n]j/k` hint
+/// belongs to the palette alone.
 const KEYS_PLACEHOLDER: &str = "j/k move · [n]j/k open";
+const SECTIONS_KEYS_PLACEHOLDER: &str = "j/k move · tab section";
 // Shown in the modal top bar; the short form fits beside "[?] Help" within
 // the narrow sidebar's width.
 const SWITCHER_NAME: &str = "agent-switcher";
@@ -67,13 +70,13 @@ pub(crate) fn draw(
         layout.list_overlay,
     );
     render_modal_top_bar(frame, layout.list_overlay);
-    render_search_bar(frame, layout.search, query, input);
+    render_search_bar(frame, layout.search, query, input, view);
     // A search filtering everything out is checked first, ahead of the
     // sections/compact split, so the sidebar shows the same feedback the
     // palette always has rather than a bare "Sessions" title with no rows.
     if sessions.is_empty() {
         render_no_matches(frame, layout.sessions);
-    } else if matches!(view, ViewMode::Sidebar | ViewMode::SidebarRight) {
+    } else if uses_sections(view) {
         render_sections(
             frame,
             layout.sessions,
@@ -95,16 +98,29 @@ pub(crate) fn draw(
         );
     }
     if let Some(help) = layout.help {
-        render_help(frame, help);
+        render_help(frame, help, view);
     }
     if let Some(prompt) = prompt {
         render_prompt(frame, frame.size(), layout.list_overlay, prompt);
     }
 }
 
+/// Whether this view draws the two sections rather than the flat compact list.
+/// Mirrors `SwitcherUi::uses_sections`; the keymap the help panel and the Keys
+/// hint describe differs between the two.
+fn uses_sections(view: ViewMode) -> bool {
+    matches!(view, ViewMode::Sidebar | ViewMode::SidebarRight)
+}
+
 /// The telescope-style prompt line on the bottom row of the list box, with a
 /// separator rule above it: `❯ query▏`, or a dim hint while the query is empty.
-fn render_search_bar(frame: &mut Frame, area: Rect, query: &str, input: InputMode) {
+fn render_search_bar(
+    frame: &mut Frame,
+    area: Rect,
+    query: &str,
+    input: InputMode,
+    view: ViewMode,
+) {
     if area.width < 4 || area.height == 0 {
         return;
     }
@@ -152,7 +168,11 @@ fn render_search_bar(frame: &mut Frame, area: Rect, query: &str, input: InputMod
     }
     let hint = match (input, visible.is_empty()) {
         (InputMode::Search, true) => Some(SEARCH_PLACEHOLDER),
-        (InputMode::Keys, true) => Some(KEYS_PLACEHOLDER),
+        (InputMode::Keys, true) => Some(if uses_sections(view) {
+            SECTIONS_KEYS_PLACEHOLDER
+        } else {
+            KEYS_PLACEHOLDER
+        }),
         (InputMode::Numbers, true) => None,
         (InputMode::Keys | InputMode::Numbers, false) => None,
         (InputMode::Search, false) => None,
@@ -262,34 +282,89 @@ fn render_section(
         .enumerate()
         .map(|(offset, row)| {
             let selected = focused && visible.start + offset == pane.cursor;
-            section_row_line(row, selected, focused, spinner_frame)
+            section_row_line(row, selected, focused, spinner_frame, rows_area.width)
         })
         .collect();
 
     frame.render_widget(Paragraph::new(lines), rows_area);
 }
 
-fn section_row_line(row: &Row, selected: bool, focused: bool, spinner_frame: usize) -> Line<'static> {
+/// [`truncate_chars`] with a trailing `…` marking what was cut, per spec §4.
+fn truncate_ellipsis(text: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    if text.chars().count() <= max_width {
+        return text.to_owned();
+    }
+    format!("{}…", truncate_chars(text, max_width - 1))
+}
+
+/// Fits a row into `width` columns. The right-hand cell — a session's window
+/// count and attached marker, or an agent's tool — is the whole reason the row
+/// carries more than a name, so it stays whole and right-aligned at the edge
+/// (spec §3) while the name absorbs the truncation.
+fn fit_row_text(left: &str, right: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if right.is_empty() {
+        return truncate_ellipsis(left, width);
+    }
+
+    let right_width = right.chars().count();
+    // At least one space separates the two cells; with less room than that the
+    // right cell is all there is space for.
+    let Some(left_budget) = width
+        .checked_sub(right_width + 1)
+        .filter(|budget| *budget > 0)
+    else {
+        return truncate_ellipsis(right, width);
+    };
+
+    let left = truncate_ellipsis(left, left_budget);
+    let padding = width - right_width - left.chars().count();
+    format!("{left}{}{right}", " ".repeat(padding))
+}
+
+fn section_row_line(
+    row: &Row,
+    selected: bool,
+    focused: bool,
+    spinner_frame: usize,
+    width: u16,
+) -> Line<'static> {
     let icon = agent_status_icon(row.status, spinner_frame);
+    // The icon and the space after it are drawn as their own span, so they sit
+    // outside the text budget.
+    let body_width = (width as usize).saturating_sub(icon.chars().count() + 1);
     let body = match &row.kind {
         RowKind::Session {
             name,
             window_count,
             attached,
             ..
-        } => format!(
-            "{name} {window_count}{}",
-            if *attached { " \u{25b8}" } else { "" }
+        } => fit_row_text(
+            name,
+            &format!(
+                "{window_count}{}",
+                if *attached { " \u{25b8}" } else { "" }
+            ),
+            body_width,
         ),
         RowKind::Window {
             index,
             name,
             last_child,
-        } => format!(
-            "  {} {index}: {name}",
-            if *last_child { "\u{2514}\u{2500}>" } else { "\u{251c}\u{2500}>" }
+        } => fit_row_text(
+            &format!(
+                "  {} {index}: {name}",
+                if *last_child { "\u{2514}\u{2500}>" } else { "\u{251c}\u{2500}>" }
+            ),
+            "",
+            body_width,
         ),
-        RowKind::Agent { window_name, tool } => format!("{window_name}  {tool}"),
+        RowKind::Agent { window_name, tool } => fit_row_text(window_name, tool, body_width),
     };
 
     let mut style = if focused {
@@ -764,27 +839,54 @@ fn render_modal_top_bar(frame: &mut Frame, area: Rect) {
     }
 }
 
-fn render_help(frame: &mut Frame, area: Rect) {
+/// The two sidebar views and the palette no longer share a keymap: `tab`
+/// focuses a section in the sidebar but cycles the input mode in the palette,
+/// and `h`/`l` collapse and expand rather than moving between sessions. The
+/// panel documents whichever one is on screen.
+const SECTIONS_HELP: [&str; 14] = [
+    "Shortcuts",
+    "tab: focus section",
+    "S-tab: keys/nums/search",
+    "v: cycle view",
+    "j/k · ↑/↓: move",
+    "h/l ←/→: collapse/expand",
+    "enter/space: open",
+    "C-j/C-k: move and open",
+    "S-j/S-k: reorder session",
+    "M-j/M-k: reorder window",
+    "r: rename window",
+    "C-t/C-s: new win/sess",
+    "C-u: clear filter",
+    "esc: clear, then close",
+];
+
+const PALETTE_HELP: [&str; 14] = [
+    "Shortcuts",
+    "tab: vim / nums / search",
+    "v: cycle view",
+    "nums: session → window",
+    "vim: j/k · [n]j/k open",
+    "S-j/S-k: reorder session",
+    "M-j/M-k: reorder window",
+    "H/L: previous/next edge",
+    "↑/↓: move, C-j/C-k: open",
+    "←/→: switch session",
+    "enter/r: open/rename",
+    "C-t/C-s: new win/sess",
+    "C-u: clear filter",
+    "esc: clear, then close",
+];
+
+fn render_help(frame: &mut Frame, area: Rect, view: ViewMode) {
     if area.width == 0 || area.height == 0 {
         return;
     }
 
-    let lines = [
-        "Shortcuts",
-        "tab: vim / nums / search",
-        "S-tab: palette/sidebar",
-        "nums: session → window",
-        "vim: j/k · [n]j/k open",
-        "S-j/S-k: reorder session",
-        "M-j/M-k: reorder window",
-        "H/L: previous/next edge",
-        "↑/↓: move, C-j/C-k: open",
-        "←/→: switch session",
-        "enter/r: open/rename",
-        "C-t/C-s: new win/sess",
-        "C-u: clear filter",
-        "esc: clear, then close",
-    ];
+    let lines = if uses_sections(view) {
+        SECTIONS_HELP
+    } else {
+        PALETTE_HELP
+    };
     let text = lines
         .into_iter()
         .take(area.height as usize)
@@ -1031,7 +1133,7 @@ mod tests {
             .collect::<String>();
 
         assert!(rendered.contains("Shortcuts"));
-        assert!(rendered.contains("tab: vim / nums / search"));
+        assert!(rendered.contains("tab: focus section"));
         assert!(rendered.contains("enter"));
     }
 
@@ -1204,34 +1306,42 @@ mod tests {
             })
             .filter(|row| {
                 row.contains("tab:")
-                    || row.contains("search:")
-                    || row.contains("nums:")
-                    || row.contains("vim:")
+                    || row.contains("v: cycle")
+                    || row.contains("↑/↓")
+                    || row.contains("←/→")
+                    || row.contains("enter/")
+                    || row.contains("C-j/C-k")
                     || row.contains("S-j/S-k:")
                     || row.contains("M-j/M-k:")
-                    || row.contains("H/L:")
-                    || row.contains("C-j/C-k")
-                    || row.contains("←/→")
-                    || row.contains("enter/r:")
+                    || row.contains("r: rename")
                     || row.contains("C-t/C-s:")
                     || row.contains("C-u:")
                     || row.contains("esc:")
             })
             .collect::<Vec<_>>();
 
+        // The sidebar's own keymap, not the palette's: `tab` focuses a
+        // section here, the input-mode cycle moved to `S-tab`, the view cycle
+        // to `v`, and `h`/`l` collapse and expand rather than moving between
+        // sessions.
         assert_eq!(help_rows.len(), 13);
         assert!(help_rows
             .iter()
-            .any(|row| row.contains("tab: vim / nums / search")));
+            .any(|row| row.contains("tab: focus section")));
         assert!(help_rows
             .iter()
-            .any(|row| row.contains("S-tab: palette/sidebar")));
+            .any(|row| row.contains("S-tab: keys/nums/search")));
+        assert!(help_rows.iter().any(|row| row.contains("v: cycle view")));
+        assert!(help_rows.iter().any(|row| row.contains("j/k · ↑/↓: move")));
         assert!(help_rows
             .iter()
-            .any(|row| row.contains("nums: session → window")));
+            .any(|row| row.contains("h/l ←/→: collapse/expand")));
         assert!(help_rows
             .iter()
-            .any(|row| row.contains("vim: j/k · [n]j/k open")));
+            .any(|row| row.contains("enter/space: open")));
+        assert!(help_rows
+            .iter()
+            .any(|row| row.contains("C-j/C-k: move and open")));
         assert!(help_rows
             .iter()
             .any(|row| row.contains("S-j/S-k: reorder session")));
@@ -1240,14 +1350,7 @@ mod tests {
             .any(|row| row.contains("M-j/M-k: reorder window")));
         assert!(help_rows
             .iter()
-            .any(|row| row.contains("H/L: previous/next edge")));
-        assert!(help_rows.iter().any(|row| row.contains("C-j/C-k: open")));
-        assert!(help_rows
-            .iter()
-            .any(|row| row.contains("←/→: switch session")));
-        assert!(help_rows
-            .iter()
-            .any(|row| row.contains("enter/r: open/rename")));
+            .any(|row| row.contains("r: rename window")));
         assert!(help_rows
             .iter()
             .any(|row| row.contains("C-t/C-s: new win/sess")));
@@ -1255,6 +1358,101 @@ mod tests {
             .iter()
             .any(|row| row.contains("C-u: clear filter")));
         assert!(help_rows.iter().any(|row| row.contains("esc: clear")));
+        // The keys the sections do not bind must not be advertised.
+        assert!(!help_rows.iter().any(|row| row.contains("H/L:")));
+        assert!(!help_rows.iter().any(|row| row.contains("[n]j/k")));
+    }
+
+    /// The palette still runs the flat `GridState` list, so its help panel
+    /// keeps documenting the keymap the sections retired.
+    #[test]
+    fn palette_help_keeps_the_flat_list_keymap() {
+        let backend = TestBackend::new(30, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 26,
+            height: 20,
+        };
+        terminal
+            .draw(|frame| render_help(frame, area, ViewMode::Palette))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..20)
+            .map(|y| {
+                (0..30)
+                    .map(|x| buffer.get(x, y).symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("tab: vim / nums / search"));
+        assert!(rendered.contains("H/L: previous/next edge"));
+        assert!(rendered.contains("←/→: switch session"));
+        assert!(rendered.contains("vim: j/k · [n]j/k open"));
+        assert!(!rendered.contains("tab: focus section"));
+    }
+
+    /// Spec §3 puts the window count (and the attached marker) at the right
+    /// edge of a session row; spec §4 truncates the name with `…`. Before the
+    /// row was width-budgeted both fell off the end of a real 28-column
+    /// sidebar, taking away everything the row carried beyond its name.
+    #[test]
+    fn a_long_session_name_truncates_and_keeps_its_count_and_marker() {
+        let mut card = test_card("a-very-long-session-name-indeed", "0");
+        card.window_flags = "*".to_owned();
+        let groups = group_cards_by_session(vec![card]);
+        let rows = session_rows(&groups, &HashSet::new(), Some(&groups[0].cards[0].window_id));
+
+        let line = section_row_line(&rows[0], false, true, 0, 26);
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert_eq!(text.chars().count(), 26);
+        assert!(text.ends_with("1 ▸"), "count and marker survive: {text:?}");
+        assert!(text.contains('…'), "name is truncated with an ellipsis: {text:?}");
+        assert!(text.contains("a-very-long"));
+    }
+
+    /// The agent row's tool name is its right-hand cell for the same reason.
+    #[test]
+    fn a_long_agent_window_name_truncates_and_keeps_its_tool() {
+        let mut card = test_card("work", "0");
+        card.window_name = "an-extremely-long-window-name".to_owned();
+        card.agent_status = AgentStatus {
+            agent: Some(AgentKind::Claude),
+            ..AgentStatus::unknown()
+        };
+        let groups = group_cards_by_session(vec![card]);
+        let rows = agent_rows(&groups);
+
+        let line = section_row_line(&rows[0], false, true, 0, 26);
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert_eq!(text.chars().count(), 26);
+        assert!(text.ends_with("claude"), "tool survives: {text:?}");
+        assert!(text.contains('…'));
+    }
+
+    /// A width too small for both cells keeps the right-hand one, and never
+    /// overruns the row.
+    #[test]
+    fn row_text_never_exceeds_its_width() {
+        assert_eq!(fit_row_text("session", "12 ▸", 4), "12 ▸");
+        assert_eq!(fit_row_text("session", "12 ▸", 3), "12…");
+        assert_eq!(fit_row_text("session", "12", 0), "");
+        assert_eq!(fit_row_text("session", "", 4), "ses…");
+        assert_eq!(fit_row_text("ab", "12", 10), "ab      12");
     }
 
     #[test]
