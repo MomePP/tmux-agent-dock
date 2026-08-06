@@ -174,6 +174,22 @@ pub fn select_card(card: &crate::model::WindowCard) -> Result<()> {
 pub fn execute_action(action: SwitcherAction) -> Result<()> {
     match action {
         SwitcherAction::Select(card) => select_card(&card),
+        SwitcherAction::SelectAgent { card, clone } => {
+            select_card(&card)?;
+            // Best effort: the host pane is focused either way, which is the
+            // behaviour before this existed.
+            let pane_pid = tmux_output(&[
+                "display-message",
+                "-p",
+                "-t",
+                &card.target_pane_id,
+                "#{pane_pid}",
+            ])
+            .ok()
+            .and_then(|pid| pid.trim().parse().ok());
+            crate::nvim::show_agent(pane_pid, &clone);
+            Ok(())
+        }
         SwitcherAction::RenameWindow {
             window_id,
             window_name,

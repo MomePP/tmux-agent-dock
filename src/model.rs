@@ -119,6 +119,13 @@ pub struct SessionGroup {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SwitcherAction {
     Select(WindowCard),
+    /// A specific agent inside an embedded session. Several share one host
+    /// pane, so focusing the pane is not enough to say which — the clone name
+    /// is what distinguishes them.
+    SelectAgent {
+        card: WindowCard,
+        clone: String,
+    },
     RenameWindow {
         window_id: String,
         window_name: String,

@@ -22,6 +22,7 @@ mod detect;
 mod dock;
 mod embed;
 mod model;
+mod nvim;
 mod preview;
 mod search;
 mod tmux;

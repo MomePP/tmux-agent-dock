@@ -456,7 +456,29 @@ impl SwitcherUi {
 
     /// Closes the switcher on whatever [`Self::selected_target`] resolves to;
     /// `None` (stay open) when nothing is selected.
+    ///
+    /// An agent row whose card hosts folded agents resolves to that agent by
+    /// name. They share a host pane, so focusing it alone lands on whichever
+    /// slot Neovim last had open rather than the one that was clicked.
     fn select_target(&self) -> Option<Option<SwitcherAction>> {
+        if self.uses_sections() {
+            if let Some(row) = self.selected_row() {
+                if let RowKind::Agent { tool, .. } = &row.kind {
+                    if row
+                        .target
+                        .folded_agents
+                        .iter()
+                        .any(|agent| &agent.label == tool)
+                    {
+                        return Some(Some(SwitcherAction::SelectAgent {
+                            card: row.target.clone(),
+                            clone: tool.clone(),
+                        }));
+                    }
+                }
+            }
+        }
+
         self.selected_target()
             .map(|card| Some(SwitcherAction::Select(card.clone())))
     }
@@ -1352,7 +1374,7 @@ fn run_tui_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{AgentKind, AgentState, AgentStatus};
+    use crate::model::{AgentKind, AgentState, AgentStatus, FoldedAgent};
     use crate::test_support::test_card;
 
     // `SwitcherUi::new` reads the real tmux globals for the view, the input
@@ -1880,6 +1902,69 @@ mod tests {
 
         assert!(result.is_none());
         assert_eq!(ui.state, before);
+    }
+
+    /// Two agents from one Neovim share a host pane, so selecting either used
+    /// to produce the same action and land on whichever slot was already open.
+    /// Each now resolves to its own clone by name.
+    #[test]
+    fn each_folded_agent_selects_itself_not_just_its_host() {
+        let mut host = test_card("dotfiles", "0");
+        host.window_name = "config".to_owned();
+        host.folded_agents = vec![
+            FoldedAgent {
+                pane_id: "%20".to_owned(),
+                status: AgentStatus {
+                    agent: Some(AgentKind::Claude),
+                    state: AgentState::Idle,
+                    seen: true,
+                    run_started_at: None,
+                },
+                label: "claude_1".to_owned(),
+            },
+            FoldedAgent {
+                pane_id: "%21".to_owned(),
+                status: AgentStatus {
+                    agent: Some(AgentKind::Claude),
+                    state: AgentState::Idle,
+                    seen: true,
+                    run_started_at: None,
+                },
+                label: "claude_2".to_owned(),
+            },
+        ];
+        let mut ui = ui_with(vec![host]);
+        ui.focus = SectionFocus::Agents;
+
+        let clone_of = |ui: &SwitcherUi| match ui.select_target() {
+            Some(Some(SwitcherAction::SelectAgent { clone, .. })) => clone,
+            other => panic!("expected SelectAgent, got {other:?}"),
+        };
+
+        ui.agents_pane.cursor = 0;
+        assert_eq!(clone_of(&ui), "claude_1");
+        ui.agents_pane.cursor = 1;
+        assert_eq!(clone_of(&ui), "claude_2");
+    }
+
+    /// A window running an agent directly needs no clone: focusing the window
+    /// is the whole job, so it stays a plain `Select`.
+    #[test]
+    fn a_direct_agent_stays_a_plain_select() {
+        let mut card = test_card("work", "0");
+        card.agent_status = AgentStatus {
+            agent: Some(AgentKind::Claude),
+            state: AgentState::Idle,
+            seen: true,
+            run_started_at: None,
+        };
+        let mut ui = ui_with(vec![card]);
+        ui.focus = SectionFocus::Agents;
+
+        assert!(matches!(
+            ui.select_target(),
+            Some(Some(SwitcherAction::Select(_)))
+        ));
     }
 
     #[test]

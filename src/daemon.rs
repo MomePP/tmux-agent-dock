@@ -258,6 +258,21 @@ impl ProcessTree {
         &self.parents
     }
 
+    /// Every pid under `root`, including `root` itself.
+    pub(crate) fn descendants(&self, root: u32) -> HashSet<u32> {
+        let mut seen = HashSet::new();
+        let mut stack = vec![root];
+        while let Some(pid) = stack.pop() {
+            if !seen.insert(pid) {
+                continue;
+            }
+            if let Some(children) = self.children.get(&pid) {
+                stack.extend(children.iter().copied());
+            }
+        }
+        seen
+    }
+
     /// The agent `root` or any of its descendants is running, if any.
     fn agent_descendant(&self, root: Option<u32>) -> Option<AgentKind> {
         let root = root?;
