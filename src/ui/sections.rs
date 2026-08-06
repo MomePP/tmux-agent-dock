@@ -13,7 +13,6 @@ use crate::{
     model::{format_agent_kind, AgentStatus, SessionGroup, WindowCard},
 };
 
-#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RowKind {
     Session {
@@ -36,7 +35,6 @@ pub(crate) enum RowKind {
 
 /// One line in either section. Every row carries the window it acts on, so
 /// selecting is a single code path regardless of which section or kind it is.
-#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Row {
     pub(crate) kind: RowKind,
@@ -47,7 +45,6 @@ pub(crate) struct Row {
 /// The identity a cursor is restored onto after the rows are rebuilt. Session
 /// rows key on the session name because their target window can change under
 /// them; every other row keys on its window.
-#[allow(dead_code)]
 pub(crate) fn row_key(row: &Row) -> &str {
     match &row.kind {
         RowKind::Session { name, .. } => name.as_str(),
@@ -57,7 +54,6 @@ pub(crate) fn row_key(row: &Row) -> &str {
 
 /// The window a session row acts on: the session's current window, or its
 /// first if tmux reports no current flag.
-#[allow(dead_code)]
 fn active_card(session: &SessionGroup) -> Option<&WindowCard> {
     session
         .cards
@@ -66,7 +62,6 @@ fn active_card(session: &SessionGroup) -> Option<&WindowCard> {
         .or_else(|| session.cards.first())
 }
 
-#[allow(dead_code)]
 pub(crate) fn session_rows(
     sessions: &[SessionGroup],
     expanded: &HashSet<String>,
@@ -127,7 +122,6 @@ pub(crate) fn session_rows(
 /// Every window running an agent, in session-then-window order. The order is
 /// deliberately independent of status: sorting by urgency would move rows out
 /// from under the cursor every time an agent changed state.
-#[allow(dead_code)]
 pub(crate) fn agent_rows(sessions: &[SessionGroup]) -> Vec<Row> {
     sessions
         .iter()
@@ -144,8 +138,6 @@ pub(crate) fn agent_rows(sessions: &[SessionGroup]) -> Vec<Row> {
         .collect()
 }
 
-/// Rows the Agents section needs below its title before it starts scrolling.
-const MIN_AGENTS_ROWS: u16 = 1;
 /// Below this the body cannot carry two titles plus a row each, so the split is
 /// abandoned and Sessions keeps everything.
 const MIN_SPLIT_HEIGHT: u16 = 4;
@@ -161,7 +153,10 @@ pub(crate) fn section_heights(body: Rect, agent_row_count: usize) -> (Rect, Opti
     let wanted = u16::try_from(agent_row_count)
         .unwrap_or(u16::MAX)
         .saturating_add(1); // title row
-    let agents_height = wanted.clamp(MIN_AGENTS_ROWS.saturating_add(1), body.height / 2);
+    // No lower bound: `agent_row_count` is at least 1 here, so `wanted` is
+    // already at least a title plus a row, and the `MIN_SPLIT_HEIGHT` guard
+    // above keeps `body.height / 2` at 2 or more.
+    let agents_height = wanted.min(body.height / 2);
     let sessions_height = body.height.saturating_sub(agents_height);
 
     let sessions = Rect {
@@ -421,6 +416,29 @@ mod tests {
 
         assert_eq!(agents.height, 10);
         assert_eq!(sessions.height, 10);
+    }
+
+    /// The shortest body that still splits: `body.height / 2` is exactly the
+    /// two rows a one-agent section wants, so the cap and the content agree.
+    #[test]
+    fn the_shortest_splittable_body_gives_each_section_half() {
+        let (sessions, agents) = section_heights(body(4), 1);
+        let agents = agents.expect("agents section");
+
+        assert_eq!(agents.height, 2);
+        assert_eq!(sessions.height, 2);
+        assert_eq!(agents.y, 2);
+    }
+
+    /// An odd body cannot halve evenly; the extra row goes to Sessions.
+    #[test]
+    fn an_odd_body_gives_the_spare_row_to_sessions() {
+        let (sessions, agents) = section_heights(body(21), 20);
+        let agents = agents.expect("agents section");
+
+        assert_eq!(agents.height, 10);
+        assert_eq!(sessions.height, 11);
+        assert_eq!(agents.y, 11);
     }
 
     #[test]

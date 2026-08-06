@@ -3,18 +3,11 @@
 
 pub(crate) struct Pane<T> {
     items: Vec<T>,
-    /// Consumed by later sidebar-sections tasks.
-    #[allow(dead_code)]
     pub(crate) cursor: usize,
-    /// Consumed by later sidebar-sections tasks.
-    #[allow(dead_code)]
     pub(crate) offset: usize,
 }
 
 impl<T> Pane<T> {
-    /// Methods like `items()`, `len()`, `is_empty()`, `selected()`, and `visible_range()`
-    /// are consumed by later tasks in the split-sidebar implementation.
-    #[allow(dead_code)]
     pub(crate) fn new(items: Vec<T>) -> Self {
         Self {
             items,
@@ -23,27 +16,22 @@ impl<T> Pane<T> {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn items(&self) -> &[T] {
         &self.items
     }
 
-    #[allow(dead_code)]
     pub(crate) fn len(&self) -> usize {
         self.items.len()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
 
-    #[allow(dead_code)]
     pub(crate) fn selected(&self) -> Option<&T> {
         self.items.get(self.cursor)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn move_by(&mut self, delta: isize) {
         if self.items.is_empty() {
             return;
@@ -56,7 +44,6 @@ impl<T> Pane<T> {
     /// Replaces the items, keeping the cursor on whichever item matches `keep`
     /// rather than on its old index — the list is rebuilt on every refresh and
     /// rows move as sessions expand, are created, or die.
-    #[allow(dead_code)]
     pub(crate) fn set_items<F>(&mut self, items: Vec<T>, keep: Option<&str>, key: F)
     where
         F: Fn(&T) -> &str,
@@ -85,7 +72,6 @@ impl<T> Pane<T> {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn visible_range(&self, height: usize) -> std::ops::Range<usize> {
         let start = self.offset.min(self.items.len());
         let end = start.saturating_add(height).min(self.items.len());
@@ -95,7 +81,6 @@ impl<T> Pane<T> {
 
 #[cfg(test)]
 mod tests {
-    #[allow(unused_imports)]
     use super::*;
 
     #[test]

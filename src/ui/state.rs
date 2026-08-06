@@ -55,7 +55,11 @@ pub(crate) fn format_view_mode(view: ViewMode) -> &'static str {
     }
 }
 
-/// How keystrokes are interpreted, cycled with Tab. Keys handles Vim-style
+/// How keystrokes are interpreted, cycled with Shift-Tab — plain Tab moves the
+/// sidebar's section focus, and only falls through to this cycle in the
+/// palette, which has no sections. The cycle key must stay non-printable: in
+/// Search every printable key is text and Esc closes the switcher rather than
+/// leaving the mode. Keys handles Vim-style
 /// motions and counts, Numbers handles session/window addresses, and Search
 /// sends typed characters to the fuzzy filter.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
