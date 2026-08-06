@@ -68,7 +68,12 @@ pub(crate) fn draw(
     );
     render_modal_top_bar(frame, layout.list_overlay);
     render_search_bar(frame, layout.search, query, input);
-    if matches!(view, ViewMode::Sidebar | ViewMode::SidebarRight) {
+    // A search filtering everything out is checked first, ahead of the
+    // sections/compact split, so the sidebar shows the same feedback the
+    // palette always has rather than a bare "Sessions" title with no rows.
+    if sessions.is_empty() {
+        render_no_matches(frame, layout.sessions);
+    } else if matches!(view, ViewMode::Sidebar | ViewMode::SidebarRight) {
         render_sections(
             frame,
             layout.sessions,
@@ -77,8 +82,6 @@ pub(crate) fn draw(
             focus,
             spinner_frame,
         );
-    } else if sessions.is_empty() {
-        render_no_matches(frame, layout.sessions);
     } else {
         render_compact_with_mode(
             frame,
@@ -227,7 +230,15 @@ fn render_section(
         return;
     }
 
-    let title_style = Style::default().fg(Color::DarkGray);
+    // The unfocused section dims as a whole, title included, so it reads at a
+    // glance which one the keyboard drives.
+    let title_style = if focused {
+        Style::default().fg(Color::Gray)
+    } else {
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM)
+    };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(title.to_owned(), title_style))),
         Rect {
@@ -290,8 +301,17 @@ fn section_row_line(row: &Row, selected: bool, focused: bool, spinner_frame: usi
         style = style.add_modifier(Modifier::REVERSED);
     }
 
+    // The icon carries the same dim/full-contrast state as the rest of the
+    // row, so an unfocused section dims completely rather than leaving its
+    // status icons full-brightness.
+    let icon_style = if focused {
+        agent_status_style(row.status)
+    } else {
+        agent_status_style(row.status).add_modifier(Modifier::DIM)
+    };
+
     Line::from(vec![
-        Span::styled(format!("{icon} "), agent_status_style(row.status)),
+        Span::styled(format!("{icon} "), icon_style),
         Span::styled(body, style),
     ])
 }
@@ -1982,5 +2002,105 @@ mod tests {
         assert!(text.contains("Agents"), "missing Agents title: {text}");
         assert!(text.contains("dotfiles"), "missing session row: {text}");
         assert!(text.contains("claude"), "missing agent row: {text}");
+    }
+
+    /// Regression test for a review finding: a search that filters the
+    /// sidebar's session list to zero results used to render a bare
+    /// "Sessions" title with no rows and no feedback. `draw` must route
+    /// through the same `render_no_matches` hint the palette view shows,
+    /// instead of `render_sections`.
+    #[test]
+    fn sidebar_view_shows_no_matches_hint_when_filtered_to_zero() {
+        let groups: Vec<SessionGroup> = Vec::new();
+        let state = GridState::new();
+        let (sessions_pane, agents_pane) = panes_from(&groups);
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &groups,
+                    &state,
+                    ViewMode::Sidebar,
+                    InputMode::Search,
+                    false,
+                    "zzz",
+                    None,
+                    None,
+                    &test_preview(),
+                    0,
+                    &sessions_pane,
+                    &agents_pane,
+                    SectionFocus::Sessions,
+                )
+            })
+            .unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("no matching windows"));
+        assert!(!rendered.contains("Sessions"));
+        assert!(!rendered.contains("Agents"));
+    }
+
+    /// Regression test for a review finding: the status icon and the section
+    /// title used to stay full-brightness in the unfocused section while only
+    /// the row text after the icon dimmed. The spec requires the whole row —
+    /// icon and title included — to dim together.
+    #[test]
+    fn unfocused_section_dims_its_title_and_status_icon() {
+        let mut agent_card = crate::test_support::test_card("dotfiles", "0");
+        agent_card.window_name = "config".to_owned();
+        agent_card.agent_status = AgentStatus {
+            agent: Some(AgentKind::Claude),
+            state: AgentState::Working,
+            seen: true,
+            run_started_at: None,
+        };
+        let sessions_group = vec![SessionGroup {
+            session_name: "dotfiles".to_owned(),
+            cards: vec![agent_card],
+        }];
+        let sessions = Pane::new(session_rows(&sessions_group, &HashSet::new(), None));
+        let agents = Pane::new(agent_rows(&sessions_group));
+
+        let body = Rect {
+            x: 0,
+            y: 0,
+            width: 28,
+            height: 12,
+        };
+        let (_, agents_area) = section_heights(body, agents.len());
+        let agents_area = agents_area.expect("agents section");
+
+        let backend = ratatui::backend::TestBackend::new(28, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                // Sessions is focused, so the Agents section below it must
+                // render fully dimmed: title and icon included.
+                render_sections(frame, body, &sessions, &agents, SectionFocus::Sessions, 0);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let title_cell = buffer.get(agents_area.x, agents_area.y);
+        let icon_cell = buffer.get(agents_area.x, agents_area.y.saturating_add(1));
+
+        assert!(
+            title_cell.modifier.contains(Modifier::DIM),
+            "unfocused Agents title was not dimmed"
+        );
+        assert!(
+            icon_cell.modifier.contains(Modifier::DIM),
+            "unfocused Agents status icon was not dimmed"
+        );
     }
 }
