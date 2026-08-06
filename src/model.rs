@@ -91,10 +91,23 @@ pub struct WindowCard {
     pub preview: Vec<String>,
     pub codex_unread: bool,
     pub agent_status: AgentStatus,
-    /// Panes of embedded sessions whose status this card carries — they have no
-    /// card of their own, so anything done per-pane on select must reach them
-    /// through here. See [`crate::embed`].
-    pub folded_pane_ids: Vec<String>,
+    /// Agents in embedded sessions that this card hosts. They have no card of
+    /// their own, and several can share one host pane — that is exactly what
+    /// happens when sidekick spawns `claude_1` and `claude_2` from the same
+    /// Neovim — so each keeps its own status and label here instead of being
+    /// flattened into the card's rolled-up one. See [`crate::embed`].
+    pub folded_agents: Vec<FoldedAgent>,
+}
+
+/// One agent running in an embedded session, attributed to its host card.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FoldedAgent {
+    pub pane_id: String,
+    pub status: AgentStatus,
+    /// What to call it in the Agents list. The embedded session is named
+    /// `<clone> <cwd-hash>`, and the clone (`claude_1`) is the half that tells
+    /// two agents in the same window apart.
+    pub label: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

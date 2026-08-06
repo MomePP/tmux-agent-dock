@@ -13,8 +13,12 @@ use anyhow::Result;
 use crate::{
     daemon::{ensure_status_daemon, ProcessTree},
     detect::detect_agent_from_process_name,
+    model::format_agent_kind,
     embed::{embedded_session_hosts, folded_panes},
-    model::{AgentKind, AgentState, AgentStatus, SessionGroup, TmuxPane, TmuxWindow, WindowCard},
+    model::{
+        AgentKind, AgentState, AgentStatus, FoldedAgent, SessionGroup, TmuxPane, TmuxWindow,
+        WindowCard,
+    },
     tmux::{parse_panes, parse_windows, tmux_output, tmux_status},
 };
 
@@ -53,6 +57,10 @@ pub fn build_cards_with_previews(
     unread_dir: &Path,
 ) -> Vec<WindowCard> {
     let folded = folded_panes(windows, panes, embedded);
+    let window_sessions: HashMap<&str, &str> = windows
+        .iter()
+        .map(|window| (window.window_id.as_str(), window.session_name.as_str()))
+        .collect();
 
     windows
         .iter()
@@ -100,13 +108,37 @@ pub fn build_cards_with_previews(
                     .unwrap_or_default(),
                 codex_unread: codex_unread || agent_status.is_done(),
                 agent_status,
-                folded_pane_ids: adopted
+                folded_agents: adopted
                     .iter()
-                    .map(|pane| pane.pane_id.clone())
+                    .filter(|pane| pane.agent_status.agent.is_some())
+                    .map(|pane| FoldedAgent {
+                        pane_id: pane.pane_id.clone(),
+                        status: pane.agent_status,
+                        label: folded_agent_label(
+                            window_sessions.get(pane.window_id.as_str()).copied(),
+                            pane.agent_status,
+                        ),
+                    })
                     .collect(),
             })
         })
         .collect()
+}
+
+/// What to call a folded agent in the Agents list.
+///
+/// Two agents spawned from the same Neovim share a host window, so the window's
+/// name cannot tell them apart. Their embedded sessions are named
+/// `<clone> <cwd-hash>` — `claude_1 b9f9f91c` — and the clone is the half that
+/// distinguishes them, and the half the user chose when they pressed
+/// `<leader>s` or `2<leader>s`. Fall back to the plain tool name when the
+/// session is not shaped that way.
+fn folded_agent_label(session_name: Option<&str>, status: AgentStatus) -> String {
+    session_name
+        .and_then(|name| name.split_whitespace().next())
+        .filter(|clone| !clone.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format_agent_kind(status.agent).to_owned())
 }
 
 pub(crate) fn rollup_agent_status(statuses: impl Iterator<Item = AgentStatus>) -> AgentStatus {
@@ -319,7 +351,17 @@ mod tests {
         assert_eq!(cards[0].command, "nvim");
         // Unread and seen state live on the folded pane, which has no card.
         assert!(cards[0].codex_unread);
-        assert_eq!(cards[0].folded_pane_ids, vec!["%20".to_owned()]);
+        assert_eq!(
+            cards[0]
+                .folded_agents
+                .iter()
+                .map(|agent| agent.pane_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["%20"]
+        );
+        // The clone half of `claude_1 abc`, which is what tells two agents in
+        // one window apart.
+        assert_eq!(cards[0].folded_agents[0].label, "claude_1");
     }
 
     #[test]

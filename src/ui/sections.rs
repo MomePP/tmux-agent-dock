@@ -119,23 +119,46 @@ pub(crate) fn session_rows(
     rows
 }
 
-/// Every window running an agent, in session-then-window order. The order is
-/// deliberately independent of status: sorting by urgency would move rows out
-/// from under the cursor every time an agent changed state.
+/// Every running agent, in session-then-window order. The order is deliberately
+/// independent of status: sorting by urgency would move rows out from under the
+/// cursor every time an agent changed state.
+///
+/// One row per *agent*, not per window. A window hosting embedded sessions can
+/// hold several — sidekick's `claude_1` and `claude_2` spawned from one Neovim
+/// share a host pane — and listing the window once would show a single row
+/// carrying their rolled-up status, which is what it used to do.
 pub(crate) fn agent_rows(sessions: &[SessionGroup]) -> Vec<Row> {
-    sessions
-        .iter()
-        .flat_map(|session| session.cards.iter())
-        .filter(|card| card.agent_status.agent.is_some())
-        .map(|card| Row {
-            kind: RowKind::Agent {
-                window_name: card.window_name.clone(),
-                tool: format_agent_kind(card.agent_status.agent).to_owned(),
-            },
-            status: card.agent_status,
-            target: card.clone(),
-        })
-        .collect()
+    let mut rows = Vec::new();
+
+    for card in sessions.iter().flat_map(|session| session.cards.iter()) {
+        for agent in &card.folded_agents {
+            rows.push(Row {
+                kind: RowKind::Agent {
+                    window_name: card.window_name.clone(),
+                    tool: agent.label.clone(),
+                },
+                status: agent.status,
+                // The host card: the embedded session has no card of its own,
+                // and focusing the host is the only way to reach the agent.
+                target: card.clone(),
+            });
+        }
+
+        // A window running an agent directly. Its status is its own, not a
+        // rollup, so it must not be listed again when it also hosts folded ones.
+        if card.folded_agents.is_empty() && card.agent_status.agent.is_some() {
+            rows.push(Row {
+                kind: RowKind::Agent {
+                    window_name: card.window_name.clone(),
+                    tool: format_agent_kind(card.agent_status.agent).to_owned(),
+                },
+                status: card.agent_status,
+                target: card.clone(),
+            });
+        }
+    }
+
+    rows
 }
 
 /// Below this the body cannot carry two titles plus a row each, so the split is
@@ -363,7 +386,7 @@ fn hit(area: Rect, click_y: u16, len: usize, offset: usize) -> Option<Option<usi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{AgentKind, AgentState};
+    use crate::model::{AgentKind, AgentState, FoldedAgent};
     use crate::test_support::test_card;
 
     fn working(agent: AgentKind) -> AgentStatus {
@@ -491,6 +514,65 @@ mod tests {
             }
             other => panic!("expected an agent row, got {other:?}"),
         }
+    }
+
+    /// Two agents spawned from one Neovim (`<leader>s` and `2<leader>s`) live in
+    /// separate embedded sessions that fold into the same host window. Listing
+    /// windows instead of agents showed one row carrying their rolled-up
+    /// status, so the second was invisible.
+    #[test]
+    fn two_agents_in_one_host_window_get_a_row_each() {
+        let mut host = test_card("dotfiles", "0");
+        host.window_name = "config".to_owned();
+        host.agent_status = working(AgentKind::Claude); // the rollup
+        host.folded_agents = vec![
+            FoldedAgent {
+                pane_id: "%20".to_owned(),
+                status: working(AgentKind::Claude),
+                label: "claude_1".to_owned(),
+            },
+            FoldedAgent {
+                pane_id: "%21".to_owned(),
+                status: AgentStatus {
+                    agent: Some(AgentKind::Claude),
+                    state: AgentState::Idle,
+                    seen: true,
+                    run_started_at: None,
+                },
+                label: "claude_2".to_owned(),
+            },
+        ];
+        let sessions = vec![SessionGroup {
+            session_name: "dotfiles".to_owned(),
+            cards: vec![host],
+        }];
+
+        let rows = agent_rows(&sessions);
+
+        assert_eq!(rows.len(), 2, "both agents should be listed");
+        let labels: Vec<&str> = rows
+            .iter()
+            .map(|row| match &row.kind {
+                RowKind::Agent { tool, .. } => tool.as_str(),
+                other => panic!("expected an agent row, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(labels, vec!["claude_1", "claude_2"]);
+        // Each keeps its own state rather than the host's rolled-up one.
+        assert_eq!(rows[0].status.state, AgentState::Working);
+        assert_eq!(rows[1].status.state, AgentState::Idle);
+        // Both resolve to the host, the only pane that can reach them.
+        assert_eq!(rows[0].target.window_id, rows[1].target.window_id);
+    }
+
+    /// A window running an agent directly is still listed once, and is not
+    /// double-counted against its own folded list.
+    #[test]
+    fn a_direct_agent_window_is_listed_once() {
+        let rows = agent_rows(&fixture());
+
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(rows[0].kind, RowKind::Agent { .. }));
     }
 
     #[test]

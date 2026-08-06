@@ -16,6 +16,6 @@ pub(crate) fn test_card(session_name: &str, window_index: &str) -> WindowCard {
         preview: Vec::new(),
         codex_unread: false,
         agent_status: AgentStatus::unknown(),
-        folded_pane_ids: Vec::new(),
+        folded_agents: Vec::new(),
     }
 }

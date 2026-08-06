@@ -153,9 +153,9 @@ pub fn select_card(card: &crate::model::WindowCard) -> Result<()> {
     // Panes folded in from an embedded session are what this card's "done" mark
     // came from, and selecting the card is how you reach them — so clear them
     // too, or the mark can never be dismissed.
-    for pane_id in &card.folded_pane_ids {
-        clear_unread_for_pane(pane_id);
-        mark_pane_seen(pane_id);
+    for agent in &card.folded_agents {
+        clear_unread_for_pane(&agent.pane_id);
+        mark_pane_seen(&agent.pane_id);
     }
     Ok(())
 }
