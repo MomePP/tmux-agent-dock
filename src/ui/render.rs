@@ -849,7 +849,7 @@ const SECTIONS_HELP: [&str; 14] = [
     "S-tab: keys/nums/search",
     "v: cycle view",
     "j/k · ↑/↓: move",
-    "h/l ←/→: collapse/expand",
+    "h/l ←/→ C-h/C-l: fold",
     "enter/space: open",
     "C-j/C-k: move and open",
     "S-j/S-k: reorder session",
@@ -1333,9 +1333,11 @@ mod tests {
             .any(|row| row.contains("S-tab: keys/nums/search")));
         assert!(help_rows.iter().any(|row| row.contains("v: cycle view")));
         assert!(help_rows.iter().any(|row| row.contains("j/k · ↑/↓: move")));
+        // C-h/C-l fold too, and reach the sections from every input mode —
+        // documenting them is the whole reason this row lists four key forms.
         assert!(help_rows
             .iter()
-            .any(|row| row.contains("h/l ←/→: collapse/expand")));
+            .any(|row| row.contains("h/l ←/→ C-h/C-l: fold")));
         assert!(help_rows
             .iter()
             .any(|row| row.contains("enter/space: open")));

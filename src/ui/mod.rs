@@ -148,10 +148,18 @@ fn persist_input_mode(input: InputMode) {
 }
 
 /// Which sessions were left expanded, remembered for the tmux server's
-/// lifetime the same way the view and input modes are.
-fn initial_expanded() -> HashSet<String> {
+/// lifetime the same way the view and input modes are. `None` means the option
+/// was never written — a fresh server — which is deliberately distinct from an
+/// empty set, the state a user reaches by collapsing everything.
+///
+/// The two look identical through `show-option -gqv`, which yields "" either
+/// way. `show-options -g <name>` tells them apart: it fails on an unset option
+/// and succeeds on one set to "". Reading the value still goes through `-gqv`,
+/// because the plural form quotes and escapes what it prints.
+fn initial_expanded() -> Option<HashSet<String>> {
+    tmux_output(&["show-options", "-g", EXPANDED_OPTION]).ok()?;
     let value = tmux_output(&["show-option", "-gqv", EXPANDED_OPTION]).unwrap_or_default();
-    parse_expanded(&value)
+    Some(parse_expanded(&value))
 }
 
 fn persist_expanded(expanded: &HashSet<String>) {
@@ -207,7 +215,7 @@ impl SwitcherUi {
         cards: Vec<WindowCard>,
         current_window_id: Option<&str>,
         terminal_size: Rect,
-        expanded: HashSet<String>,
+        expanded: Option<HashSet<String>>,
         view: ViewMode,
         input: InputMode,
     ) -> Self {
@@ -1191,7 +1199,7 @@ mod tests {
             cards,
             current_window_id,
             size(),
-            HashSet::new(),
+            Some(HashSet::new()),
             ViewMode::Sidebar,
             InputMode::Keys,
         )
@@ -1203,7 +1211,7 @@ mod tests {
             cards,
             None,
             size(),
-            HashSet::new(),
+            Some(HashSet::new()),
             ViewMode::Palette,
             InputMode::Keys,
         )
@@ -1497,10 +1505,6 @@ mod tests {
         assert_eq!(result, Some(Some(SwitcherAction::Select(card))));
     }
 
-    /// No row is focused when the query has filtered the focused section to
-    /// nothing. Enter then does nothing and leaves the switcher open, the
-    /// same as the palette's `select_key_action` does when nothing is
-    /// selected.
     // ---- The sections cursor is the one every key acts on --------------
     //
     // Tasks 5-8 moved navigation and selection onto the two panes, but every
@@ -1508,6 +1512,44 @@ mod tests {
     // touches and the sidebar never draws. Each test below drives the visible
     // cursor off row 0 first, so a key still reading `GridState` acts on a
     // different, nameable window.
+
+    /// `C-l`/`C-h` mirror `l`/`h`, but reach the sections through
+    /// `handle_ctrl_char`, which runs in every input mode — including Search,
+    /// where a plain `l` is text. Without these two tests, dropping either
+    /// `uses_sections()` branch would still pass the whole suite.
+    #[test]
+    fn ctrl_l_expands_and_ctrl_h_collapses_the_selected_session() {
+        let mut ui = ui_with(vec![test_card("dotfiles", "0"), test_card("dotfiles", "1")]);
+        assert_eq!(ui.sessions_pane.len(), 1);
+
+        ui.handle_key(ctrl(KeyCode::Char('l')), size());
+
+        assert!(ui.expanded.contains("dotfiles"));
+        assert_eq!(ui.sessions_pane.len(), 3);
+
+        ui.handle_key(ctrl(KeyCode::Char('h')), size());
+
+        assert!(!ui.expanded.contains("dotfiles"));
+        assert_eq!(ui.sessions_pane.len(), 1);
+    }
+
+    #[test]
+    fn ctrl_h_and_ctrl_l_still_move_the_grid_cursor_in_the_palette() {
+        let mut ui = palette_ui(three_sessions());
+        let start = ui.state.clone();
+
+        ui.handle_key(ctrl(KeyCode::Char('l')), size());
+        let after_l = ui.state.clone();
+        assert_ne!(after_l, start, "C-l should move the palette's grid cursor");
+
+        ui.handle_key(ctrl(KeyCode::Char('h')), size());
+
+        assert_eq!(ui.state, start, "C-h should move it back");
+        assert!(
+            ui.expanded.is_empty(),
+            "the palette must not touch the expansion set"
+        );
+    }
 
     #[test]
     fn ctrl_j_opens_the_window_below_the_sections_cursor() {
@@ -1705,7 +1747,8 @@ mod tests {
 
     /// Spec §4: the attached session starts expanded, and the switcher opens
     /// on the window you are in — the sections cursor used to start at 0
-    /// however deep in the list that window was.
+    /// however deep in the list that window was. `None` is a fresh server,
+    /// which is what makes the seeding fire.
     #[test]
     fn opening_puts_the_cursor_on_the_current_window() {
         let cards = vec![
@@ -1714,7 +1757,14 @@ mod tests {
             test_card("bravo", "1"),
         ];
 
-        let ui = ui_with_current(cards, Some("@bravo-1"));
+        let ui = SwitcherUi::with_settings(
+            cards,
+            Some("@bravo-1"),
+            size(),
+            None,
+            ViewMode::Sidebar,
+            InputMode::Keys,
+        );
 
         assert!(ui.expanded.contains("bravo"));
         let selected = ui.sessions_pane.selected().expect("a selected row");
@@ -1738,7 +1788,7 @@ mod tests {
             size(),
             // A non-empty remembered set is the user's own choice and is taken
             // as-is, so "bravo" stays collapsed.
-            HashSet::from(["alpha".to_owned()]),
+            Some(HashSet::from(["alpha".to_owned()])),
             ViewMode::Sidebar,
             InputMode::Keys,
         );
@@ -1818,6 +1868,10 @@ mod tests {
         assert_eq!(ui.focus, SectionFocus::Sessions);
     }
 
+    /// No row is focused when the query has filtered the focused section to
+    /// nothing. Enter then does nothing and leaves the switcher open, the
+    /// same as the palette's `select_key_action` does when nothing is
+    /// selected.
     #[test]
     fn enter_does_nothing_when_the_focused_pane_is_empty() {
         let mut ui = ui_with(vec![test_card("dotfiles", "0")]);

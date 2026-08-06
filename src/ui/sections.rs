@@ -188,15 +188,21 @@ fn attached_session_name(
 /// are attached to expanded — but only on a fresh server: once the persisted
 /// option carries a set, it is the user's own choice, and re-expanding what
 /// they collapsed would fight them every open.
+///
+/// `persisted` is `None` only when the option was never written. An explicitly
+/// empty set arrives as `Some(empty)` and is honoured as-is — collapsing every
+/// session is a deliberate act, and seeding the attached one back in would undo
+/// it on the very next open.
 pub(crate) fn initial_expanded_set(
-    persisted: HashSet<String>,
+    persisted: Option<HashSet<String>>,
     sessions: &[SessionGroup],
     current_window_id: Option<&str>,
 ) -> HashSet<String> {
-    let mut expanded = persisted;
-    if !expanded.is_empty() {
+    if let Some(expanded) = persisted {
         return expanded;
     }
+
+    let mut expanded = HashSet::new();
     if let Some(name) = attached_session_name(sessions, current_window_id) {
         expanded.insert(name);
     }
@@ -508,7 +514,7 @@ mod tests {
         let sessions = fixture();
         let current = sessions[1].cards[0].window_id.clone();
 
-        let expanded = initial_expanded_set(HashSet::new(), &sessions, Some(&current));
+        let expanded = initial_expanded_set(None, &sessions, Some(&current));
 
         assert_eq!(expanded, HashSet::from(["gogo".to_owned()]));
     }
@@ -521,14 +527,30 @@ mod tests {
         let current = sessions[1].cards[0].window_id.clone();
         let persisted = HashSet::from(["dotfiles".to_owned()]);
 
-        let expanded = initial_expanded_set(persisted.clone(), &sessions, Some(&current));
+        let expanded = initial_expanded_set(Some(persisted.clone()), &sessions, Some(&current));
 
         assert_eq!(expanded, persisted);
     }
 
+    /// Collapsing every session persists an empty set, which is NOT the same as
+    /// never having been written. Seeding the attached session back in here
+    /// would silently re-expand it on the very next open.
+    #[test]
+    fn collapsing_every_session_survives_the_next_open() {
+        let sessions = fixture();
+        let current = sessions[1].cards[0].window_id.clone();
+
+        let expanded = initial_expanded_set(Some(HashSet::new()), &sessions, Some(&current));
+
+        assert!(
+            expanded.is_empty(),
+            "an explicitly emptied set was re-seeded: {expanded:?}"
+        );
+    }
+
     #[test]
     fn nothing_is_expanded_when_the_current_window_is_unknown() {
-        assert!(initial_expanded_set(HashSet::new(), &fixture(), None).is_empty());
+        assert!(initial_expanded_set(None, &fixture(), None).is_empty());
     }
 
     #[test]
