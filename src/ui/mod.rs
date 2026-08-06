@@ -1617,15 +1617,21 @@ mod tests {
     /// They were not unbound — they moved the cursor nothing draws.
     #[test]
     fn shift_h_and_shift_l_are_unbound_in_the_sections() {
-        let mut ui = ui_with(three_sessions());
-        ui.handle_key(key(KeyCode::Char('j')), size());
+        // Opened from bravo, so the grid cursor starts on row 1 and an edge
+        // jump in *either* direction would visibly move it. (Asserted after
+        // each key: L and H are inverses, so a single L-then-H pair would come
+        // back to where it started and hide the movement.)
+        let mut ui = ui_with_current(three_sessions(), Some("@bravo-0"));
         let grid = ui.state.clone();
+        let cursor = ui.sessions_pane.cursor;
+        assert_eq!(grid.selected_row, 1);
 
         ui.handle_key(key(KeyCode::Char('L')), size());
-        ui.handle_key(key(KeyCode::Char('H')), size());
-
-        assert_eq!(ui.sessions_pane.cursor, 1);
         assert_eq!(ui.state, grid);
+
+        ui.handle_key(key(KeyCode::Char('H')), size());
+        assert_eq!(ui.state, grid);
+        assert_eq!(ui.sessions_pane.cursor, cursor);
     }
 
     /// Scrolling worked before the branch and stopped working with it: two
