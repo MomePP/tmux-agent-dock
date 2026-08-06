@@ -264,6 +264,73 @@ impl SectionFocus {
     }
 }
 
+/// What a click landed on.
+#[allow(dead_code)] // Task 3: mouse event handler
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ClickTarget {
+    /// A row: focus that section and select item `index`.
+    Row {
+        section: SectionFocus,
+        index: usize,
+    },
+    /// A title or the empty space below the last row: focus the section, select
+    /// nothing. Clicking a heading or a gap should not move you anywhere.
+    Section(SectionFocus),
+    /// Outside both sections.
+    None,
+}
+
+/// Resolves a click's row within the body to a section and item index, using
+/// the same split and the same scroll offsets the renderer used to draw it.
+#[allow(dead_code)] // Task 3: mouse event handler
+pub(crate) fn row_at(
+    body: Rect,
+    click_y: u16,
+    sessions_len: usize,
+    sessions_offset: usize,
+    agents_len: usize,
+    agents_offset: usize,
+) -> ClickTarget {
+    let (sessions_area, agents_area) = section_heights(body);
+
+    if let Some(target) = hit(sessions_area, click_y, sessions_len, sessions_offset) {
+        return match target {
+            Some(index) => ClickTarget::Row {
+                section: SectionFocus::Sessions,
+                index,
+            },
+            None => ClickTarget::Section(SectionFocus::Sessions),
+        };
+    }
+
+    let Some(agents_area) = agents_area else {
+        return ClickTarget::None;
+    };
+    match hit(agents_area, click_y, agents_len, agents_offset) {
+        Some(Some(index)) => ClickTarget::Row {
+            section: SectionFocus::Agents,
+            index,
+        },
+        Some(None) => ClickTarget::Section(SectionFocus::Agents),
+        None => ClickTarget::None,
+    }
+}
+
+/// `None` when the click is outside this section; `Some(None)` when it is on
+/// the title or past the last row; `Some(Some(index))` when it is on a row.
+#[allow(dead_code)] // Task 3: mouse event handler
+fn hit(area: Rect, click_y: u16, len: usize, offset: usize) -> Option<Option<usize>> {
+    if area.height == 0 || click_y < area.y || click_y >= area.y.saturating_add(area.height) {
+        return None;
+    }
+    // Row 0 of the section is its title.
+    let Some(row) = click_y.checked_sub(area.y).filter(|row| *row > 0) else {
+        return Some(None);
+    };
+    let index = offset.saturating_add(usize::from(row - 1));
+    Some((index < len).then_some(index))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -576,5 +643,94 @@ mod tests {
         let expand = sessions_matching_windows(&all, &all);
 
         assert!(expand.is_empty());
+    }
+
+    /// body(20) splits into Sessions rows 0..10 and Agents rows 10..20, each
+    /// with a title on its first row.
+    #[test]
+    fn a_click_on_a_row_resolves_to_that_row() {
+        let area = body(20);
+
+        // Sessions title is y=0; its first row is y=1.
+        assert_eq!(
+            row_at(area, 1, 5, 0, 3, 0),
+            ClickTarget::Row {
+                section: SectionFocus::Sessions,
+                index: 0
+            }
+        );
+        assert_eq!(
+            row_at(area, 3, 5, 0, 3, 0),
+            ClickTarget::Row {
+                section: SectionFocus::Sessions,
+                index: 2
+            }
+        );
+        // Agents starts at y=10; its title is y=10, first row y=11.
+        assert_eq!(
+            row_at(area, 11, 5, 0, 3, 0),
+            ClickTarget::Row {
+                section: SectionFocus::Agents,
+                index: 0
+            }
+        );
+    }
+
+    /// Clicking a title focuses that section without moving its cursor —
+    /// clicking a heading should not teleport you to a window.
+    #[test]
+    fn a_click_on_a_title_focuses_without_selecting() {
+        let area = body(20);
+
+        assert_eq!(row_at(area, 0, 5, 0, 3, 0), ClickTarget::Section(SectionFocus::Sessions));
+        assert_eq!(row_at(area, 10, 5, 0, 3, 0), ClickTarget::Section(SectionFocus::Agents));
+    }
+
+    /// Empty space past the last row is still that section, but selects nothing.
+    #[test]
+    fn a_click_past_the_last_row_focuses_the_section_only() {
+        let area = body(20);
+
+        // Sessions holds 2 rows: y=1 and y=2. y=5 is past them.
+        assert_eq!(row_at(area, 5, 2, 0, 3, 0), ClickTarget::Section(SectionFocus::Sessions));
+        // Agents holds 1 row at y=11. y=15 is past it.
+        assert_eq!(row_at(area, 15, 2, 0, 1, 0), ClickTarget::Section(SectionFocus::Agents));
+    }
+
+    /// A scrolled section resolves through its offset: the first visible row is
+    /// item `offset`, not item 0.
+    #[test]
+    fn a_click_in_a_scrolled_section_resolves_through_its_offset() {
+        let area = body(20);
+
+        assert_eq!(
+            row_at(area, 1, 40, 12, 3, 0),
+            ClickTarget::Row {
+                section: SectionFocus::Sessions,
+                index: 12
+            }
+        );
+        assert_eq!(
+            row_at(area, 12, 40, 12, 30, 7),
+            ClickTarget::Row {
+                section: SectionFocus::Agents,
+                index: 8
+            }
+        );
+    }
+
+    /// A body too short to split has no Agents section to click into.
+    #[test]
+    fn a_click_in_an_unsplit_body_can_only_hit_sessions() {
+        let area = body(3);
+
+        assert_eq!(
+            row_at(area, 1, 5, 0, 3, 0),
+            ClickTarget::Row {
+                section: SectionFocus::Sessions,
+                index: 0
+            }
+        );
+        assert_eq!(row_at(area, 99, 5, 0, 3, 0), ClickTarget::None);
     }
 }
