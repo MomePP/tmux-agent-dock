@@ -416,10 +416,13 @@ fn section_row_lines(
         }
     };
 
+    // The name line: full contrast when the section has the keyboard, one step
+    // down when it does not — but still clearly readable, since the unfocused
+    // section is the one you are most likely reading rather than driving.
     let mut style = if focused {
         Style::default()
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(Color::Gray)
     };
     if selected {
         style = style.add_modifier(Modifier::REVERSED);
@@ -444,16 +447,24 @@ fn section_row_lines(
     ]
 }
 
-/// The detail line is always quieter than the name above it. A blocked agent
-/// keeps its colour there, because "blocked" is the word worth noticing.
+/// The detail line sits one step below the name above it, and never below
+/// `DarkGray`.
+///
+/// It used to render `Color::Black` in an unfocused section, which on a dark
+/// background is not dim — it is gone. Two steps of contrast say "secondary"
+/// well enough without making the text unreadable, and the section that has
+/// the keyboard is already obvious from its cursor.
+///
+/// A blocked agent keeps its colour here either way, because "blocked" is the
+/// word worth noticing whether or not you are looking at that section.
 fn detail_style(row: &Row, focused: bool) -> Style {
     if matches!(row.kind, RowKind::Agent { .. }) && row.status.state == AgentState::Blocked {
         return agent_status_style(row.status);
     }
     if focused {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(Color::Gray)
     } else {
-        Style::default().fg(Color::Black)
+        Style::default().fg(Color::DarkGray)
     }
 }
 
@@ -2409,5 +2420,15 @@ mod tests {
             !icon_cell.modifier.contains(Modifier::DIM),
             "status icon should not be dimmed"
         );
+
+        // The detail line beneath the name. It rendered `Color::Black` here
+        // once, which on a dark background is not dim — it is invisible.
+        let detail_cell = buffer.get(agents_area.x + 2, agents_area.y.saturating_add(2));
+        assert_ne!(
+            detail_cell.fg,
+            Color::Black,
+            "an unfocused detail line must stay readable, not vanish into the background"
+        );
+        assert_eq!(detail_cell.fg, Color::DarkGray);
     }
 }
