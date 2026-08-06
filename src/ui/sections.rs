@@ -161,9 +161,22 @@ pub(crate) fn agent_rows(sessions: &[SessionGroup]) -> Vec<Row> {
     rows
 }
 
+/// Screen lines one row occupies: a name line and a dim detail line beneath it.
+///
+/// Every row in both sections is the same height, which is what lets the
+/// renderer, the click resolver and the scroll clamp share one conversion
+/// instead of each carrying its own idea of where a row starts.
+pub(crate) const ROW_LINES: u16 = 2;
+
+/// How many rows fit in `height` screen lines, given each row's title line is
+/// already accounted for by the caller.
+pub(crate) fn rows_per_height(height: u16) -> usize {
+    (height / ROW_LINES) as usize
+}
+
 /// Below this the body cannot carry two titles plus a row each, so the split is
 /// abandoned and Sessions keeps everything.
-const MIN_SPLIT_HEIGHT: u16 = 4;
+const MIN_SPLIT_HEIGHT: u16 = 6;
 
 /// Divides the body in half between the two sections. The split does not depend
 /// on how many agents are running: an Agents section that resizes itself moves
@@ -212,10 +225,12 @@ fn attached_session_name(
 /// What a fresh tmux server starts with, from `@agent_switcher_expand_default`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
 pub(crate) enum ExpandDefault {
-    /// Every session expanded — the whole tree at once.
-    All,
-    /// Only the session you are attached to. Spec §4's rule.
+    /// Every session expanded — the whole tree at once, and the default. The
+    /// sidebar exists to show where everything is, and opening it folded hides
+    /// exactly that until you go looking for it.
     #[default]
+    All,
+    /// Only the session you are attached to.
     Attached,
     /// Everything collapsed: one row per session.
     None,
@@ -223,11 +238,11 @@ pub(crate) enum ExpandDefault {
 
 pub(crate) fn parse_expand_default(value: &str) -> ExpandDefault {
     match value.trim() {
-        "all" | "expanded" | "open" => ExpandDefault::All,
+        "attached" | "current" => ExpandDefault::Attached,
         "none" | "collapsed" | "closed" => ExpandDefault::None,
-        // Includes "attached" and anything unrecognised: an unreadable setting
+        // Includes "all" and anything unrecognised: an unreadable setting
         // should land on the documented default, not on a surprise.
-        _ => ExpandDefault::Attached,
+        _ => ExpandDefault::All,
     }
 }
 
@@ -375,11 +390,13 @@ fn hit(area: Rect, click_y: u16, len: usize, offset: usize) -> Option<Option<usi
     if area.height == 0 || click_y < area.y || click_y >= area.y.saturating_add(area.height) {
         return None;
     }
-    // Row 0 of the section is its title.
-    let Some(row) = click_y.checked_sub(area.y).filter(|row| *row > 0) else {
+    // Line 0 of the section is its title.
+    let Some(line) = click_y.checked_sub(area.y).filter(|line| *line > 0) else {
         return Some(None);
     };
-    let index = offset.saturating_add(usize::from(row - 1));
+    // A row spans ROW_LINES lines, so either of them resolves to the same item:
+    // clicking an agent's `working · claude_1` detail means its name.
+    let index = offset.saturating_add(usize::from((line - 1) / ROW_LINES));
     Some((index < len).then_some(index))
 }
 
@@ -629,16 +646,16 @@ mod tests {
         assert_eq!(few.1.expect("agents section").y, 10);
     }
 
-    /// The shortest body that still splits: one row of content each under two
-    /// titles.
+    /// The shortest body that still splits: a title plus one two-line row in
+    /// each half.
     #[test]
     fn the_shortest_splittable_body_gives_each_section_half() {
-        let (sessions, agents) = section_heights(body(4));
+        let (sessions, agents) = section_heights(body(6));
         let agents = agents.expect("agents section");
 
-        assert_eq!(agents.height, 2);
-        assert_eq!(sessions.height, 2);
-        assert_eq!(agents.y, 2);
+        assert_eq!(agents.height, 3);
+        assert_eq!(sessions.height, 3);
+        assert_eq!(agents.y, 3);
     }
 
     /// An odd body cannot halve evenly; the extra row goes to Sessions, which
@@ -655,9 +672,9 @@ mod tests {
 
     #[test]
     fn a_body_too_short_to_split_stays_one_section() {
-        let (sessions, agents) = section_heights(body(3));
+        let (sessions, agents) = section_heights(body(5));
 
-        assert_eq!(sessions, body(3));
+        assert_eq!(sessions, body(5));
         assert_eq!(agents, None);
     }
 
@@ -734,14 +751,15 @@ mod tests {
     /// surprise, and the spellings people actually try are accepted.
     #[test]
     fn the_expand_default_parses_its_spellings() {
-        assert_eq!(parse_expand_default("all"), ExpandDefault::All);
-        assert_eq!(parse_expand_default("expanded"), ExpandDefault::All);
-        assert_eq!(parse_expand_default(" open "), ExpandDefault::All);
+        assert_eq!(parse_expand_default("attached"), ExpandDefault::Attached);
+        assert_eq!(parse_expand_default(" current "), ExpandDefault::Attached);
         assert_eq!(parse_expand_default("none"), ExpandDefault::None);
         assert_eq!(parse_expand_default("collapsed"), ExpandDefault::None);
-        assert_eq!(parse_expand_default("attached"), ExpandDefault::Attached);
-        assert_eq!(parse_expand_default(""), ExpandDefault::Attached);
-        assert_eq!(parse_expand_default("nonsense"), ExpandDefault::Attached);
+        assert_eq!(parse_expand_default("all"), ExpandDefault::All);
+        // Unset and unrecognised both land on the default, which is `all`.
+        assert_eq!(parse_expand_default(""), ExpandDefault::All);
+        assert_eq!(parse_expand_default("nonsense"), ExpandDefault::All);
+        assert_eq!(ExpandDefault::default(), ExpandDefault::All);
     }
 
     /// The default only shapes a fresh server. Once anything is remembered it is
@@ -827,11 +845,12 @@ mod tests {
                 index: 0
             }
         );
+        // Rows are two lines tall: lines 1-2 are item 0, lines 3-4 item 1.
         assert_eq!(
             row_at(area, 3, 5, 0, 3, 0),
             ClickTarget::Row {
                 section: SectionFocus::Sessions,
-                index: 2
+                index: 1
             }
         );
         // Agents starts at y=10; its title is y=10, first row y=11.
@@ -852,6 +871,34 @@ mod tests {
 
         assert_eq!(row_at(area, 0, 5, 0, 3, 0), ClickTarget::Section(SectionFocus::Sessions));
         assert_eq!(row_at(area, 10, 5, 0, 3, 0), ClickTarget::Section(SectionFocus::Agents));
+    }
+
+    /// Both lines of a row mean the same entry — clicking an agent's
+    /// `working · claude_1` detail is clicking the agent.
+    #[test]
+    fn either_line_of_a_row_resolves_to_the_same_item() {
+        let area = body(20);
+
+        for line in [1, 2] {
+            assert_eq!(
+                row_at(area, line, 5, 0, 3, 0),
+                ClickTarget::Row {
+                    section: SectionFocus::Sessions,
+                    index: 0
+                },
+                "line {line} should be item 0"
+            );
+        }
+        for line in [3, 4] {
+            assert_eq!(
+                row_at(area, line, 5, 0, 3, 0),
+                ClickTarget::Row {
+                    section: SectionFocus::Sessions,
+                    index: 1
+                },
+                "line {line} should be item 1"
+            );
+        }
     }
 
     /// Empty space past the last row is still that section, but selects nothing.
@@ -882,7 +929,7 @@ mod tests {
             row_at(area, 12, 40, 12, 30, 7),
             ClickTarget::Row {
                 section: SectionFocus::Agents,
-                index: 8
+                index: 7
             }
         );
     }
@@ -890,7 +937,7 @@ mod tests {
     /// A body too short to split has no Agents section to click into.
     #[test]
     fn a_click_in_an_unsplit_body_can_only_hit_sessions() {
-        let area = body(3);
+        let area = body(5);
 
         assert_eq!(
             row_at(area, 1, 5, 0, 3, 0),

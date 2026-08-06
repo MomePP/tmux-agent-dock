@@ -12,7 +12,7 @@ use ratatui::{
 use super::{
     layout::{dock_layout, inset_rect, switcher_layout_for_input},
     pane::Pane,
-    sections::{section_heights, Row, RowKind, SectionFocus},
+    sections::{rows_per_height, section_heights, Row, RowKind, SectionFocus},
     state::{
         char_byte_index, compact_card_positions, compact_lines, numbered_session_index,
         CompactLine, GridState, InputMode, PromptState, ViewMode,
@@ -20,7 +20,7 @@ use super::{
 };
 use crate::{
     cards::compact_tab_process_text,
-    model::{AgentState, AgentStatus, SessionGroup, WindowCard},
+    model::{format_agent_state, AgentState, AgentStatus, SessionGroup, WindowCard},
     preview::PreviewMirror,
     tmux::unix_timestamp,
     TMUX_ORANGE,
@@ -308,13 +308,15 @@ fn render_section(
         return;
     }
 
-    let visible = pane.visible_range(rows_area.height as usize);
+    // Rows are two screen lines tall, so the pane is asked how many *rows*
+    // fit rather than how many lines.
+    let visible = pane.visible_range(rows_per_height(rows_area.height));
     let lines: Vec<Line> = pane.items()[visible.clone()]
         .iter()
         .enumerate()
-        .map(|(offset, row)| {
+        .flat_map(|(offset, row)| {
             let selected = focused && visible.start + offset == pane.cursor;
-            section_row_line(row, selected, focused, spinner_frame, rows_area.width)
+            section_row_lines(row, selected, focused, spinner_frame, rows_area.width)
         })
         .collect();
 
@@ -359,29 +361,27 @@ fn fit_row_text(left: &str, right: &str, width: usize) -> String {
     format!("{left}{}{right}", " ".repeat(padding))
 }
 
-fn section_row_line(
+/// One row as its [`ROW_LINES`] screen lines: a name line, and a dim detail
+/// line beneath it. The pair reads as one entry, which is what gives the list
+/// its rhythm — a status and a tool crammed onto the name line cost more than
+/// they explained.
+fn section_row_lines(
     row: &Row,
     selected: bool,
     focused: bool,
     spinner_frame: usize,
     width: u16,
-) -> Line<'static> {
+) -> Vec<Line<'static>> {
     let icon = agent_status_icon(row.status, spinner_frame);
     // The icon and the space after it are drawn as their own span, so they sit
     // outside the text budget.
     let body_width = (width as usize).saturating_sub(icon.chars().count() + 1);
     let body = match &row.kind {
         RowKind::Session {
-            name,
-            window_count,
-            attached,
-            ..
+            name, attached, ..
         } => fit_row_text(
             name,
-            &format!(
-                "{window_count}{}",
-                if *attached { " \u{25b8}" } else { "" }
-            ),
+            if *attached { "\u{25b8}" } else { "" },
             body_width,
         ),
         RowKind::Window {
@@ -396,7 +396,24 @@ fn section_row_line(
             "",
             body_width,
         ),
-        RowKind::Agent { window_name, tool } => fit_row_text(window_name, tool, body_width),
+        RowKind::Agent { window_name, .. } => truncate_ellipsis(window_name, body_width),
+    };
+
+    // The second line: what the entry is doing, not what it is called.
+    let detail = match &row.kind {
+        RowKind::Session {
+            window_count,
+            expanded,
+            ..
+        } => format!(
+            "{window_count} window{} {}",
+            if *window_count == 1 { "" } else { "s" },
+            if *expanded { "\u{25be}" } else { "\u{25b8}" }
+        ),
+        RowKind::Window { .. } => String::new(),
+        RowKind::Agent { tool, .. } => {
+            format!("{} \u{b7} {tool}", format_agent_state(row.status.state))
+        }
     };
 
     let mut style = if focused {
@@ -414,10 +431,30 @@ fn section_row_line(
     // has the keyboard.
     let icon_style = agent_status_style(row.status);
 
-    Line::from(vec![
-        Span::styled(format!("{icon} "), icon_style),
-        Span::styled(body, style),
-    ])
+    let indent = " ".repeat(icon.chars().count() + 1);
+    vec![
+        Line::from(vec![
+            Span::styled(format!("{icon} "), icon_style),
+            Span::styled(body, style),
+        ]),
+        Line::from(Span::styled(
+            format!("{indent}{}", truncate_ellipsis(&detail, body_width)),
+            detail_style(row, focused),
+        )),
+    ]
+}
+
+/// The detail line is always quieter than the name above it. A blocked agent
+/// keeps its colour there, because "blocked" is the word worth noticing.
+fn detail_style(row: &Row, focused: bool) -> Style {
+    if matches!(row.kind, RowKind::Agent { .. }) && row.status.state == AgentState::Blocked {
+        return agent_status_style(row.status);
+    }
+    if focused {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default().fg(Color::Black)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1444,17 +1481,22 @@ mod tests {
         let groups = group_cards_by_session(vec![card]);
         let rows = session_rows(&groups, &HashSet::new(), Some(&groups[0].cards[0].window_id));
 
-        let line = section_row_line(&rows[0], false, true, 0, 26);
-        let text = line
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
+        let lines = section_row_lines(&rows[0], false, true, 0, 26);
+        let text = |line: &Line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
 
-        assert_eq!(text.chars().count(), 26);
-        assert!(text.ends_with("1 ▸"), "count and marker survive: {text:?}");
-        assert!(text.contains('…'), "name is truncated with an ellipsis: {text:?}");
-        assert!(text.contains("a-very-long"));
+        assert_eq!(lines.len(), 2, "a row is a name line and a detail line");
+        let name = text(&lines[0]);
+        assert_eq!(name.chars().count(), 26);
+        assert!(name.ends_with('▸'), "the attached marker survives: {name:?}");
+        assert!(name.contains('…'), "the name truncates: {name:?}");
+        assert!(name.contains("a-very-long"));
+        // The count moved to the detail line, where it has room to spell itself.
+        assert!(text(&lines[1]).contains("1 window"), "{:?}", text(&lines[1]));
     }
 
     /// The agent row's tool name is its right-hand cell for the same reason.
@@ -1469,16 +1511,21 @@ mod tests {
         let groups = group_cards_by_session(vec![card]);
         let rows = agent_rows(&groups);
 
-        let line = section_row_line(&rows[0], false, true, 0, 26);
-        let text = line
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
+        let lines = section_row_lines(&rows[0], false, true, 0, 26);
+        let text = |line: &Line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
 
-        assert_eq!(text.chars().count(), 26);
-        assert!(text.ends_with("claude"), "tool survives: {text:?}");
-        assert!(text.contains('…'));
+        assert_eq!(lines.len(), 2);
+        let name = text(&lines[0]);
+        assert!(name.contains('…'), "the window name truncates: {name:?}");
+        // The tool is on the detail line now, beside the agent's state, so a
+        // long window name can no longer crowd it out.
+        let detail = text(&lines[1]);
+        assert!(detail.contains("claude"), "tool survives: {detail:?}");
     }
 
     /// A width too small for both cells keeps the right-hand one, and never
@@ -1707,12 +1754,18 @@ mod tests {
         assert_eq!(buffer.get(27, 0).symbol(), "┐");
         assert_eq!(buffer.get(0, 39).symbol(), "└");
         assert_eq!(buffer.get(27, 39).symbol(), "┘");
-        // Sections render top-anchored: "Sessions" title, then one row per
-        // session, both starting right under the top border.
+        // Sections render top-anchored: "Sessions" title, then two-line rows —
+        // a name line with the status icon, and a dim detail line beneath it.
         assert_eq!(buffer.get(2, 2).symbol(), "S");
-        assert_eq!(buffer.get(4, 3).symbol(), "w");
         assert_eq!(buffer.get(2, 3).symbol(), "○");
-        assert_eq!(buffer.get(4, 4).symbol(), "o");
+        assert_eq!(buffer.get(4, 3).symbol(), "w");
+        let detail = (0..28)
+            .map(|x| buffer.get(x, 4).symbol())
+            .collect::<String>();
+        assert!(
+            detail.contains("window"),
+            "row 0's detail line should sit directly under its name: {detail:?}"
+        );
 
         let modal_top = (0..100)
             .map(|x| buffer.get(x, 0).symbol())

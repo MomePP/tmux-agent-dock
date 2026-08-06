@@ -47,7 +47,7 @@ use pane::Pane;
 use render::{draw, Surface};
 use sections::{
     agent_rows, format_expanded, initial_expanded_set, parse_expand_default, parse_expanded, row_at, row_key,
-    section_heights, session_rows, sessions_matching_windows, ClickTarget, ExpandDefault, Row, RowKind,
+    rows_per_height, section_heights, session_rows, sessions_matching_windows, ClickTarget, ExpandDefault, Row, RowKind,
     SectionFocus,
 };
 use state::{
@@ -1236,12 +1236,14 @@ fn keep_sections_visible(ui: &mut SwitcherUi, terminal_size: Rect) {
     // disagreed with either would clamp the cursor against the wrong height.
     let (sessions_area, agents_area) = section_heights(ui.body_rect(terminal_size));
 
-    // Each section spends one row on its title before the rows start.
+    // Each section spends one line on its title, and each row is two lines
+    // tall — the same conversion the renderer and the click resolver use, so
+    // scrolling cannot clamp against a height none of them drew.
     ui.sessions_pane
-        .keep_visible(sessions_area.height.saturating_sub(1) as usize);
+        .keep_visible(rows_per_height(sessions_area.height.saturating_sub(1)));
     if let Some(agents_area) = agents_area {
         ui.agents_pane
-            .keep_visible(agents_area.height.saturating_sub(1) as usize);
+            .keep_visible(rows_per_height(agents_area.height.saturating_sub(1)));
     }
 }
 
@@ -1839,8 +1841,9 @@ mod tests {
         let mut ui = ui_with(three_sessions());
         let body = sections_body(&ui);
 
-        // Row 0 of a section is its title, so the second content row is +2.
-        let result = ui.handle_mouse(click(2, body.y + 2), 40, size());
+        // Line 0 is the title; a row is two lines, so lines 1-2 are the first
+        // session and line 3 starts the second.
+        let result = ui.handle_mouse(click(2, body.y + 3), 40, size());
 
         assert_eq!(ui.focus, SectionFocus::Sessions);
         assert_eq!(ui.sessions_pane.cursor, 1);
