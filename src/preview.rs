@@ -16,7 +16,7 @@ use ratatui::{
 use crate::{
     model::WindowCard,
     tmux::{split_tmux_fields, tmux_output},
-    TMUX_ORANGE,
+    ACCENT,
 };
 
 pub(crate) const PREVIEW_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
@@ -261,7 +261,7 @@ fn draw_preview_pane(
     }
 
     let border_style = if pane.pane_active {
-        Style::default().fg(TMUX_ORANGE)
+        Style::default().fg(ACCENT)
     } else {
         Style::default().fg(Color::DarkGray)
     };

@@ -14,7 +14,14 @@
 
 use ratatui::style::Color;
 
-pub const TMUX_ORANGE: Color = Color::Indexed(202);
+/// The accent, and the section titles. Both are lifted verbatim from the
+/// user's tmux status line (`tmux/tmux.powerline.conf`, `ACCENT` and `PINK`),
+/// so the sidebar and the bar directly above it are the same two colours
+/// rather than two guesses at the same idea. Given as RGB because that config
+/// uses the real palette rather than approximated ANSI slots, and the terminal
+/// is configured for truecolor.
+pub const ACCENT: Color = Color::Rgb(0xcb, 0xa6, 0xf7);
+pub const TITLE: Color = Color::Rgb(0xff, 0x7e, 0xb6);
 
 mod cards;
 mod daemon;

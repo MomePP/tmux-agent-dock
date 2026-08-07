@@ -26,7 +26,7 @@ use crate::{
     model::{format_agent_state, AgentState, AgentStatus, SessionGroup, WindowCard},
     preview::PreviewMirror,
     tmux::unix_timestamp,
-    TMUX_ORANGE,
+    ACCENT, TITLE,
 };
 
 const SEARCH_PLACEHOLDER: &str = "type to filter";
@@ -175,7 +175,7 @@ fn render_search_bar(
     };
 
     let prompt_style = Style::default()
-        .fg(TMUX_ORANGE)
+        .fg(ACCENT)
         .add_modifier(Modifier::BOLD);
     let mut spans = vec![Span::styled("❯ ", prompt_style)];
     if !visible.is_empty() {
@@ -291,14 +291,14 @@ fn render_section(
         );
     }
 
-    // Both titles stay white whether or not their section has focus. They are
-    // headings, not state: dimming one made the sidebar look half switched-off,
-    // and which section holds the keyboard is already said by the cursor being
-    // drawn there.
+    // Both titles keep the same colour whether or not their section has focus.
+    // They are headings, not state: dimming one made the sidebar look half
+    // switched-off, and which section holds the keyboard is already said by the
+    // cursor being drawn there.
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             title.to_owned(),
-            Style::default().fg(Color::White),
+            Style::default().fg(TITLE),
         ))),
         Rect {
             y: area.y.saturating_add(header_lines(section).saturating_sub(2)),
@@ -414,6 +414,7 @@ fn section_row_lines(
             index,
             name,
             last_child,
+            ..
         } => fit_row_text(
             &format!(
                 "  {} {index}: {name}",
@@ -425,23 +426,7 @@ fn section_row_lines(
         RowKind::Agent { window_name, .. } => truncate_ellipsis(window_name, body_width),
     };
 
-    // Names are full contrast in both sections. Dimming the unfocused one made
-    // half the sidebar look switched off, and focus is already unmistakable
-    // from the cursor row — which is how herdr does it too.
-    //
-    // The cursor is weight, not a block of white. `REVERSED` painted the whole
-    // row's width, which in a narrow sidebar is a slab of background that
-    // pulls the eye harder than the name it is marking.
-    let mut style = Style::default();
-    if selected {
-        style = style.add_modifier(Modifier::BOLD);
-    }
-    // The session you are attached to. The right edge now belongs to the fold
-    // arrow, so "you are here" is said in the accent colour rather than with a
-    // marker — and in colour rather than weight, which the cursor has taken.
-    if matches!(row.kind, RowKind::Session { attached: true, .. }) {
-        style = style.fg(TMUX_ORANGE);
-    }
+    let style = name_style(row, selected);
 
     // The status icon keeps its colour in the unfocused section. Dimming it too
     // de-emphasised the one thing the Agents section exists to show — whether an
@@ -472,6 +457,37 @@ fn section_row_lines(
             detail_style(row),
         )),
     ]
+}
+
+/// The colour of a row's name line, as three rules that override in order.
+///
+/// The Sessions tree rests at [`DETAIL_GRAY`] — session rows and window rows
+/// alike. That is what makes the other two readable: a cursor drawn as plain
+/// white, with no bold, is only a cursor if what surrounds it is not already
+/// white.
+///
+/// Agent rows keep their full-contrast name. Nothing in the Agents section is
+/// "where you are", so there is no accent to contrast against, and the cursor
+/// there stays bold — white on white would say nothing.
+fn name_style(row: &Row, selected: bool) -> Style {
+    let attached = matches!(
+        row.kind,
+        RowKind::Session { attached: true, .. } | RowKind::Window { attached: true, .. }
+    );
+
+    match &row.kind {
+        // The window you are in, and the session holding it. "You are here" is
+        // said in the accent colour rather than with a marker — the right edge
+        // belongs to the fold arrow now — and in colour rather than weight,
+        // which the cursor has taken.
+        _ if selected && !matches!(row.kind, RowKind::Agent { .. }) => {
+            Style::default().fg(Color::White)
+        }
+        _ if attached => Style::default().fg(ACCENT),
+        RowKind::Session { .. } | RowKind::Window { .. } => Style::default().fg(DETAIL_GRAY),
+        RowKind::Agent { .. } if selected => Style::default().add_modifier(Modifier::BOLD),
+        RowKind::Agent { .. } => Style::default(),
+    }
 }
 
 /// The detail line's grey.
@@ -777,14 +793,14 @@ fn compact_tab_line(
         Span::styled(
             highlighted_prefix.to_owned(),
             Style::default()
-                .fg(TMUX_ORANGE)
+                .fg(ACCENT)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(number_suffix.to_owned()),
         Span::styled(
             vim_count_hint.motion(),
             Style::default()
-                .fg(TMUX_ORANGE)
+                .fg(ACCENT)
                 .add_modifier(Modifier::DIM)
                 .remove_modifier(Modifier::BOLD),
         ),
@@ -916,7 +932,7 @@ fn render_modal_top_bar(frame: &mut Frame, area: Rect) {
     frame.render_widget(
         Paragraph::new(left.clone()).style(
             Style::default()
-                .fg(TMUX_ORANGE)
+                .fg(ACCENT)
                 .add_modifier(Modifier::BOLD),
         ),
         Rect {
@@ -1040,7 +1056,7 @@ fn render_prompt(frame: &mut Frame, screen: Rect, sidebar: Rect, prompt: &Prompt
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
-            .style(Style::default().fg(TMUX_ORANGE)),
+            .style(Style::default().fg(ACCENT)),
         area,
     );
     frame.render_widget(
@@ -1559,48 +1575,73 @@ mod tests {
         assert_eq!(child.len(), 1);
     }
 
-    /// The cursor is weight, not a slab of reversed background across a narrow
-    /// sidebar; the attached session is colour, since the right edge it used to
-    /// mark itself on now belongs to the fold arrow.
+    /// The Sessions tree rests at `DarkGray` so the two colours layered over it
+    /// can be read: the accent for where you are attached, plain white for the
+    /// cursor. A white cursor is only a cursor if its surroundings are not.
     #[test]
-    fn the_cursor_is_bold_and_the_attached_session_is_accented() {
+    fn the_sessions_tree_is_grey_with_accent_and_white_layered_over_it() {
         let mut card = test_card("work", "0");
         card.window_flags = "*".to_owned();
         let groups = group_cards_by_session(vec![card]);
-        let attached = session_rows(&groups, &HashSet::new(), Some(&groups[0].cards[0].window_id));
-        let detached = session_rows(&groups, &HashSet::new(), None);
+        let here = groups[0].cards[0].window_id.clone();
+        let attached = session_rows(
+            &groups,
+            &HashSet::from(["work".to_owned()]),
+            Some(&here),
+        );
+        let elsewhere = session_rows(&groups, &HashSet::from(["work".to_owned()]), None);
 
-        let selected = section_row_lines(&detached[0], SectionFocus::Sessions, true, 0, 26);
-        let name_style = |lines: &[Line]| lines[0].spans[1].style;
+        let fg = |row: &Row, selected: bool| {
+            section_row_lines(row, SectionFocus::Sessions, selected, 0, 26)[0].spans[1].style
+        };
 
-        assert!(name_style(&selected).add_modifier.contains(Modifier::BOLD));
-        assert!(
-            !name_style(&selected).add_modifier.contains(Modifier::REVERSED),
-            "the cursor should not paint the row's full width"
-        );
-        assert_eq!(
-            name_style(&section_row_lines(
-                &detached[0],
-                SectionFocus::Sessions,
-                false,
-                0,
-                26
-            ))
-            .fg,
-            None,
-            "an unattached session takes no accent"
-        );
-        assert_eq!(
-            name_style(&section_row_lines(
-                &attached[0],
-                SectionFocus::Sessions,
-                false,
-                0,
-                26
-            ))
-            .fg,
-            Some(TMUX_ORANGE)
-        );
+        // Row 0 is the session, row 1 its single window.
+        for (index, what) in [(0, "session"), (1, "window")] {
+            assert_eq!(
+                fg(&elsewhere[index], false).fg,
+                Some(DETAIL_GRAY),
+                "an unattached {what} row should rest at grey"
+            );
+            assert_eq!(
+                fg(&attached[index], false).fg,
+                Some(ACCENT),
+                "the attached {what} row should take the accent"
+            );
+            let cursor = fg(&attached[index], true);
+            assert_eq!(
+                cursor.fg,
+                Some(Color::White),
+                "the cursor should be white on a {what} row, outranking the accent"
+            );
+            assert!(
+                !cursor.add_modifier.contains(Modifier::BOLD),
+                "the cursor is colour, not weight"
+            );
+            assert!(
+                !cursor.add_modifier.contains(Modifier::REVERSED),
+                "the cursor should not paint the row's full width"
+            );
+        }
+    }
+
+    /// Nothing in the Agents section is "where you are", so there is no accent
+    /// to contrast against and its names stay full contrast. The cursor there
+    /// is therefore still weight — white on white would say nothing.
+    #[test]
+    fn agent_rows_keep_full_contrast_names_and_a_bold_cursor() {
+        let mut card = test_card("work", "0");
+        card.agent_status = AgentStatus {
+            agent: Some(AgentKind::Claude),
+            ..AgentStatus::unknown()
+        };
+        let groups = group_cards_by_session(vec![card]);
+        let rows = agent_rows(&groups);
+        let style = |selected| {
+            section_row_lines(&rows[0], SectionFocus::Agents, selected, 0, 26)[0].spans[1].style
+        };
+
+        assert_eq!(style(false).fg, None, "an agent name is not dimmed");
+        assert!(style(true).add_modifier.contains(Modifier::BOLD));
     }
 
     /// The agent row's tool name is its right-hand cell for the same reason.
@@ -2186,19 +2227,19 @@ mod tests {
         let buffer = terminal.backend().buffer();
         // Distance 10 above: only the typed `1` prefix is highlighted.
         assert_eq!(buffer.get(1, 1).symbol(), "1");
-        assert_eq!(buffer.get(1, 1).fg, TMUX_ORANGE);
+        assert_eq!(buffer.get(1, 1).fg, ACCENT);
         assert_eq!(buffer.get(2, 1).symbol(), "0");
         assert_eq!(buffer.get(2, 1).fg, Color::White);
         assert_eq!(buffer.get(3, 1).symbol(), "k");
-        assert_eq!(buffer.get(3, 1).fg, TMUX_ORANGE);
+        assert_eq!(buffer.get(3, 1).fg, ACCENT);
         assert!(buffer.get(3, 1).modifier.contains(Modifier::DIM));
 
         // Exact distance 1 is also a match in both directions.
         assert_eq!(buffer.get(2, 10).symbol(), "1");
-        assert_eq!(buffer.get(2, 10).fg, TMUX_ORANGE);
+        assert_eq!(buffer.get(2, 10).fg, ACCENT);
         assert_eq!(buffer.get(3, 10).symbol(), "k");
         assert_eq!(buffer.get(2, 12).symbol(), "1");
-        assert_eq!(buffer.get(2, 12).fg, TMUX_ORANGE);
+        assert_eq!(buffer.get(2, 12).fg, ACCENT);
         assert_eq!(buffer.get(3, 12).symbol(), "j");
 
         // Nonmatching distances stay quiet.
@@ -2208,7 +2249,7 @@ mod tests {
 
         // Distance 10 below gets the same prefix-only treatment.
         assert_eq!(buffer.get(1, 21).symbol(), "1");
-        assert_eq!(buffer.get(1, 21).fg, TMUX_ORANGE);
+        assert_eq!(buffer.get(1, 21).fg, ACCENT);
         assert_eq!(buffer.get(2, 21).symbol(), "0");
         assert_eq!(buffer.get(2, 21).fg, Color::White);
         assert_eq!(buffer.get(3, 21).symbol(), "j");
@@ -2453,7 +2494,7 @@ mod tests {
     }
 
     /// Focus is carried by the cursor row, not by draining colour out of half
-    /// the sidebar. The unfocused section keeps full-contrast names, `DarkGray`
+    /// the sidebar. The unfocused section keeps its agent-row names, `DarkGray`
     /// details and its status colours — `Black` was invisible against the
     /// background and `Gray` is the terminal's normal white, which left the
     /// detail line looking no quieter than the name above it.
@@ -2503,12 +2544,12 @@ mod tests {
         assert_eq!(rule_cell.symbol(), "\u{2500}", "the halves need a boundary");
         assert_eq!(rule_cell.fg, DETAIL_GRAY);
 
-        // Headings are not state: both titles stay white whether or not their
-        // section has focus.
+        // Headings are not state: both titles keep the title colour whether or
+        // not their section has focus.
         assert_eq!(
             title_cell.fg,
-            Color::White,
-            "the Agents title should stay white while unfocused"
+            TITLE,
+            "the Agents title should keep its colour while unfocused"
         );
         assert_ne!(title_cell.fg, Color::DarkGray);
         assert!(

@@ -26,6 +26,9 @@ pub(crate) enum RowKind {
         name: String,
         /// Draws `└─>` instead of `├─>`.
         last_child: bool,
+        /// The window the client is actually in — not merely inside the
+        /// attached session. Takes the accent colour, like its session row.
+        attached: bool,
     },
     Agent {
         window_name: String,
@@ -109,6 +112,7 @@ pub(crate) fn session_rows(
                     index: card.window_index.clone(),
                     name: card.window_name.clone(),
                     last_child: index == last_index,
+                    attached: current_window_id == Some(card.window_id.as_str()),
                 },
                 status: card.agent_status,
                 target: card.clone(),
@@ -564,6 +568,7 @@ mod tests {
                 index,
                 name,
                 last_child,
+                ..
             } => {
                 assert_eq!(index, "0");
                 assert_eq!(name, "config");

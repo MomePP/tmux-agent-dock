@@ -191,6 +191,14 @@ pub(crate) fn compact_navigation_height(
 /// the status line above, which is where the eye picks up the alignment.
 const DOCK_LEFT_PAD: u16 = 1;
 
+/// A blank line under the search prompt, for the same reason as the blank line
+/// above the Sessions title: the popup's border gives it that separation and
+/// the dock has none, so the prompt sat flush on the pane's bottom edge.
+///
+/// Only reserved when the search bar is on screen. In the navigation modes
+/// there is no bar to hold off the edge, and the row is worth more to the list.
+const DOCK_BOTTOM_PAD: u16 = 1;
+
 /// Geometry for the docked sidebar: the pane is the list. No modal inset,
 /// because there is no border to sit inside, and no preview, because the work
 /// pane beside the dock is the thing a preview would have been showing.
@@ -204,7 +212,17 @@ pub(crate) fn dock_layout(area: Rect, show_help: bool, input: InputMode) -> Swit
     } else {
         0
     };
-    let body_height = area.height.saturating_sub(search_height);
+    // The pad sits below the bar, so it comes out of the body's share and the
+    // bar itself keeps its full height.
+    let bottom_pad = if search_height == SEARCH_BAR_ROWS {
+        DOCK_BOTTOM_PAD
+    } else {
+        0
+    };
+    let body_height = area
+        .height
+        .saturating_sub(search_height)
+        .saturating_sub(bottom_pad);
     let help_height = if show_help {
         HELP_LINE_COUNT.min(body_height)
     } else {
@@ -460,10 +478,28 @@ mod tests {
 
         let layout = dock_layout(area, false, InputMode::Search);
 
+        // The bar keeps its full height and is held one row off the pane's
+        // bottom edge; the pad comes out of the list's share, not the bar's.
         assert_eq!(layout.search.height, SEARCH_BAR_ROWS);
-        assert_eq!(layout.search.y, 40 - SEARCH_BAR_ROWS);
-        assert_eq!(layout.sessions.height, 40 - SEARCH_BAR_ROWS);
+        assert_eq!(layout.search.y, 40 - SEARCH_BAR_ROWS - DOCK_BOTTOM_PAD);
+        assert_eq!(layout.sessions.height, 40 - SEARCH_BAR_ROWS - DOCK_BOTTOM_PAD);
         assert_eq!(layout.sessions.y, 0);
+    }
+
+    /// No bar, nothing to hold off the edge — the row is worth more to the list.
+    #[test]
+    fn the_navigation_modes_spend_no_rows_on_the_bottom_pad() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 40,
+        };
+
+        let layout = dock_layout(area, false, InputMode::Keys);
+
+        assert_eq!(layout.search.height, 0);
+        assert_eq!(layout.sessions.height, 40);
     }
 
     #[test]
