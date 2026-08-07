@@ -346,6 +346,49 @@ pub fn follow() -> Result<()> {
     moved
 }
 
+/// Keeps the dock's own working directory matching the pane it sits beside.
+///
+/// tmux names a window after its *active* pane. With
+/// `automatic-rename-format '#{b:pane_current_path}'` — the user's setup — that
+/// means clicking into the sidebar renames the host window to the dock's
+/// directory: `momeppkt`, the basename of the home directory the dock inherited
+/// when it was spawned. It reverts the moment focus leaves, so the window name
+/// flickers on every visit to the sidebar.
+///
+/// Matching the work pane's directory makes that rename a no-op — tmux computes
+/// the same name from either pane. The alternative, turning `automatic-rename`
+/// off on the host window, would freeze the name of whichever window you are
+/// actually working in, which is worse than the flicker and overrides a setting
+/// the user chose.
+///
+/// Best-effort throughout: a dock that cannot find its own pane, or whose
+/// neighbour's directory has been deleted, simply keeps the cwd it has.
+pub(crate) fn match_host_cwd() {
+    let Some(dock) = crate::tmux::env_tmux_value("TMUX_PANE") else {
+        return;
+    };
+    // `-t <pane>` targets the window *containing* that pane, which is what the
+    // dock needs — it has no other handle on where it currently lives.
+    let Ok(panes) = tmux_output(&[
+        "list-panes",
+        "-t",
+        &dock,
+        "-F",
+        "#{pane_id}\t#{pane_current_path}",
+    ]) else {
+        return;
+    };
+    let Some(path) = panes
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .find(|(pane_id, path)| *pane_id != dock && !path.is_empty())
+        .map(|(_, path)| path)
+    else {
+        return;
+    };
+    let _ = std::env::set_current_dir(path);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

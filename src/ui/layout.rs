@@ -185,11 +185,11 @@ pub(crate) fn compact_navigation_height(
         .saturating_add(1)
 }
 
-/// One column of breathing room down the dock's left edge. The popup gets this
-/// for free from the border it sits inside; the dock has no border, so without
-/// it every row starts hard against the pane divider — and a column off from
-/// the status line above, which is where the eye picks up the alignment.
-const DOCK_LEFT_PAD: u16 = 1;
+/// One column of breathing room down each of the dock's edges. The popup gets
+/// this for free from the border it sits inside; the dock has no border, so
+/// without it every row starts hard against the pane divider — and a column off
+/// from the status line above, which is where the eye picks up the alignment.
+const DOCK_SIDE_PAD: u16 = 1;
 
 /// A blank line under the search prompt, for the same reason as the blank line
 /// above the Sessions title: the popup's border gives it that separation and
@@ -228,11 +228,11 @@ pub(crate) fn dock_layout(area: Rect, show_help: bool, input: InputMode) -> Swit
     } else {
         0
     };
-    // Every content rect starts one column in; `list_overlay` keeps the pane's
-    // own bounds, since it is what the surface clears and measures against.
+    // Every content rect is inset a column on each side; `list_overlay` keeps
+    // the pane's own bounds, since it is what the surface measures against.
     let content = Rect {
-        x: area.x.saturating_add(DOCK_LEFT_PAD),
-        width: area.width.saturating_sub(DOCK_LEFT_PAD),
+        x: area.x.saturating_add(DOCK_SIDE_PAD),
+        width: area.width.saturating_sub(DOCK_SIDE_PAD.saturating_mul(2)),
         ..area
     };
 
@@ -453,12 +453,13 @@ mod tests {
 
         let layout = dock_layout(area, false, InputMode::Keys);
 
-        // No border to inset past, but one column of left padding so rows line
-        // up with the status line above rather than hugging the pane divider.
+        // No border to inset past, but a column of padding on each side so rows
+        // line up with the status line above rather than hugging the dividers.
         assert_eq!(layout.list_overlay, area);
-        assert_eq!(layout.sessions.x, DOCK_LEFT_PAD);
-        assert_eq!(layout.sessions.width, 30 - DOCK_LEFT_PAD);
-        assert_eq!(layout.search.x, DOCK_LEFT_PAD);
+        assert_eq!(layout.sessions.x, DOCK_SIDE_PAD);
+        assert_eq!(layout.sessions.width, 30 - DOCK_SIDE_PAD * 2);
+        assert_eq!(layout.search.x, DOCK_SIDE_PAD);
+        assert_eq!(layout.search.width, 30 - DOCK_SIDE_PAD * 2);
         // Nothing to preview beside a pane that fills its own width.
         assert_eq!(layout.preview.width, 0);
         assert_eq!(layout.preview.height, 0);

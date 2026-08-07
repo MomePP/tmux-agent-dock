@@ -1310,16 +1310,30 @@ fn run_tui_loop(
                 let navigation_height = ui.navigation_height(terminal.size()?);
                 ui.refresh_cards(cards, navigation_height);
             }
+            // Cheap, and it has to be re-done after every follow: the dock has
+            // moved to a new window with a different work pane by then.
+            if surface == Surface::Dock {
+                crate::dock::match_host_cwd();
+            }
             last_card_refresh = now;
         }
-        let preview_area = switcher_layout(
-            terminal.size()?,
-            ui.show_help,
-            ui.view,
-            compact_lines(&ui.filtered).len(),
-        )
-        .preview;
-        preview.refresh_for(ui.selected_target(), preview_area, now);
+        // The dock draws no preview — the work pane beside it *is* the preview —
+        // so refreshing one is pure cost, and the cost lands exactly where it
+        // shows. `refresh_for` re-captures whenever the selected target changes,
+        // so every `j`/`k` was shelling out to `capture-pane` for panes nothing
+        // would render, stalling the draw loop mid-navigation. The area it
+        // measured came from `switcher_layout` — the *popup's* geometry — so the
+        // dock was sizing captures to a rect it does not even have.
+        if surface == Surface::Popup {
+            let preview_area = switcher_layout(
+                terminal.size()?,
+                ui.show_help,
+                ui.view,
+                compact_lines(&ui.filtered).len(),
+            )
+            .preview;
+            preview.refresh_for(ui.selected_target(), preview_area, now);
+        }
         if now.duration_since(last_full_redraw) >= FULL_REDRAW_INTERVAL {
             queue_full_repaint(terminal)?;
             last_full_redraw = now;
