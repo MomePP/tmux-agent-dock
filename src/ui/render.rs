@@ -396,37 +396,56 @@ fn section_row_lines(
     // The icon and the space after it are drawn as their own span, so they sit
     // outside the text budget.
     let body_width = (width as usize).saturating_sub(icon.chars().count() + 1);
-    let body = match &row.kind {
+    let style = name_style(row, selected);
+    // Tree glyphs and fold arrows stay grey whatever the row is doing. They are
+    // chrome — they say where a row sits in the tree, not what it is — so
+    // letting the cursor's white or the attached accent wash over them made the
+    // highlight look like it covered more than the one name it means.
+    let glyph = Style::default().fg(DETAIL_GRAY);
+
+    let body: Vec<Span<'static>> = match &row.kind {
         RowKind::Session {
             name,
             window_count,
             expanded,
             ..
-        } => fit_row_text(
-            name,
-            &format!(
-                "{window_count} {}",
-                if *expanded { "\u{25be}" } else { "\u{25b8}" }
-            ),
-            body_width,
-        ),
+        } => {
+            let arrow = if *expanded { "\u{25be}" } else { "\u{25b8}" };
+            let fitted = fit_row_text(name, &format!("{window_count} {arrow}"), body_width);
+            // The arrow is the last character unless a very narrow row truncated
+            // it away, in which case there is nothing to split off.
+            match fitted.strip_suffix(arrow) {
+                Some(head) => vec![
+                    Span::styled(head.to_owned(), style),
+                    Span::styled(arrow.to_owned(), glyph),
+                ],
+                None => vec![Span::styled(fitted, style)],
+            }
+        }
         RowKind::Window {
             index,
             name,
             last_child,
             ..
-        } => fit_row_text(
-            &format!(
-                "  {} {index}: {name}",
+        } => {
+            let branch = format!(
+                "  {} ",
                 if *last_child { "\u{2514}\u{2500}>" } else { "\u{251c}\u{2500}>" }
-            ),
-            "",
-            body_width,
-        ),
-        RowKind::Agent { window_name, .. } => truncate_ellipsis(window_name, body_width),
+            );
+            let label = truncate_ellipsis(
+                &format!("{index}: {name}"),
+                body_width.saturating_sub(branch.chars().count()),
+            );
+            vec![
+                Span::styled(branch, glyph),
+                Span::styled(label, style),
+            ]
+        }
+        RowKind::Agent { window_name, .. } => {
+            vec![Span::styled(truncate_ellipsis(window_name, body_width), style)]
+        }
     };
 
-    let style = name_style(row, selected);
 
     // The status icon keeps its colour in the unfocused section. Dimming it too
     // de-emphasised the one thing the Agents section exists to show — whether an
@@ -434,10 +453,9 @@ fn section_row_lines(
     // has the keyboard.
     let icon_style = agent_status_style(row.status);
 
-    let name_line = Line::from(vec![
-        Span::styled(format!("{icon} "), icon_style),
-        Span::styled(body, style),
-    ]);
+    let mut spans = vec![Span::styled(format!("{icon} "), icon_style)];
+    spans.extend(body);
+    let name_line = Line::from(spans);
     if row_lines(section) < 2 {
         return vec![name_line];
     }
@@ -1591,8 +1609,13 @@ mod tests {
         );
         let elsewhere = session_rows(&groups, &HashSet::from(["work".to_owned()]), None);
 
+        // The name span: after the icon, and after the tree glyph on a window
+        // row. Those glyphs are chrome and keep their own grey, which is the
+        // point — the highlight covers the name and nothing else.
         let fg = |row: &Row, selected: bool| {
-            section_row_lines(row, SectionFocus::Sessions, selected, 0, 26)[0].spans[1].style
+            let line = &section_row_lines(row, SectionFocus::Sessions, selected, 0, 26)[0];
+            let index = if matches!(row.kind, RowKind::Window { .. }) { 2 } else { 1 };
+            line.spans[index].style
         };
 
         // Row 0 is the session, row 1 its single window.
