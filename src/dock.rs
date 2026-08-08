@@ -168,14 +168,15 @@ fn dock_host() -> DockHost {
 }
 
 /// The window holding `pane` and that window's remembered layout, or `None` if
-/// the pane is gone.
+/// the pane is gone. The layout comes back empty when it no longer fits — see
+/// [`layout_fits`].
 fn host_of(pane: &str) -> Option<(String, String)> {
     let probe = tmux_output(&[
         "display-message",
         "-p",
         "-t",
         pane,
-        &format!("#{{window_id}}\t#{{{DOCK_LAYOUT_OPTION}}}"),
+        &format!("#{{window_id}}\t#{{window_width}}x#{{window_height}}\t#{{{DOCK_LAYOUT_OPTION}}}"),
     ])
     .ok()?;
     let mut fields = probe.trim_end_matches('\n').split('\t');
@@ -183,7 +184,34 @@ fn host_of(pane: &str) -> Option<(String, String)> {
     if window.is_empty() {
         return None;
     }
-    Some((window, fields.next().unwrap_or_default().to_owned()))
+    let size = fields.next().unwrap_or_default();
+    let layout = fields.next().unwrap_or_default();
+    Some((window, usable_layout(layout, size)))
+}
+
+/// A saved layout is only worth restoring onto a window the same size as the one
+/// it was taken from.
+///
+/// tmux applies a smaller layout literally and leaves the difference as dead
+/// space — a row at the bottom belonging to no pane, that nothing ever paints,
+/// and that on a transparent terminal shows straight through to the desktop.
+/// Turning the status line off is enough to cause it: every window gains a row,
+/// and every layout saved before that is now a row short. It also persists,
+/// because the restored layout is what gets saved on the next open, so one
+/// stale string keeps the gap alive across every toggle.
+///
+/// Restoring geometry is a courtesy, and tmux's own arrangement is already
+/// right in this case, so the courtesy is simply skipped.
+fn layout_fits(layout: &str, window_size: &str) -> bool {
+    !layout.is_empty() && !window_size.is_empty() && layout.split(',').nth(1) == Some(window_size)
+}
+
+fn usable_layout(layout: &str, window_size: &str) -> String {
+    if layout_fits(layout, window_size) {
+        layout.to_owned()
+    } else {
+        String::new()
+    }
 }
 
 fn save_layout(window_id: &str) {
@@ -205,7 +233,15 @@ fn save_layout(window_id: &str) {
 /// own arrangement is a perfectly good outcome. Restoring geometry is a
 /// courtesy, not a guarantee worth erroring over.
 fn restore_layout(window_id: &str) {
-    let layout = option(&["show-option", "-wqv", "-t", window_id, DOCK_LAYOUT_OPTION]);
+    let probe = option(&[
+        "display-message",
+        "-p",
+        "-t",
+        window_id,
+        &format!("#{{window_width}}x#{{window_height}}\t#{{{DOCK_LAYOUT_OPTION}}}"),
+    ]);
+    let (size, layout) = probe.split_once('\t').unwrap_or((probe.as_str(), ""));
+    let layout = usable_layout(layout, size);
     if !layout.is_empty() {
         let _ = run(&restore_layout_args(window_id, &layout));
     }
@@ -733,6 +769,26 @@ mod tests {
             args,
             vec!["move-pane", "-b", "-h", "-d", "-l", "30", "-s", "%7", "-t", "%12"]
         );
+    }
+
+    /// The gap this prevents: a layout saved at 52 rows, applied to a window
+    /// that is now 53, leaves a row belonging to no pane. On a transparent
+    /// terminal you see the desktop through it, and it survives every toggle
+    /// because the restored layout is what gets saved next time.
+    #[test]
+    fn a_layout_from_a_differently_sized_window_is_not_restored() {
+        assert!(layout_fits("bac3,198x52,0,0,6", "198x52"));
+        assert!(!layout_fits("bac3,198x52,0,0,6", "198x53"), "a row taller");
+        assert!(!layout_fits("bac3,198x52,0,0,6", "200x52"), "columns differ");
+
+        // Nothing saved, or nothing known about the window: nothing to restore.
+        assert!(!layout_fits("", "198x52"));
+        assert!(!layout_fits("bac3,198x52,0,0,6", ""));
+        // A layout string too mangled to carry a size is not trusted either.
+        assert!(!layout_fits("nonsense", "198x52"));
+
+        assert_eq!(usable_layout("bac3,198x52,0,0,6", "198x52"), "bac3,198x52,0,0,6");
+        assert!(usable_layout("bac3,198x52,0,0,6", "198x53").is_empty());
     }
 
     #[test]
