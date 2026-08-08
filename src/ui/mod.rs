@@ -213,6 +213,48 @@ fn initial_expanded() -> (HashSet<String>, HashSet<String>) {
     (read(EXPANDED_OPTION), read(KNOWN_OPTION))
 }
 
+/// One frame of the switcher.
+///
+/// Pulled out of the loop so an action can be *drawn before it is performed*.
+/// Acting on a click means switching tmux and, for an agent row, asking the
+/// editor to open that agent — hundreds of milliseconds of blocking work that
+/// used to run before the loop came back round to redraw. The cursor had already
+/// moved to the clicked row in memory; it just could not be seen there yet, so
+/// the sidebar looked like it was lagging a second behind the switch it had just
+/// caused.
+fn render(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    ui: &SwitcherUi,
+    preview: &PreviewMirror,
+    spinner_frame: usize,
+) -> Result<()> {
+    let input_value = if ui.input == InputMode::Numbers {
+        ui.numbered_input.as_str()
+    } else {
+        ui.query.as_str()
+    };
+    terminal.draw(|frame| {
+        draw(
+            frame,
+            &ui.filtered,
+            &ui.state,
+            ui.view,
+            ui.input,
+            ui.show_help,
+            input_value,
+            ui.movement_count,
+            ui.prompt.as_ref(),
+            preview,
+            spinner_frame,
+            &ui.sessions_pane,
+            &ui.agents_pane,
+            ui.focus,
+            ui.surface,
+        )
+    })?;
+    Ok(())
+}
+
 /// Performs a switch the dock initiated, then puts the dock's own directory
 /// back in step with where it now sits.
 ///
@@ -1361,30 +1403,7 @@ fn run_tui_loop(
         }
         let spinner_frame = spinner_started_at.elapsed().as_millis() as usize / 120;
         keep_sections_visible(&mut ui, terminal.size()?);
-        let input_value = if ui.input == InputMode::Numbers {
-            ui.numbered_input.as_str()
-        } else {
-            ui.query.as_str()
-        };
-        terminal.draw(|frame| {
-            draw(
-                frame,
-                &ui.filtered,
-                &ui.state,
-                ui.view,
-                ui.input,
-                ui.show_help,
-                input_value,
-                ui.movement_count,
-                ui.prompt.as_ref(),
-                &preview,
-                spinner_frame,
-                &ui.sessions_pane,
-                &ui.agents_pane,
-                ui.focus,
-                ui.surface,
-            )
-        })?;
+        render(terminal, &ui, &preview, spinner_frame)?;
 
         if !event::poll(TUI_TICK_INTERVAL)? {
             continue;
@@ -1399,6 +1418,10 @@ fn run_tui_loop(
                     // returns the action and tears down first.
                     if surface == Surface::Dock {
                         if let Some(action) = result {
+                            // Show the click landing before doing the work it
+                            // asked for; see `render`.
+                            keep_sections_visible(&mut ui, terminal.size()?);
+                            render(terminal, &ui, &preview, spinner_frame)?;
                             perform_in_dock(action);
                         }
                     } else {
@@ -1423,6 +1446,8 @@ fn run_tui_loop(
                 if let Some(result) = ui.handle_key(key, terminal.size()?) {
                     if surface == Surface::Dock {
                         if let Some(action) = result {
+                            keep_sections_visible(&mut ui, terminal.size()?);
+                            render(terminal, &ui, &preview, spinner_frame)?;
                             perform_in_dock(action);
                         }
                     } else {
