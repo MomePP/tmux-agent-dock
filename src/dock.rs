@@ -303,8 +303,47 @@ pub fn follow() -> Result<()> {
         return Ok(());
     }
 
-    // One invocation: guard, remember the destination's geometry, move, put the
-    // window we left back, forget its layout, release the guard.
+    let mut batch = carry_args(&Carry {
+        dock_pane: pane,
+        dock_width,
+        host,
+        host_layout,
+        destination: current,
+        destination_layout: current_layout,
+        target_pane: target,
+    });
+    batch.extend(release_guard_args());
+
+    let moved = run(&batch);
+    if moved.is_err() {
+        // The batch stops at the failure, so the guard would stay set and the
+        // dock would never follow again.
+        unset_global(DOCK_MOVING_OPTION);
+    }
+    moved
+}
+
+/// Everything one move of the dock needs to know.
+pub(crate) struct Carry {
+    pub(crate) dock_pane: String,
+    pub(crate) dock_width: u16,
+    /// The window the dock is leaving, and the layout it had before the dock
+    /// arrived there. An empty layout means there is nothing to put back.
+    pub(crate) host: String,
+    pub(crate) host_layout: String,
+    /// The window the dock is going to, and the layout to remember for when it
+    /// leaves again.
+    pub(crate) destination: String,
+    pub(crate) destination_layout: String,
+    /// The pane in `destination` the dock is placed to the left of.
+    pub(crate) target_pane: String,
+}
+
+/// Guard, remember the destination's geometry, move, put the window we left
+/// back, forget its layout — but do *not* release the guard. Callers append
+/// their own commands and then [`release_guard_args`], so everything tmux is
+/// asked to do lands in one invocation and one redraw.
+pub(crate) fn carry_args(carry: &Carry) -> Vec<String> {
     let mut batch = vec![
         "set-option".to_owned(),
         "-g".to_owned(),
@@ -314,15 +353,19 @@ pub fn follow() -> Result<()> {
         "set-option".to_owned(),
         "-w".to_owned(),
         "-t".to_owned(),
-        current.clone(),
+        carry.destination.clone(),
         DOCK_LAYOUT_OPTION.to_owned(),
-        current_layout,
+        carry.destination_layout.clone(),
         ";".to_owned(),
     ];
-    batch.extend(move_args(dock_width, &pane, &target));
-    if !host_layout.is_empty() {
+    batch.extend(move_args(
+        carry.dock_width,
+        &carry.dock_pane,
+        &carry.target_pane,
+    ));
+    if !carry.host_layout.is_empty() {
         batch.push(";".to_owned());
-        batch.extend(restore_layout_args(&host, &host_layout));
+        batch.extend(restore_layout_args(&carry.host, &carry.host_layout));
     }
     batch.extend([
         ";".to_owned(),
@@ -330,22 +373,79 @@ pub fn follow() -> Result<()> {
         "-w".to_owned(),
         "-u".to_owned(),
         "-t".to_owned(),
-        host,
+        carry.host.clone(),
         DOCK_LAYOUT_OPTION.to_owned(),
+    ]);
+    batch
+}
+
+/// Releases the guard on its own, for a batch that failed part-way through and
+/// never reached [`release_guard_args`].
+pub(crate) fn release_guard() {
+    unset_global(DOCK_MOVING_OPTION);
+}
+
+pub(crate) fn release_guard_args() -> Vec<String> {
+    vec![
         ";".to_owned(),
         "set-option".to_owned(),
         "-g".to_owned(),
         "-u".to_owned(),
         DOCK_MOVING_OPTION.to_owned(),
-    ]);
+    ]
+}
 
-    let moved = run(&batch);
-    if moved.is_err() {
-        // The batch stops at the failure, so the guard would stay set and the
-        // dock would never follow again.
-        unset_global(DOCK_MOVING_OPTION);
+/// The commands that carry the dock into the window holding `target_pane`,
+/// for a switch the switcher is about to perform itself.
+///
+/// The follow hook cannot help here: it only runs *after* the client has already
+/// moved, so tmux draws the destination full width, and the sidebar appears a
+/// beat later when the hook's own process has finished forking and probing. That
+/// is the flash — the window going full screen and the sidebar sliding back in —
+/// and no amount of making the hook faster removes it, because the wrong frame
+/// has already been painted by the time it starts.
+///
+/// Doing the move here instead, in front of the switch and in the same
+/// invocation, means the destination window already has the dock in it the first
+/// time it is drawn.
+///
+/// Empty when there is nothing to do — the dock is closed, or already there — in
+/// which case the caller just runs its own commands.
+pub(crate) fn carry_before_switch(target_window: &str, target_pane: &str) -> Vec<String> {
+    let Some(dock_pane) = dock_pane() else {
+        return Vec::new();
+    };
+    let Ok(host_probe) = tmux_output(&[
+        "display-message",
+        "-p",
+        "-t",
+        &dock_pane,
+        &format!("#{{window_id}}\t#{{{DOCK_LAYOUT_OPTION}}}"),
+    ]) else {
+        return Vec::new();
+    };
+    let mut host_fields = host_probe.trim_end_matches('\n').split('\t');
+    let host = host_fields.next().unwrap_or_default().to_owned();
+    let host_layout = host_fields.next().unwrap_or_default().to_owned();
+    if host.is_empty() || host == target_window {
+        return Vec::new();
     }
-    moved
+
+    carry_args(&Carry {
+        dock_pane,
+        dock_width: width(),
+        host,
+        host_layout,
+        destination: target_window.to_owned(),
+        destination_layout: option(&[
+            "display-message",
+            "-p",
+            "-t",
+            target_window,
+            "#{window_layout}",
+        ]),
+        target_pane: target_pane.to_owned(),
+    })
 }
 
 /// Holds the dock at its configured width.
@@ -476,6 +576,57 @@ mod tests {
         let args = restore_layout_args("@3", "b5e2,80x24,0,0,1");
 
         assert_eq!(args, vec!["select-layout", "-t", "@3", "b5e2,80x24,0,0,1"]);
+    }
+
+    /// The order is the whole point: the guard goes up first, the destination's
+    /// geometry is remembered before the dock lands in it, and the guard is
+    /// *not* released — the caller appends its own commands (a switch, for
+    /// `select_card`) so tmux does all of it in one pass and redraws once.
+    #[test]
+    fn carrying_the_dock_leaves_the_guard_up_for_the_caller() {
+        let batch = carry_args(&Carry {
+            dock_pane: "%7".to_owned(),
+            dock_width: 30,
+            host: "@1".to_owned(),
+            host_layout: "b5e2,80x24,0,0,1".to_owned(),
+            destination: "@2".to_owned(),
+            destination_layout: "c1d3,80x24,0,0,2".to_owned(),
+            target_pane: "%12".to_owned(),
+        });
+
+        assert_eq!(
+            batch,
+            vec![
+                "set-option", "-g", DOCK_MOVING_OPTION, "1", ";",
+                "set-option", "-w", "-t", "@2", DOCK_LAYOUT_OPTION, "c1d3,80x24,0,0,2", ";",
+                "move-pane", "-b", "-h", "-d", "-l", "30", "-s", "%7", "-t", "%12", ";",
+                "select-layout", "-t", "@1", "b5e2,80x24,0,0,1", ";",
+                "set-option", "-w", "-u", "-t", "@1", DOCK_LAYOUT_OPTION,
+            ]
+        );
+        assert_eq!(
+            release_guard_args(),
+            vec![";", "set-option", "-g", "-u", DOCK_MOVING_OPTION]
+        );
+    }
+
+    /// A host with no remembered layout has nothing to put back, and must not
+    /// emit a `select-layout` with an empty argument — tmux rejects the whole
+    /// list, which would strand the guard.
+    #[test]
+    fn a_host_with_no_saved_layout_is_left_to_tmux() {
+        let batch = carry_args(&Carry {
+            dock_pane: "%7".to_owned(),
+            dock_width: 30,
+            host: "@1".to_owned(),
+            host_layout: String::new(),
+            destination: "@2".to_owned(),
+            destination_layout: "c1d3,80x24,0,0,2".to_owned(),
+            target_pane: "%12".to_owned(),
+        });
+
+        assert!(!batch.iter().any(|arg| arg == "select-layout"));
+        assert_eq!(batch.last().unwrap(), DOCK_LAYOUT_OPTION);
     }
 
     #[test]

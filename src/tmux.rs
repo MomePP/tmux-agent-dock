@@ -149,6 +149,17 @@ pub fn select_card(card: &crate::model::WindowCard) -> Result<()> {
     // the outer client. Driven from a sidekick float the acting client is the
     // nested one, and switching that to an outer session attaches a session
     // inside its own pane — tmux renders it recursively and the layout breaks.
+    //
+    // The dock, if it is open and somewhere else, moves in *ahead* of the
+    // switch and in this same invocation. Left to the follow hook it arrives
+    // after the destination has already been drawn full width, which is the
+    // flash of "fullscreen, then the sidebar slides back in".
+    let mut args = crate::dock::carry_before_switch(&card.window_id, &card.target_pane_id);
+    let carried = !args.is_empty();
+    if carried {
+        args.push(";".to_owned());
+    }
+
     let mut switch = vec!["switch-client".to_owned()];
     if let Some(tty) = crate::embed::outer_client_tty() {
         switch.push("-c".to_owned());
@@ -156,9 +167,31 @@ pub fn select_card(card: &crate::model::WindowCard) -> Result<()> {
     }
     switch.push("-t".to_owned());
     switch.push(card.session_name.clone());
-    tmux_status(Command::new("tmux").args(&switch))?;
-    tmux_status(Command::new("tmux").args(["select-window", "-t", &card.window_id]))?;
-    tmux_status(Command::new("tmux").args(["select-pane", "-t", &card.target_pane_id]))?;
+    args.extend(switch);
+    args.extend([
+        ";".to_owned(),
+        "select-window".to_owned(),
+        "-t".to_owned(),
+        card.window_id.clone(),
+        ";".to_owned(),
+        "select-pane".to_owned(),
+        "-t".to_owned(),
+        card.target_pane_id.clone(),
+    ]);
+    if carried {
+        args.extend(crate::dock::release_guard_args());
+    }
+
+    let switched = tmux_status(Command::new("tmux").args(&args));
+    if switched.is_err() && carried {
+        // The list stops at the failure, so the guard would stay set and the
+        // dock would never follow again. Whether the dock had already moved by
+        // then depends on where the list stopped, so put it wherever the client
+        // actually ended up rather than reasoning about it.
+        crate::dock::release_guard();
+        let _ = crate::dock::follow();
+    }
+    switched?;
     clear_unread_for_pane(&card.target_pane_id);
     mark_window_seen(&card.window_id);
     // Panes folded in from an embedded session are what this card's "done" mark
