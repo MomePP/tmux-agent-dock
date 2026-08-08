@@ -213,6 +213,25 @@ fn initial_expanded() -> (HashSet<String>, HashSet<String>) {
     (read(EXPANDED_OPTION), read(KNOWN_OPTION))
 }
 
+/// Performs a switch the dock initiated, then puts the dock's own directory
+/// back in step with where it now sits.
+///
+/// The window name comes from `automatic-rename-format "#{b:pane_current_path}"`
+/// evaluated on the window's **active** pane, and clicking the sidebar is what
+/// makes the dock that pane. So a dock still holding the directory of the window
+/// it came from renames the window it is in after the *previous* one, and it
+/// stays wrong until something puts it right — which used to be the 300ms card
+/// tick plus tmux's own rename check, long enough to watch a window take its
+/// neighbour's name and hand it back.
+///
+/// Matching here rather than before the switch is deliberate: while the dock is
+/// still in the window it is leaving, changing its directory renames *that*
+/// window instead, which is the same bug from the other end.
+fn perform_in_dock(action: SwitcherAction) {
+    let _ = execute_action(action);
+    crate::dock::match_host_cwd();
+}
+
 /// Hands the keyboard back to the pane the user was working in. `select-pane -l`
 /// is the last-active pane, which is where they came from; the `:.+` fallback
 /// covers a dock that has no last pane yet. Best-effort — failing to move focus
@@ -1380,7 +1399,7 @@ fn run_tui_loop(
                     // returns the action and tears down first.
                     if surface == Surface::Dock {
                         if let Some(action) = result {
-                            let _ = execute_action(action);
+                            perform_in_dock(action);
                         }
                     } else {
                         return Ok(result);
@@ -1391,12 +1410,20 @@ fn run_tui_loop(
             // the pane blanks and stays blank until the next draw. The dock
             // resizes every time it is carried into another window, which made
             // that blank flash the visible cost of switching.
-            Event::Resize(_, _) => queue_full_repaint(terminal)?,
+            Event::Resize(_, _) => {
+                queue_full_repaint(terminal)?;
+                // A resize is how the dock finds out it was carried somewhere by
+                // the follow hook, which cannot set this process's directory for
+                // it. Same reason as `perform_in_dock`.
+                if surface == Surface::Dock {
+                    crate::dock::match_host_cwd();
+                }
+            }
             Event::Key(key) => {
                 if let Some(result) = ui.handle_key(key, terminal.size()?) {
                     if surface == Surface::Dock {
                         if let Some(action) = result {
-                            let _ = execute_action(action);
+                            perform_in_dock(action);
                         }
                     } else {
                         return Ok(result);

@@ -504,6 +504,11 @@ pub(crate) fn keep_width(current: u16) {
 /// actually working in, which is worse than the flicker and overrides a setting
 /// the user chose.
 ///
+/// The window's *active* pane is the one whose directory the name is computed
+/// from, so that is the one to match. Any other pane is a fallback for the
+/// moment the dock itself is active — it cannot match its own directory to its
+/// own directory, and the pane the user came from is a better guess than none.
+///
 /// Best-effort throughout: a dock that cannot find its own pane, or whose
 /// neighbour's directory has been deleted, simply keeps the cwd it has.
 pub(crate) fn match_host_cwd() {
@@ -517,19 +522,31 @@ pub(crate) fn match_host_cwd() {
         "-t",
         &dock,
         "-F",
-        "#{pane_id}\t#{pane_current_path}",
+        "#{pane_id}\t#{pane_active}\t#{pane_current_path}",
     ]) else {
         return;
     };
-    let Some(path) = panes
-        .lines()
-        .filter_map(|line| line.split_once('\t'))
-        .find(|(pane_id, path)| *pane_id != dock && !path.is_empty())
-        .map(|(_, path)| path)
-    else {
+    let Some(path) = host_path(&panes, &dock) else {
         return;
     };
     let _ = std::env::set_current_dir(path);
+}
+
+fn host_path<'a>(panes: &'a str, dock: &str) -> Option<&'a str> {
+    let candidates: Vec<(&str, &str, &str)> = panes
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            Some((fields.next()?, fields.next()?, fields.next()?))
+        })
+        .filter(|(pane_id, _, path)| *pane_id != dock && !path.is_empty())
+        .collect();
+
+    candidates
+        .iter()
+        .find(|(_, active, _)| *active == "1")
+        .or_else(|| candidates.first())
+        .map(|(_, _, path)| *path)
 }
 
 #[cfg(test)]
@@ -627,6 +644,22 @@ mod tests {
 
         assert!(!batch.iter().any(|arg| arg == "select-layout"));
         assert_eq!(batch.last().unwrap(), DOCK_LAYOUT_OPTION);
+    }
+
+    /// The name comes from the *active* pane, so that is the directory to copy.
+    /// Picking the first neighbour instead gave a three-pane window the wrong
+    /// one two times in three.
+    #[test]
+    fn the_dock_matches_the_pane_the_window_is_named_after() {
+        let panes = "%1\t0\t/one\n%7\t0\t/dock\n%2\t1\t/two\n%3\t0\t/three\n";
+
+        assert_eq!(host_path(panes, "%7"), Some("/two"));
+        // The dock itself is active — the user is in the sidebar. Its own path
+        // is no answer, so fall back to a neighbour rather than to nothing.
+        assert_eq!(host_path("%7\t1\t/dock\n%1\t0\t/one\n", "%7"), Some("/one"));
+        // Nothing to match: a dock alone in its window, or a pane with no path.
+        assert_eq!(host_path("%7\t1\t/dock\n", "%7"), None);
+        assert_eq!(host_path("%1\t1\t\n%7\t0\t/dock\n", "%7"), None);
     }
 
     #[test]
