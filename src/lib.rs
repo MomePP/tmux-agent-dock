@@ -32,6 +32,7 @@ mod model;
 mod nvim;
 mod preview;
 mod search;
+mod spawn;
 mod tmux;
 mod ui;
 

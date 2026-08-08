@@ -140,6 +140,36 @@ Set `@agent_switcher_tab_status 'off'` to leave tmux's window status formats
 untouched. Tab indicators begin updating after the sidebar starts its status
 daemon for the first time.
 
+### Borrowing the daemon's heartbeat
+
+**tmux has no timer.** Anything that wants to happen periodically has to hang off
+something tmux redraws, and the usual choice is the status line, whose `#()`
+interpolations re-run every `status-interval`. That is how
+[tmux-continuum](https://github.com/tmux-plugins/tmux-continuum) saves sessions —
+and why `set -g status off` stops it saving, quietly, until you notice weeks
+later that there is nothing to restore.
+
+The status daemon is already a heartbeat: it runs for the life of the tmux
+server and is respawned if it dies. It will run a command of your choosing on an
+interval, so periodic work need not depend on a visible status line:
+
+```tmux
+set -g @agent_switcher_tick_command ''     # shell command to run periodically (default: none)
+set -g @agent_switcher_tick_interval '60'  # seconds between runs (default: 60)
+```
+
+Keeping continuum saving with no status line at all:
+
+```tmux
+set -g status off
+set -g @agent_switcher_tick_command '~/.tmux/plugins/tmux-continuum/scripts/continuum_save.sh'
+```
+
+The command runs through `sh -c`, so arguments, `~` and pipelines all work. It is
+started and not waited for, so a slow one cannot stall status polling — and
+nothing throttles it beyond the interval, so a command that must not run too
+often should keep its own timestamp, as continuum's save script already does.
+
 ## How it works
 
 The plugin observes; it never intercepts. Agent state comes from:

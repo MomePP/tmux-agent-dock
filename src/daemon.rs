@@ -7,7 +7,7 @@ use std::{
     path::Path,
     process::Command,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -44,6 +44,9 @@ pub(crate) const STATUS_SEEN_OPTION: &str = "@tmux_agent_switcher_seen";
 const STATUS_RUN_STARTED_OPTION: &str = "@tmux_agent_switcher_run_started_at";
 const STATUS_UPDATED_OPTION: &str = "@tmux_agent_switcher_updated";
 const STATUS_WINDOW_ICON_OPTION: &str = "@tmux_agent_switcher_window_icon";
+const TICK_COMMAND_OPTION: &str = "@agent_switcher_tick_command";
+const TICK_INTERVAL_OPTION: &str = "@agent_switcher_tick_interval";
+const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(60);
 
 pub fn ensure_status_daemon() -> Result<()> {
     let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
@@ -71,6 +74,7 @@ pub fn run_status_daemon() -> Result<()> {
 
     let mut debounce: HashMap<String, Debounce> = HashMap::new();
     let mut ownership_check = 0;
+    let mut tick = Tick::new();
     loop {
         if ownership_check == 0 && current_status_daemon_pid() != pid {
             break;
@@ -80,6 +84,7 @@ pub fn run_status_daemon() -> Result<()> {
         if poll_agent_status_once(&mut debounce).is_err() {
             break;
         }
+        tick.run_if_due();
         thread::sleep(STATUS_DAEMON_INTERVAL);
     }
 
@@ -100,6 +105,80 @@ pub fn run_status_daemon() -> Result<()> {
         ]));
     }
     Ok(())
+}
+
+/// A command run on an interval, for work that wants a heartbeat rather than an
+/// event.
+///
+/// **tmux has no timer.** Anything that wants to happen periodically has to hang
+/// off something tmux redraws, and the usual choice is the status line, whose
+/// `#()` interpolations are re-run every `status-interval`. tmux-continuum saves
+/// sessions exactly that way — which is why turning the status line off stops it
+/// saving, silently, and why "my sessions stopped being saved" is a thing people
+/// discover weeks later.
+///
+/// This daemon is already a heartbeat. It polls for the life of the tmux server,
+/// is respawned when it dies, and exits when there is nothing left to watch, so
+/// lending that heartbeat out costs one option read per interval:
+///
+/// ```text
+/// set -g @agent_switcher_tick_command '~/.tmux/plugins/tmux-continuum/scripts/continuum_save.sh'
+/// set -g @agent_switcher_tick_interval '60'   # seconds; default 60
+/// ```
+///
+/// The command is started and not waited for, so a slow one cannot stall status
+/// polling. Nothing throttles it beyond the interval — a command that must not
+/// run too often should say so itself, as `continuum_save.sh` does by keeping
+/// its own last-run timestamp.
+struct Tick {
+    last_run: Instant,
+    interval: Duration,
+}
+
+impl Tick {
+    fn new() -> Self {
+        Self {
+            last_run: Instant::now(),
+            interval: read_tick_interval(),
+        }
+    }
+
+    /// Both options are re-read when the interval elapses, not on every poll: a
+    /// heartbeat that asked tmux twice a second what it was supposed to be doing
+    /// would cost more than the work it exists to trigger. Editing either takes
+    /// effect within one interval.
+    fn run_if_due(&mut self) {
+        if self.last_run.elapsed() < self.interval {
+            return;
+        }
+        self.last_run = Instant::now();
+        self.interval = read_tick_interval();
+        crate::spawn::shell_detached(&tmux_option(TICK_COMMAND_OPTION));
+    }
+}
+
+fn read_tick_interval() -> Duration {
+    parse_tick_interval(&tmux_option(TICK_INTERVAL_OPTION))
+}
+
+/// Anything unusable falls back to the default rather than to zero: a tmux
+/// option that is unset, misspelled or non-numeric must never turn the heartbeat
+/// into a busy loop.
+fn parse_tick_interval(value: &str) -> Duration {
+    value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_TICK_INTERVAL)
+}
+
+fn tmux_option(name: &str) -> String {
+    tmux_output(&["show-option", "-gqv", name])
+        .unwrap_or_default()
+        .trim()
+        .to_owned()
 }
 
 pub fn poll_agent_status_once(debounce: &mut HashMap<String, Debounce>) -> Result<()> {
@@ -697,6 +776,23 @@ mod tests {
 
         let done = stabilize_agent_status_at(blocked, AgentKind::Codex, AgentState::Idle, 2040);
         assert_eq!(done.run_started_at, None);
+    }
+
+    /// The heartbeat's interval comes from a tmux option, so every way a person
+    /// can get that wrong has to land somewhere safe — and "0 seconds" would be
+    /// a busy loop spawning processes for the life of the server.
+    #[test]
+    fn an_unusable_tick_interval_falls_back_to_the_default() {
+        assert_eq!(parse_tick_interval("15"), Duration::from_secs(15));
+        assert_eq!(parse_tick_interval("  900  "), Duration::from_secs(900));
+
+        for value in ["", "   ", "0", "-5", "every minute", "60s", "1.5"] {
+            assert_eq!(
+                parse_tick_interval(value),
+                DEFAULT_TICK_INTERVAL,
+                "{value:?} should fall back, not become a busy loop"
+            );
+        }
     }
 
     #[test]

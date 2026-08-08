@@ -15,9 +15,8 @@
 //! focused and nothing is disturbed, which is exactly the old behaviour.
 
 use std::collections::HashSet;
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use crate::daemon::ProcessTree;
 
@@ -37,29 +36,10 @@ pub(crate) fn show_agent(pane_pid: Option<u32>, clone: &str) {
     // terminal — and `--remote-expr` blocks until it returns, which is a second
     // or two of it. A caller that waits cannot redraw meanwhile, so the
     // sidebar's accent landed that long after the window it describes had
-    // already changed.
-    //
-    // Spawning a process rather than detaching a thread is what keeps both
-    // callers right: the popup exits immediately after this, and a child process
-    // outlives it to finish the job; the dock lives on, so a thread waits on the
-    // child rather than leaving a zombie behind on every click.
-    //
-    // Its own process group, because the popup surface runs inside
-    // `display-popup -E`, which tmux tears down the moment the command exits.
-    // A child left in that group would be signalled along with it and could be
-    // killed before it had asked the editor anything.
-    if let Ok(mut child) = Command::new("nvim")
-        .args(["--server", &socket.to_string_lossy(), "--remote-expr", &expr])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn()
-    {
-        std::thread::spawn(move || {
-            let _ = child.wait();
-        });
-    }
+    // already changed. See `spawn` for why this shape and not a thread.
+    crate::spawn::detached(
+        Command::new("nvim").args(["--server", &socket.to_string_lossy(), "--remote-expr", &expr]),
+    );
 }
 
 /// The RPC socket of a Neovim running under `pane_pid`.
