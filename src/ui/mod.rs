@@ -1396,16 +1396,20 @@ fn run_tui_loop(
     loop {
         let now = Instant::now();
         if now.duration_since(last_card_refresh) >= CARD_REFRESH_INTERVAL {
-            if let Ok(cards) = load_cards() {
-                let navigation_height = ui.navigation_height(terminal.size()?);
-                ui.refresh_cards(cards, navigation_height);
-            }
-            // Both cheap, and both have to be re-done after every follow: the
+            // Before the cards, not after: the rows are built against the window
+            // the client is in, so observing second meant every window change
+            // was drawn once with the accent still on the window before it.
+            //
+            // Both of these have to be re-done after every follow anyway — the
             // dock has moved to a new window by then, with a different work pane
             // beside it and whatever width that window's layout gave it.
             if surface == Surface::Dock {
                 ui.observe_dock();
                 crate::dock::keep_width(terminal.size()?.width);
+            }
+            if let Ok(cards) = load_cards() {
+                let navigation_height = ui.navigation_height(terminal.size()?);
+                ui.refresh_cards(cards, navigation_height);
             }
             last_card_refresh = now;
         }

@@ -163,7 +163,57 @@ pub(crate) fn merge_remembered(
 /// the layout looks broken, and it is hard to get out of. Every client-scoped
 /// command must therefore name the outer client rather than inheriting
 /// whichever one happened to run it.
+/// The embedded sessions as last worked out, without working them out again.
+///
+/// The daemon and every card refresh keep this current, so anything that only
+/// needs to ask "is this session inside a pane?" can have the answer for one
+/// small read instead of listing the server and walking the process table.
+pub(crate) fn remembered_embedded() -> HashMap<String, String> {
+    parse_remembered(
+        &tmux_output(&["show-option", "-gqv", EMBEDDED_HOSTS_OPTION]).unwrap_or_default(),
+    )
+    .into_iter()
+    .collect()
+}
+
+/// This is on the path of every switch the user makes, so it takes the answer
+/// the daemon and every card refresh already keep in [`EMBEDDED_HOSTS_OPTION`]:
+/// two small reads instead of listing every window and pane on the server and
+/// walking the whole process table. An *empty* value is the one case that has to
+/// be worked out from scratch, because it cannot tell "nothing is embedded" from
+/// "nobody has computed this yet".
 pub fn outer_client_tty() -> Option<String> {
+    let clients = tmux_output(&["list-clients", "-F", "#{session_name}\t#{client_tty}"]).ok()?;
+
+    let remembered: HashMap<String, String> =
+        parse_remembered(&tmux_output(&["show-option", "-gqv", EMBEDDED_HOSTS_OPTION]).ok()?)
+            .into_iter()
+            .collect();
+    if !remembered.is_empty() {
+        return outer_tty(&clients, &remembered);
+    }
+
+    outer_tty(&clients, &resolve_embedded_now()?)
+}
+
+/// The first client that is not inside a pane. A client attached to an embedded
+/// session *is* inside one — that is what makes the session embedded — so the
+/// map of those is enough to tell them apart without walking any processes here.
+pub(crate) fn outer_tty(clients: &str, embedded: &HashMap<String, String>) -> Option<String> {
+    if embedded.is_empty() {
+        return None;
+    }
+    clients
+        .lines()
+        .filter_map(|line| line.rsplit_once('\t'))
+        .find(|(session, _)| !embedded.contains_key(*session))
+        .map(|(_, tty)| tty.trim().to_owned())
+        .filter(|tty| !tty.is_empty())
+}
+
+/// The full sweep: every window, every pane, the whole process table. Only worth
+/// it when nothing has been remembered.
+fn resolve_embedded_now() -> Option<HashMap<String, String>> {
     let windows = parse_windows(
         &tmux_output(&[
             "list-windows",
@@ -186,17 +236,7 @@ pub fn outer_client_tty() -> Option<String> {
     .ok()?;
 
     let processes = ProcessTree::snapshot();
-    let embedded = embedded_session_hosts(&windows, &panes, processes.parents());
-    if embedded.is_empty() {
-        return None;
-    }
-
-    tmux_output(&["list-clients", "-F", "#{session_name}\t#{client_tty}"])
-        .ok()?
-        .lines()
-        .filter_map(|line| line.rsplit_once('\t'))
-        .find(|(session, _)| !embedded.contains_key(*session))
-        .map(|(_, tty)| tty.trim().to_owned())
+    Some(embedded_session_hosts(&windows, &panes, processes.parents()))
 }
 
 /// The panes of embedded sessions, keyed by the pane hosting them.
@@ -477,6 +517,34 @@ mod tests {
         assert!(parse_remembered("").is_empty());
         assert!(parse_remembered("no tab here\n").is_empty());
         assert!(format_remembered(&HashMap::new()).is_empty());
+    }
+
+    /// The client to act on is the one that is not inside a pane. Getting this
+    /// wrong is not cosmetic: switching a *nested* client to an outer session
+    /// attaches that session inside one of its own panes, which tmux renders
+    /// recursively and is hard to get out of.
+    #[test]
+    fn the_outer_client_is_the_one_not_attached_to_an_embedded_session() {
+        let clients = "claude_1 abc\t/dev/ttys002\ndotfiles\t/dev/ttys022\n";
+        let embedded = HashMap::from([("claude_1 abc".to_owned(), "%6".to_owned())]);
+
+        assert_eq!(
+            outer_tty(clients, &embedded),
+            Some("/dev/ttys022".to_owned()),
+            "the float's own client must never be the one acted on"
+        );
+
+        // Nothing embedded: whichever client is acting is already the right one,
+        // and naming it explicitly would only be a chance to name it wrongly.
+        assert_eq!(outer_tty(clients, &HashMap::new()), None);
+        // Every client is inside a pane, so there is no outer one to name.
+        assert_eq!(
+            outer_tty(
+                "claude_1 abc\t/dev/ttys002\n",
+                &HashMap::from([("claude_1 abc".to_owned(), "%6".to_owned())])
+            ),
+            None
+        );
     }
 
     #[test]
