@@ -30,6 +30,15 @@ pub(crate) const DEFAULT_DOCK_WIDTH: u16 = 30;
 /// pressed inside a sidekick float that client is the nested one, and the dock
 /// would be built inside the embedded session instead of beside the Neovim
 /// hosting it.
+///
+/// **`exec` is load-bearing.** tmux runs a pane command through the user's
+/// `default-shell`, so without it the pane's process is the shell — `nu -c
+/// <exe> dock` here — and the dock is merely its child. tmux reads
+/// `pane_current_path` from the pane's own process, so the shell's directory is
+/// the one it reports and [`match_host_cwd`] was chdir'ing a process nothing
+/// ever looked at: the dock's reported directory stayed frozen at wherever it
+/// was first spawned, for its whole life. `exec` replaces the shell with the
+/// binary, which makes the dock the pane and its directory the pane's.
 pub(crate) fn split_args(width: u16, exe: &str, target_window: &str) -> Vec<String> {
     vec![
         "split-window".to_owned(),
@@ -43,7 +52,7 @@ pub(crate) fn split_args(width: u16, exe: &str, target_window: &str) -> Vec<Stri
         "-P".to_owned(),
         "-F".to_owned(),
         "#{pane_id}".to_owned(),
-        format!("{exe} dock"),
+        format!("exec {exe} dock"),
     ]
 }
 
@@ -571,7 +580,9 @@ mod tests {
                 "-P",
                 "-F",
                 "#{pane_id}",
-                "/opt/bin/tmux-agent-switcher dock",
+                // `exec`, or the pane's process is the shell and the dock's
+                // directory — the one tmux names the window after — never moves.
+                "exec /opt/bin/tmux-agent-switcher dock",
             ]
         );
     }
