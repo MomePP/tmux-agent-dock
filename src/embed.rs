@@ -16,6 +16,14 @@
 //! A session is only folded away when *every* client attached to it is embedded
 //! that way. One real terminal attachment and it stays listed on its own, which
 //! is what should happen once its Neovim exits and it outlives its host.
+//!
+//! Ancestry needs a client to walk up from, and closing the float detaches one
+//! without ending the session — `tmux new -A -s` keeps it alive for the next
+//! open. So the answer is also remembered in [`EMBEDDED_HOSTS_OPTION`] and kept
+//! for as long as it can still be true: the session still exists, and the pane
+//! that hosted it still exists and still belongs to some other session. A
+//! sidekick session therefore stays folded into its Neovim while its float is
+//! shut, and comes back on its own the moment that pane is gone.
 
 use std::collections::{HashMap, HashSet};
 
@@ -27,19 +35,119 @@ use crate::tmux::{parse_panes, parse_windows, tmux_output};
 /// its pane; anything deeper is a cycle in a malformed `ps` snapshot.
 const MAX_ANCESTRY_HOPS: usize = 64;
 
+/// Where the resolved mapping is remembered, so a session whose float is closed
+/// — and which therefore has no client left to trace — stays folded. One
+/// `session\tpane` per line; session names are already assumed tab-free by
+/// [`parse_clients`].
+const EMBEDDED_HOSTS_OPTION: &str = "@tmux_agent_switcher_embedded";
+
 /// Maps each embedded session's name to the `pane_id` it is running inside.
 pub fn embedded_session_hosts(
     windows: &[TmuxWindow],
     panes: &[TmuxPane],
     parents: &HashMap<u32, u32>,
 ) -> HashMap<String, String> {
-    if parents.is_empty() {
-        return HashMap::new();
+    let stored = tmux_output(&["show-option", "-gqv", EMBEDDED_HOSTS_OPTION]).unwrap_or_default();
+
+    // No process snapshot means no ancestry to walk — but what was already
+    // remembered is still as true as it was, so it is kept rather than dropped.
+    let live = if parents.is_empty() {
+        LiveEmbedding::default()
+    } else {
+        let clients = parse_clients(
+            &tmux_output(&["list-clients", "-F", "#{session_name}\t#{client_pid}"])
+                .unwrap_or_default(),
+        );
+        resolve_embedded(&clients, parents, windows, panes)
+    };
+
+    let hosts = merge_remembered(live, &parse_remembered(&stored), windows, panes);
+
+    // Written back only when it actually changed: this runs on every poll of
+    // both the daemon and an open dock, and an unconditional `set-option` would
+    // be a fork, an exec and a socket round trip several times a second for a
+    // value that changes when a float opens or closes.
+    let formatted = format_remembered(&hosts);
+    if formatted != stored.trim_end_matches('\n') {
+        let _ = tmux_output(&["set-option", "-g", EMBEDDED_HOSTS_OPTION, &formatted]);
     }
-    let clients = parse_clients(
-        &tmux_output(&["list-clients", "-F", "#{session_name}\t#{client_pid}"]).unwrap_or_default(),
-    );
-    resolve_embedded(&clients, parents, windows, panes)
+    hosts
+}
+
+/// What the currently-attached clients say about which sessions are embedded.
+#[derive(Debug, Default)]
+pub(crate) struct LiveEmbedding {
+    /// Session name to the pane it is running inside.
+    pub(crate) hosts: HashMap<String, String>,
+    /// Sessions holding at least one client that is *not* inside a pane — a real
+    /// terminal attachment. These stay listed however they started, and their
+    /// remembered host is discarded rather than merged back in.
+    pub(crate) standalone: HashSet<String>,
+}
+
+pub(crate) fn parse_remembered(value: &str) -> Vec<(String, String)> {
+    value
+        .lines()
+        .filter_map(|line| line.rsplit_once('\t'))
+        .map(|(session, pane)| (session.to_owned(), pane.trim().to_owned()))
+        .collect()
+}
+
+/// Sorted, so an unchanged mapping formats to an unchanged string and the
+/// write-back can be skipped.
+pub(crate) fn format_remembered(hosts: &HashMap<String, String>) -> String {
+    let mut lines: Vec<String> = hosts
+        .iter()
+        .map(|(session, pane)| format!("{session}\t{pane}"))
+        .collect();
+    lines.sort();
+    lines.join("\n")
+}
+
+/// Adds back the sessions we have seen embedded before and that nothing since
+/// has contradicted.
+///
+/// A remembered entry survives while all three still hold: the session exists,
+/// the host pane exists, and that pane belongs to some *other* session — the
+/// last one both rules out a session folded into itself and expires the memory
+/// when the Neovim's pane is gone. Anything a live client says wins outright.
+pub(crate) fn merge_remembered(
+    live: LiveEmbedding,
+    remembered: &[(String, String)],
+    windows: &[TmuxWindow],
+    panes: &[TmuxPane],
+) -> HashMap<String, String> {
+    let LiveEmbedding {
+        mut hosts,
+        standalone,
+    } = live;
+
+    let sessions = window_sessions(windows);
+    let alive: HashSet<&str> = windows
+        .iter()
+        .map(|window| window.session_name.as_str())
+        .collect();
+    let pane_owners: HashMap<&str, &str> = panes
+        .iter()
+        .filter_map(|pane| {
+            Some((
+                pane.pane_id.as_str(),
+                *sessions.get(pane.window_id.as_str())?,
+            ))
+        })
+        .collect();
+
+    for (session, host) in remembered {
+        if standalone.contains(session.as_str()) || !alive.contains(session.as_str()) {
+            continue;
+        }
+        if let Some(owner) = pane_owners.get(host.as_str()) {
+            if *owner != session.as_str() {
+                hosts.entry(session.clone()).or_insert_with(|| host.clone());
+            }
+        }
+    }
+    hosts
 }
 
 /// The tty of a client that is not itself running inside a tmux pane, or `None`
@@ -126,7 +234,7 @@ pub(crate) fn resolve_embedded(
     parents: &HashMap<u32, u32>,
     windows: &[TmuxWindow],
     panes: &[TmuxPane],
-) -> HashMap<String, String> {
+) -> LiveEmbedding {
     let sessions = window_sessions(windows);
     let by_pid: HashMap<u32, &TmuxPane> = panes
         .iter()
@@ -134,7 +242,7 @@ pub(crate) fn resolve_embedded(
         .collect();
 
     let mut hosts: HashMap<String, String> = HashMap::new();
-    let mut standalone: HashSet<&str> = HashSet::new();
+    let mut standalone: HashSet<String> = HashSet::new();
 
     for (session_name, client_pid) in clients {
         // A client running in a pane of the session it is attached to is a
@@ -152,13 +260,13 @@ pub(crate) fn resolve_embedded(
             // A client we can't trace back into a pane is a real terminal
             // attachment: the session stands on its own and must stay listed.
             None => {
-                standalone.insert(session_name.as_str());
+                standalone.insert(session_name.clone());
             }
         }
     }
 
     hosts.retain(|session_name, _| !standalone.contains(session_name.as_str()));
-    hosts
+    LiveEmbedding { hosts, standalone }
 }
 
 /// Walks up from a tmux client to the first pane whose process it descends
@@ -233,7 +341,7 @@ mod tests {
             ("claude_1 abc".to_owned(), 120),
         ];
 
-        let embedded = resolve_embedded(&clients, &parents, &windows, &panes);
+        let embedded = resolve_embedded(&clients, &parents, &windows, &panes).hosts;
         assert_eq!(
             embedded,
             HashMap::from([("claude_1 abc".to_owned(), "%6".to_owned())])
@@ -253,18 +361,118 @@ mod tests {
             ("claude_1 abc".to_owned(), 300),
         ];
 
-        assert!(resolve_embedded(&clients, &parents, &windows, &panes).is_empty());
+        let live = resolve_embedded(&clients, &parents, &windows, &panes);
+        assert!(live.hosts.is_empty());
+        assert!(live.standalone.contains("claude_1 abc"));
     }
 
     #[test]
-    fn keeps_a_detached_session_and_ignores_recursive_attaches() {
+    fn a_detached_session_traces_to_nothing_and_ignores_recursive_attaches() {
         let (windows, panes, parents) = fixture();
-        // No clients at all: nothing to trace, nothing folded.
-        assert!(resolve_embedded(&[], &parents, &windows, &panes).is_empty());
+        // No clients at all: nothing to trace, nothing to say.
+        let live = resolve_embedded(&[], &parents, &windows, &panes);
+        assert!(live.hosts.is_empty());
+        assert!(live.standalone.is_empty());
 
         // A client inside %6 attached back to %6's own session.
         let clients = vec![("dotfiles".to_owned(), 120)];
-        assert!(resolve_embedded(&clients, &parents, &windows, &panes).is_empty());
+        assert!(resolve_embedded(&clients, &parents, &windows, &panes)
+            .hosts
+            .is_empty());
+    }
+
+    /// Closing the sidekick float detaches the client but leaves the session
+    /// running, so ancestry has nothing to walk. The remembered answer carries
+    /// it: the session is still there and so is the Neovim's pane.
+    #[test]
+    fn a_session_whose_float_closed_stays_folded() {
+        let (windows, panes, _) = fixture();
+        let remembered = vec![("claude_1 abc".to_owned(), "%6".to_owned())];
+
+        let hosts = merge_remembered(LiveEmbedding::default(), &remembered, &windows, &panes);
+
+        assert_eq!(
+            hosts,
+            HashMap::from([("claude_1 abc".to_owned(), "%6".to_owned())])
+        );
+    }
+
+    /// The three ways the memory expires. Each one means the fold can no longer
+    /// be true, and the session has to come back as a peer.
+    #[test]
+    fn the_remembered_host_expires_when_it_can_no_longer_be_true() {
+        let (windows, panes, _) = fixture();
+        let remembered = vec![("claude_1 abc".to_owned(), "%6".to_owned())];
+        let merge = |live, windows: &[TmuxWindow], panes: &[TmuxPane]| {
+            merge_remembered(live, &remembered, windows, panes)
+        };
+
+        // The Neovim's pane is gone — its window closed, or the editor quit.
+        let orphaned: Vec<TmuxPane> = panes
+            .iter()
+            .filter(|pane| pane.pane_id != "%6")
+            .cloned()
+            .collect();
+        assert!(merge(LiveEmbedding::default(), &windows, &orphaned).is_empty());
+
+        // The session itself ended.
+        let without: Vec<TmuxWindow> = windows
+            .iter()
+            .filter(|window| window.session_name != "claude_1 abc")
+            .cloned()
+            .collect();
+        assert!(merge(LiveEmbedding::default(), &without, &panes).is_empty());
+
+        // Someone attached a real terminal to it: it is a session in its own
+        // right now, whatever it used to be.
+        let attached = LiveEmbedding {
+            standalone: HashSet::from(["claude_1 abc".to_owned()]),
+            ..LiveEmbedding::default()
+        };
+        assert!(merge(attached, &windows, &panes).is_empty());
+    }
+
+    /// A live client outranks the memory — the float can be reopened from a
+    /// different Neovim than the one that first spawned it.
+    #[test]
+    fn a_live_client_wins_over_a_stale_remembered_host() {
+        let (mut windows, mut panes, parents) = fixture();
+        windows.push(window("@3", "other"));
+        panes.push(pane("%30", "@3", 400));
+
+        let live = resolve_embedded(
+            &[("claude_1 abc".to_owned(), 120)],
+            &parents,
+            &windows,
+            &panes,
+        );
+        let stale = vec![("claude_1 abc".to_owned(), "%30".to_owned())];
+
+        assert_eq!(
+            merge_remembered(live, &stale, &windows, &panes),
+            HashMap::from([("claude_1 abc".to_owned(), "%6".to_owned())])
+        );
+    }
+
+    #[test]
+    fn remembered_hosts_round_trip_through_the_option() {
+        let hosts = HashMap::from([
+            ("claude_1 abc".to_owned(), "%6".to_owned()),
+            ("codex_2 def".to_owned(), "%9".to_owned()),
+        ]);
+
+        let formatted = format_remembered(&hosts);
+
+        assert_eq!(formatted, "claude_1 abc\t%6\ncodex_2 def\t%9");
+        assert_eq!(
+            parse_remembered(&formatted)
+                .into_iter()
+                .collect::<HashMap<_, _>>(),
+            hosts
+        );
+        assert!(parse_remembered("").is_empty());
+        assert!(parse_remembered("no tab here\n").is_empty());
+        assert!(format_remembered(&HashMap::new()).is_empty());
     }
 
     #[test]
