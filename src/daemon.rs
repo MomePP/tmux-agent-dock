@@ -83,13 +83,22 @@ pub fn run_status_daemon() -> Result<()> {
         thread::sleep(STATUS_DAEMON_INTERVAL);
     }
 
-    let _ = tmux_status(Command::new("tmux").args([
-        "set-option",
-        "-g",
-        "-u",
-        "-q",
-        STATUS_DAEMON_PID_OPTION,
-    ]));
+    // Relinquish the option only while it is still ours. A daemon that lost the
+    // handoff — the ordinary way one retires, by another taking the option —
+    // used to clear the winner's claim on its way out. `ensure_status_daemon`
+    // then read an empty option and started yet another daemon, which took the
+    // option, which retired that one, which cleared it again. Once two ever
+    // coexisted the pair never settled: a new process every few seconds for as
+    // long as the tmux server lived.
+    if current_status_daemon_pid() == pid {
+        let _ = tmux_status(Command::new("tmux").args([
+            "set-option",
+            "-g",
+            "-u",
+            "-q",
+            STATUS_DAEMON_PID_OPTION,
+        ]));
+    }
     Ok(())
 }
 
