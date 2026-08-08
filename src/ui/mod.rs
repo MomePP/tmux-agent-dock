@@ -248,7 +248,7 @@ fn render(
             spinner_frame,
             &ui.sessions_pane,
             &ui.agents_pane,
-            ui.focus,
+            ui.section_focus(),
             ui.surface,
         )
     })?;
@@ -269,9 +269,9 @@ fn render(
 /// Matching here rather than before the switch is deliberate: while the dock is
 /// still in the window it is leaving, changing its directory renames *that*
 /// window instead, which is the same bug from the other end.
-fn perform_in_dock(action: SwitcherAction) {
+fn perform_in_dock(ui: &mut SwitcherUi, action: SwitcherAction) {
     let _ = execute_action(action);
-    crate::dock::match_host_cwd();
+    ui.observe_dock();
 }
 
 /// Hands the keyboard back to the pane the user was working in. `select-pane -l`
@@ -317,6 +317,9 @@ struct SwitcherUi {
     /// collapse state.
     search_expanded: HashSet<String>,
     current_window_id: Option<String>,
+    /// Whether this surface holds the keyboard. Always true for the popup;
+    /// mostly false for the dock, which sits beside the pane you work in.
+    pane_focused: bool,
 }
 
 impl SwitcherUi {
@@ -386,6 +389,10 @@ impl SwitcherUi {
             expanded,
             search_expanded: HashSet::new(),
             current_window_id: current_window_id.map(str::to_owned),
+            // The popup is a modal: it has the keyboard for as long as it
+            // exists. Only the dock ever hands it back, and it keeps this in
+            // step from `observe_dock`.
+            pane_focused: true,
         };
         ui.rebuild_panes();
         ui.focus_current_window();
@@ -398,6 +405,28 @@ impl SwitcherUi {
             ui.apply_initial_move(direction, terminal_size);
         }
         ui
+    }
+
+    /// Which section the keys act on, or `None` when the keys are not here.
+    fn section_focus(&self) -> Option<SectionFocus> {
+        self.pane_focused.then_some(self.focus)
+    }
+
+    /// Asks tmux the two things the dock cannot see about itself, and takes the
+    /// answers.
+    ///
+    /// The window it is in is *the window the client is looking at*, because the
+    /// dock follows — and that is what the accent marks. Read once at startup it
+    /// went stale the first time the user changed window by any means other than
+    /// the sidebar: the lavender stayed on whichever window the dock happened to
+    /// be opened in, for the rest of its life.
+    fn observe_dock(&mut self) {
+        let context = crate::dock::observe();
+        self.pane_focused = context.focused;
+        if context.window_id.is_some() && context.window_id != self.current_window_id {
+            self.current_window_id = context.window_id;
+            self.rebuild_panes();
+        }
     }
 
     /// Opens with the Sessions cursor on the row for the window the client is
@@ -1375,7 +1404,7 @@ fn run_tui_loop(
             // dock has moved to a new window by then, with a different work pane
             // beside it and whatever width that window's layout gave it.
             if surface == Surface::Dock {
-                crate::dock::match_host_cwd();
+                ui.observe_dock();
                 crate::dock::keep_width(terminal.size()?.width);
             }
             last_card_refresh = now;
@@ -1422,7 +1451,7 @@ fn run_tui_loop(
                             // asked for; see `render`.
                             keep_sections_visible(&mut ui, terminal.size()?);
                             render(terminal, &ui, &preview, spinner_frame)?;
-                            perform_in_dock(action);
+                            perform_in_dock(&mut ui, action);
                         }
                     } else {
                         return Ok(result);
@@ -1439,7 +1468,7 @@ fn run_tui_loop(
                 // the follow hook, which cannot set this process's directory for
                 // it. Same reason as `perform_in_dock`.
                 if surface == Surface::Dock {
-                    crate::dock::match_host_cwd();
+                    ui.observe_dock();
                 }
             }
             Event::Key(key) => {
@@ -1448,7 +1477,7 @@ fn run_tui_loop(
                         if let Some(action) = result {
                             keep_sections_visible(&mut ui, terminal.size()?);
                             render(terminal, &ui, &preview, spinner_frame)?;
-                            perform_in_dock(action);
+                            perform_in_dock(&mut ui, action);
                         }
                     } else {
                         return Ok(result);

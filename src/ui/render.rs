@@ -64,7 +64,9 @@ pub(crate) fn draw(
     spinner_frame: usize,
     sessions_pane: &Pane<Row>,
     agents_pane: &Pane<Row>,
-    focus: SectionFocus,
+    // Which section holds the keyboard, or `None` when this surface does not
+    // hold it at all — a dock sitting beside the pane you are working in.
+    focus: Option<SectionFocus>,
     surface: Surface,
 ) {
     let layout = match surface {
@@ -228,12 +230,17 @@ fn render_selected_preview(frame: &mut Frame, area: Rect, preview: &PreviewMirro
 
 /// Draws the Sessions and Agents sections into `body`. The unfocused section
 /// is dimmed so it is obvious which one the keyboard drives.
+/// `focus` is `None` when the surface itself does not hold the keyboard, and
+/// then neither section draws a cursor. A docked sidebar spends most of its life
+/// that way — beside the pane you are typing in — and a cursor sitting there
+/// claims a selection that no key would act on, while competing with the accent
+/// that says which window you are actually in.
 pub(crate) fn render_sections(
     frame: &mut Frame,
     body: Rect,
     sessions: &Pane<Row>,
     agents: &Pane<Row>,
-    focus: SectionFocus,
+    focus: Option<SectionFocus>,
     spinner_frame: usize,
 ) {
     let (sessions_area, agents_area) = section_heights(body);
@@ -244,7 +251,7 @@ pub(crate) fn render_sections(
         SectionFocus::Sessions,
         "Sessions",
         sessions,
-        focus == SectionFocus::Sessions,
+        focus == Some(SectionFocus::Sessions),
         spinner_frame,
         "no sessions",
     );
@@ -256,7 +263,7 @@ pub(crate) fn render_sections(
             SectionFocus::Agents,
             "Agents",
             agents,
-            focus == SectionFocus::Agents,
+            focus == Some(SectionFocus::Agents),
             spinner_frame,
             "none running",
         );
@@ -1227,7 +1234,7 @@ mod tests {
                     0,
                     &sessions_pane,
                     &agents_pane,
-                    SectionFocus::Sessions,
+                    Some(SectionFocus::Sessions),
                     Surface::Popup,
                 )
             })
@@ -1269,7 +1276,7 @@ mod tests {
                     0,
                     &sessions_pane,
                     &agents_pane,
-                    SectionFocus::Sessions,
+                    Some(SectionFocus::Sessions),
                     Surface::Popup,
                 )
             })
@@ -1311,7 +1318,7 @@ mod tests {
                     0,
                     &sessions_pane,
                     &agents_pane,
-                    SectionFocus::Sessions,
+                    Some(SectionFocus::Sessions),
                     Surface::Popup,
                 )
             })
@@ -1357,7 +1364,7 @@ mod tests {
                     0,
                     &sessions_pane,
                     &agents_pane,
-                    SectionFocus::Sessions,
+                    Some(SectionFocus::Sessions),
                     Surface::Popup,
                 )
             })
@@ -1407,7 +1414,7 @@ mod tests {
                     0,
                     &sessions_pane,
                     &agents_pane,
-                    SectionFocus::Sessions,
+                    Some(SectionFocus::Sessions),
                     Surface::Popup,
                 )
             })
@@ -1448,7 +1455,7 @@ mod tests {
                     0,
                     &sessions_pane,
                     &agents_pane,
-                    SectionFocus::Sessions,
+                    Some(SectionFocus::Sessions),
                     Surface::Popup,
                 )
             })
@@ -1787,7 +1794,7 @@ mod tests {
                     0,
                     &sessions_pane,
                     &agents_pane,
-                    SectionFocus::Sessions,
+                    Some(SectionFocus::Sessions),
                     Surface::Popup,
                 )
             })
@@ -1959,7 +1966,7 @@ mod tests {
                     0,
                     &sessions_pane,
                     &agents_pane,
-                    SectionFocus::Sessions,
+                    Some(SectionFocus::Sessions),
                     Surface::Popup,
                 )
             })
@@ -2026,7 +2033,7 @@ mod tests {
                     0,
                     &sessions_pane,
                     &agents_pane,
-                    SectionFocus::Sessions,
+                    Some(SectionFocus::Sessions),
                     Surface::Popup,
                 )
             })
@@ -2066,7 +2073,7 @@ mod tests {
                     0,
                     &sessions_pane,
                     &agents_pane,
-                    SectionFocus::Sessions,
+                    Some(SectionFocus::Sessions),
                     Surface::Popup,
                 )
             })
@@ -2506,7 +2513,7 @@ mod tests {
                     },
                     &sessions,
                     &agents,
-                    SectionFocus::Sessions,
+                    Some(SectionFocus::Sessions),
                     0,
                 );
             })
@@ -2549,7 +2556,7 @@ mod tests {
                     0,
                     &sessions_pane,
                     &agents_pane,
-                    SectionFocus::Sessions,
+                    Some(SectionFocus::Sessions),
                     Surface::Popup,
                 )
             })
@@ -2566,6 +2573,51 @@ mod tests {
         assert!(rendered.contains("no matching windows"));
         assert!(!rendered.contains("Sessions"));
         assert!(!rendered.contains("Agents"));
+    }
+
+    /// A dock spends most of its life beside the pane you are typing in.
+    /// Drawing a cursor there claims a selection no key would act on, and
+    /// competes with the accent that says which window you are actually in.
+    #[test]
+    fn an_unfocused_surface_draws_no_cursor() {
+        let groups = vec![SessionGroup {
+            session_name: "dotfiles".to_owned(),
+            cards: vec![crate::test_support::test_card("dotfiles", "0")],
+        }];
+        let sessions = Pane::new(session_rows(&groups, &HashSet::new(), None));
+        let agents = Pane::new(agent_rows(&groups));
+        let body = Rect {
+            x: 0,
+            y: 0,
+            width: 28,
+            height: 16,
+        };
+        let rows = rows_area(section_heights(body).0, SectionFocus::Sessions);
+
+        // The first character of the cursor row's name, past the status column.
+        let cursor_cell = |focus| {
+            let backend = ratatui::backend::TestBackend::new(28, 16);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| render_sections(frame, body, &sessions, &agents, focus, 0))
+                .unwrap();
+            let cell = terminal.backend().buffer().get(rows.x + 2, rows.y);
+            (cell.fg, cell.modifier)
+        };
+
+        let (fg, modifier) = cursor_cell(Some(SectionFocus::Sessions));
+        assert_eq!(fg, Color::White);
+        assert!(
+            modifier.contains(Modifier::BOLD),
+            "the section holding the keyboard draws its cursor"
+        );
+
+        let (fg, modifier) = cursor_cell(None);
+        assert_eq!(fg, Color::White, "a session name is white either way");
+        assert!(
+            !modifier.contains(Modifier::BOLD),
+            "a surface without the keyboard draws no cursor"
+        );
     }
 
     /// Focus is carried by the cursor row, not by draining colour out of half
@@ -2605,7 +2657,7 @@ mod tests {
             .draw(|frame| {
                 // Sessions is focused, so the Agents section below it must
                 // render fully dimmed: title and icon included.
-                render_sections(frame, body, &sessions, &agents, SectionFocus::Sessions, 0);
+                render_sections(frame, body, &sessions, &agents, Some(SectionFocus::Sessions), 0);
             })
             .unwrap();
 

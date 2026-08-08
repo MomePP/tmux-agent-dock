@@ -520,9 +520,14 @@ pub(crate) fn keep_width(current: u16) {
 ///
 /// Best-effort throughout: a dock that cannot find its own pane, or whose
 /// neighbour's directory has been deleted, simply keeps the cwd it has.
-pub(crate) fn match_host_cwd() {
+///
+/// The same probe answers the other two things the dock cannot know about
+/// itself — which window it is in now, and whether it holds the keyboard — so
+/// all three cost one call between them rather than three.
+pub(crate) fn observe() -> DockContext {
+    let mut context = DockContext::default();
     let Some(dock) = crate::tmux::env_tmux_value("TMUX_PANE") else {
-        return;
+        return context;
     };
     // `-t <pane>` targets the window *containing* that pane, which is what the
     // dock needs — it has no other handle on where it currently lives.
@@ -531,14 +536,38 @@ pub(crate) fn match_host_cwd() {
         "-t",
         &dock,
         "-F",
-        "#{pane_id}\t#{pane_active}\t#{pane_current_path}",
+        "#{pane_id}\t#{pane_active}\t#{pane_current_path}\t#{window_id}",
     ]) else {
-        return;
+        return context;
     };
-    let Some(path) = host_path(&panes, &dock) else {
-        return;
-    };
-    let _ = std::env::set_current_dir(path);
+
+    context.window_id = panes
+        .lines()
+        .filter_map(|line| line.rsplit_once('\t'))
+        .map(|(_, window_id)| window_id.trim().to_owned())
+        .find(|window_id| !window_id.is_empty());
+    context.focused = panes
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            Some((fields.next()?, fields.next()?))
+        })
+        .any(|(pane_id, active)| pane_id == dock && active == "1");
+
+    if let Some(path) = host_path(&panes, &dock) {
+        let _ = std::env::set_current_dir(path);
+    }
+    context
+}
+
+/// What the dock cannot work out from inside itself.
+#[derive(Debug, Default)]
+pub(crate) struct DockContext {
+    /// The window the dock is in — which, since it follows, is the window the
+    /// client is looking at. `None` when the probe failed.
+    pub(crate) window_id: Option<String>,
+    /// Whether the dock pane holds the keyboard.
+    pub(crate) focused: bool,
 }
 
 fn host_path<'a>(panes: &'a str, dock: &str) -> Option<&'a str> {
