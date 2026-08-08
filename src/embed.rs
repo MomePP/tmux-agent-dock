@@ -67,8 +67,12 @@ pub fn embedded_session_hosts(
     // both the daemon and an open dock, and an unconditional `set-option` would
     // be a fork, an exec and a socket round trip several times a second for a
     // value that changes when a float opens or closes.
+    //
+    // Never under `cfg(test)`, for the reason `ui::mod::set_global_options`
+    // gives: a plain `cargo test` that reaches a live tmux write rewrites the
+    // developer's own server state with fixture data.
     let formatted = format_remembered(&hosts);
-    if formatted != stored.trim_end_matches('\n') {
+    if !cfg!(test) && formatted != stored.trim_end_matches('\n') {
         let _ = tmux_output(&["set-option", "-g", EMBEDDED_HOSTS_OPTION, &formatted]);
     }
     hosts
