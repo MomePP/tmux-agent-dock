@@ -392,15 +392,24 @@ fn section_row_lines(
     spinner_frame: usize,
     width: u16,
 ) -> Vec<Line<'static>> {
-    let icon = agent_status_icon(row.status, spinner_frame);
+    let status_icon = agent_status_icon(row.status, spinner_frame);
+    // An expanded session drops its dot. Every window under it is on screen
+    // carrying a dot of its own, so the session's rolled-up one says nothing
+    // new — and a filled dot beside a name whose children are all visible reads
+    // as the session itself being the busy thing. The column is still reserved,
+    // so names line up whichever way the tree is folded.
+    let icon = match row.kind {
+        RowKind::Session { expanded: true, .. } => " ".repeat(status_icon.chars().count()),
+        _ => status_icon.to_owned(),
+    };
     // The icon and the space after it are drawn as their own span, so they sit
     // outside the text budget.
     let body_width = (width as usize).saturating_sub(icon.chars().count() + 1);
-    let style = name_style(row, selected);
+    let style = name_style(row);
     // Tree glyphs and fold arrows stay grey whatever the row is doing. They are
     // chrome — they say where a row sits in the tree, not what it is — so
-    // letting the cursor's white or the attached accent wash over them made the
-    // highlight look like it covered more than the one name it means.
+    // letting the attached accent wash over them made the row look like it
+    // coloured more than the one name it means.
     let glyph = Style::default().fg(DETAIL_GRAY);
 
     let body: Vec<Span<'static>> = match &row.kind {
@@ -456,57 +465,101 @@ fn section_row_lines(
     let mut spans = vec![Span::styled(format!("{icon} "), icon_style)];
     spans.extend(body);
     let name_line = Line::from(spans);
-    if row_lines(section) < 2 {
-        return vec![name_line];
-    }
 
-    // The second line: what the entry is doing, not what it is called.
-    let detail = match &row.kind {
-        RowKind::Agent { tool, .. } => {
-            format!("{} \u{b7} {tool}", format_agent_state(row.status.state))
-        }
-        RowKind::Session { .. } | RowKind::Window { .. } => String::new(),
+    let lines = if row_lines(section) < 2 {
+        vec![name_line]
+    } else {
+        // The second line: what the entry is doing, not what it is called.
+        let detail = match &row.kind {
+            RowKind::Agent { tool, .. } => {
+                format!("{} \u{b7} {tool}", format_agent_state(row.status.state))
+            }
+            RowKind::Session { .. } | RowKind::Window { .. } => String::new(),
+        };
+        let indent = " ".repeat(icon.chars().count() + 1);
+        vec![
+            name_line,
+            Line::from(Span::styled(
+                format!("{indent}{}", truncate_ellipsis(&detail, body_width)),
+                detail_style(row),
+            )),
+        ]
     };
-    let indent = " ".repeat(icon.chars().count() + 1);
-    vec![
-        name_line,
-        Line::from(Span::styled(
-            format!("{indent}{}", truncate_ellipsis(&detail, body_width)),
-            detail_style(row),
-        )),
-    ]
+
+    if !selected {
+        return lines;
+    }
+    lines
+        .into_iter()
+        .map(|line| highlight(line, width))
+        .collect()
 }
 
-/// The colour of a row's name line, as three rules that override in order.
+/// Fills a row with [`SELECTION_BG`] to mark the cursor, keeping every
+/// foreground it already had.
 ///
-/// The Sessions tree rests at [`DETAIL_GRAY`] — session rows and window rows
-/// alike. That is what makes the other two readable: a cursor drawn as plain
-/// white, with no bold, is only a cursor if what surrounds it is not already
-/// white.
+/// The cursor used to be a colour — white over the tree's grey — which meant no
+/// other colour could also be white, and the highlight stopped where the text
+/// did. A fill says "this row" without spending a colour, and covers the whole
+/// row including the status icon, the tree glyph and the padding past the name,
+/// so it reads as one bar rather than a lit-up word.
+fn highlight(line: Line<'static>, width: u16) -> Line<'static> {
+    let used: usize = line
+        .spans
+        .iter()
+        .map(|span| span.content.chars().count())
+        .sum();
+    let mut spans: Vec<Span<'static>> = line
+        .spans
+        .into_iter()
+        .map(|span| {
+            let style = span.style.bg(SELECTION_BG);
+            Span::styled(span.content, style)
+        })
+        .collect();
+    if let Some(padding) = (width as usize).checked_sub(used).filter(|pad| *pad > 0) {
+        spans.push(Span::styled(
+            " ".repeat(padding),
+            Style::default().bg(SELECTION_BG),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// The colour of a row's name line.
+///
+/// Session names sit at plain white and the windows under them at
+/// [`DETAIL_GRAY`]. The tree is scanned by session first, so the names that
+/// anchor it are the ones that stay bright, and their windows recede into the
+/// detail they are.
+///
+/// Either takes the accent when it is where you are attached. "You are here" is
+/// said in colour rather than with a marker — the right edge belongs to the
+/// fold arrow.
 ///
 /// Agent rows keep their full-contrast name. Nothing in the Agents section is
-/// "where you are", so there is no accent to contrast against, and the cursor
-/// there stays bold — white on white would say nothing.
-fn name_style(row: &Row, selected: bool) -> Style {
-    let attached = matches!(
-        row.kind,
-        RowKind::Session { attached: true, .. } | RowKind::Window { attached: true, .. }
-    );
-
+/// "where you are", so there is no accent to contrast against.
+///
+/// Nothing here marks the cursor: that is [`SELECTION_BG`] filling the row,
+/// which leaves every colour free to keep meaning what it means under it.
+fn name_style(row: &Row) -> Style {
     match &row.kind {
-        // The window you are in, and the session holding it. "You are here" is
-        // said in the accent colour rather than with a marker — the right edge
-        // belongs to the fold arrow now — and in colour rather than weight,
-        // which the cursor has taken.
-        _ if selected && !matches!(row.kind, RowKind::Agent { .. }) => {
-            Style::default().fg(Color::White)
+        RowKind::Session { attached: true, .. } | RowKind::Window { attached: true, .. } => {
+            Style::default().fg(ACCENT)
         }
-        _ if attached => Style::default().fg(ACCENT),
-        RowKind::Session { .. } | RowKind::Window { .. } => Style::default().fg(DETAIL_GRAY),
-        RowKind::Agent { .. } if selected => Style::default().add_modifier(Modifier::BOLD),
+        RowKind::Session { .. } => Style::default().fg(Color::White),
+        RowKind::Window { .. } => Style::default().fg(DETAIL_GRAY),
         RowKind::Agent { .. } => Style::default(),
     }
 }
+
+/// The cursor's fill.
+///
+/// Lifted from `tmux/tmux.powerline.conf`'s `BORDER`, the dark neutral that
+/// config already uses for the pane borders — so the row under the cursor is
+/// filled with the same grey that frames the panes beside the sidebar, rather
+/// than a fourth guess at "subtle dark".
+const SELECTION_BG: Color = Color::Rgb(0x39, 0x39, 0x39);
 
 /// The detail line's grey.
 ///
@@ -1593,11 +1646,12 @@ mod tests {
         assert_eq!(child.len(), 1);
     }
 
-    /// The Sessions tree rests at `DarkGray` so the two colours layered over it
-    /// can be read: the accent for where you are attached, plain white for the
-    /// cursor. A white cursor is only a cursor if its surroundings are not.
+    /// Session names are white and their windows `DarkGray`, with the accent
+    /// layered over whichever row you are attached to. The cursor is no longer
+    /// one of these colours — it is a fill — so a white session name and a
+    /// selected row can now say two different things at once.
     #[test]
-    fn the_sessions_tree_is_grey_with_accent_and_white_layered_over_it() {
+    fn session_names_are_white_over_grey_windows_with_the_accent_on_top() {
         let mut card = test_card("work", "0");
         card.window_flags = "*".to_owned();
         let groups = group_cards_by_session(vec![card]);
@@ -1619,39 +1673,108 @@ mod tests {
         };
 
         // Row 0 is the session, row 1 its single window.
+        assert_eq!(
+            fg(&elsewhere[0], false).fg,
+            Some(Color::White),
+            "a session name should stay white — it anchors the tree"
+        );
+        assert_eq!(
+            fg(&elsewhere[1], false).fg,
+            Some(DETAIL_GRAY),
+            "a window row should rest at grey under its session"
+        );
+
         for (index, what) in [(0, "session"), (1, "window")] {
-            assert_eq!(
-                fg(&elsewhere[index], false).fg,
-                Some(DETAIL_GRAY),
-                "an unattached {what} row should rest at grey"
-            );
             assert_eq!(
                 fg(&attached[index], false).fg,
                 Some(ACCENT),
                 "the attached {what} row should take the accent"
             );
-            let cursor = fg(&attached[index], true);
+            // Selecting changes no foreground at all now — the accent survives
+            // the cursor sitting on it.
             assert_eq!(
-                cursor.fg,
-                Some(Color::White),
-                "the cursor should be white on a {what} row, outranking the accent"
-            );
-            assert!(
-                !cursor.add_modifier.contains(Modifier::BOLD),
-                "the cursor is colour, not weight"
-            );
-            assert!(
-                !cursor.add_modifier.contains(Modifier::REVERSED),
-                "the cursor should not paint the row's full width"
+                fg(&attached[index], true).fg,
+                Some(ACCENT),
+                "the cursor should not repaint a {what} row's name"
             );
         }
     }
 
-    /// Nothing in the Agents section is "where you are", so there is no accent
-    /// to contrast against and its names stay full contrast. The cursor there
-    /// is therefore still weight — white on white would say nothing.
+    /// The cursor is a filled row: every span of it takes `SELECTION_BG`,
+    /// including the status icon and the tree glyph, and the fill runs to the
+    /// row's full width rather than stopping where the name does.
     #[test]
-    fn agent_rows_keep_full_contrast_names_and_a_bold_cursor() {
+    fn the_cursor_fills_its_whole_row_without_changing_a_foreground() {
+        let groups = group_cards_by_session(vec![test_card("work", "0"), test_card("work", "1")]);
+        let rows = session_rows(&groups, &HashSet::from(["work".to_owned()]), None);
+
+        for (index, what) in [(0, "session"), (1, "window")] {
+            let plain = &section_row_lines(&rows[index], SectionFocus::Sessions, false, 0, 26)[0];
+            let cursor = &section_row_lines(&rows[index], SectionFocus::Sessions, true, 0, 26)[0];
+
+            assert!(
+                cursor
+                    .spans
+                    .iter()
+                    .all(|span| span.style.bg == Some(SELECTION_BG)),
+                "every span of a selected {what} row should be filled"
+            );
+            assert_eq!(
+                row_text(cursor).chars().count(),
+                26,
+                "the fill on a {what} row should reach the row's edge"
+            );
+            // Same foregrounds, span for span: only the background moved.
+            let fgs = |line: &Line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.style.fg)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                fgs(plain),
+                fgs(cursor)[..plain.spans.len()].to_vec(),
+                "selecting a {what} row should not repaint it"
+            );
+        }
+    }
+
+    /// An expanded session drops its dot: its windows are all on screen with
+    /// dots of their own. The column stays blank rather than closing up, so the
+    /// names still line up with the collapsed rows around them.
+    #[test]
+    fn an_expanded_session_drops_its_status_dot_but_keeps_the_column() {
+        let mut card = test_card("work", "0");
+        card.agent_status = AgentStatus {
+            agent: Some(AgentKind::Claude),
+            state: AgentState::Blocked,
+            seen: true,
+            run_started_at: None,
+        };
+        let groups = group_cards_by_session(vec![card]);
+
+        let collapsed = session_rows(&groups, &HashSet::new(), None);
+        let expanded = session_rows(&groups, &HashSet::from(["work".to_owned()]), None);
+
+        let icon = |rows: &[Row]| {
+            section_row_lines(&rows[0], SectionFocus::Sessions, false, 0, 26)[0].spans[0]
+                .content
+                .to_string()
+        };
+
+        assert_eq!(icon(&collapsed), "\u{25c9} ", "a collapsed session keeps it");
+        assert_eq!(icon(&expanded), "  ", "an expanded one blanks the column");
+        // The window under it still carries its own.
+        let child = &section_row_lines(&expanded[1], SectionFocus::Sessions, false, 0, 26)[0];
+        assert_eq!(child.spans[0].content.as_ref(), "\u{25c9} ");
+    }
+
+    /// Nothing in the Agents section is "where you are", so there is no accent
+    /// to contrast against and its names stay full contrast. The cursor fills
+    /// both of an agent row's lines — half a filled row reads as a rendering
+    /// bug, not as a cursor.
+    #[test]
+    fn agent_rows_keep_full_contrast_names_and_a_filled_cursor() {
         let mut card = test_card("work", "0");
         card.agent_status = AgentStatus {
             agent: Some(AgentKind::Claude),
@@ -1659,12 +1782,22 @@ mod tests {
         };
         let groups = group_cards_by_session(vec![card]);
         let rows = agent_rows(&groups);
-        let style = |selected| {
-            section_row_lines(&rows[0], SectionFocus::Agents, selected, 0, 26)[0].spans[1].style
-        };
+        let lines = |selected| section_row_lines(&rows[0], SectionFocus::Agents, selected, 0, 26);
 
-        assert_eq!(style(false).fg, None, "an agent name is not dimmed");
-        assert!(style(true).add_modifier.contains(Modifier::BOLD));
+        assert_eq!(lines(false)[0].spans[1].style.fg, None, "not dimmed");
+
+        let cursor = lines(true);
+        assert_eq!(cursor.len(), 2);
+        for (index, which) in [(0, "name"), (1, "detail")] {
+            assert!(
+                cursor[index]
+                    .spans
+                    .iter()
+                    .all(|span| span.style.bg == Some(SELECTION_BG)),
+                "the {which} line of a selected agent row should be filled"
+            );
+            assert_eq!(row_text(&cursor[index]).chars().count(), 26);
+        }
     }
 
     /// The agent row's tool name is its right-hand cell for the same reason.
