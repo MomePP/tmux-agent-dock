@@ -112,6 +112,7 @@ pub fn poll_agent_status_once(debounce: &mut HashMap<String, Debounce>) -> Resul
 
     let now = unix_timestamp();
     let live: HashSet<String> = panes.iter().map(|pane| pane.pane_id.clone()).collect();
+    let visible = visible_panes();
     // Built lazily, at most once per poll: needed whenever a pane's foreground
     // command is not itself an agent, to look for one deeper in the pane.
     let mut processes: Option<ProcessTree> = None;
@@ -151,7 +152,8 @@ pub fn poll_agent_status_once(debounce: &mut HashMap<String, Debounce>) -> Resul
             let pane_debounce = debounce
                 .entry(pane.pane_id.clone())
                 .or_insert_with(|| Debounce::new(raw));
-            debounce_state(previous, agent, raw, pane_debounce, now)
+            let status = debounce_state(previous, agent, raw, pane_debounce, now);
+            watched(status, visible.contains(pane.pane_id.as_str()))
         } else {
             debounce.remove(&pane.pane_id);
             AgentStatus::unknown()
@@ -542,6 +544,42 @@ fn write_window_status_icons(
     Ok(())
 }
 
+/// An agent that finishes while you are watching it is not something you have
+/// yet to read.
+///
+/// The done dot exists for turns that ended out of sight. Without this every
+/// agent you sit with raised one the moment it stopped, and the only way to
+/// clear it was to select the row you were already looking at.
+fn watched(status: AgentStatus, visible: bool) -> AgentStatus {
+    if visible {
+        AgentStatus { seen: true, ..status }
+    } else {
+        status
+    }
+}
+
+/// The panes on screen right now: their window is its session's current one,
+/// and something is attached to that session.
+///
+/// tmux does the filtering, so this is one call whatever the pane count. The
+/// `session_attached` half is what keeps a sidekick agent unread while its float
+/// is shut — the session is alive but nobody is looking at it.
+fn visible_panes() -> HashSet<String> {
+    tmux_output(&[
+        "list-panes",
+        "-a",
+        "-F",
+        "#{pane_id}",
+        "-f",
+        "#{&&:#{window_active},#{session_attached}}",
+    ])
+    .unwrap_or_default()
+    .lines()
+    .map(|line| line.trim().to_owned())
+    .filter(|pane_id| !pane_id.is_empty())
+    .collect()
+}
+
 pub(crate) fn mark_window_seen(window_id: &str) {
     let output =
         tmux_output(&["list-panes", "-t", window_id, "-F", "#{pane_id}"]).unwrap_or_default();
@@ -696,6 +734,37 @@ mod tests {
         assert_eq!(done.state, AgentState::Idle);
         assert!(!done.seen);
         assert_eq!(done.run_started_at, None);
+
+        // Unless you were watching it finish, in which case there is nothing
+        // left to read and the done dot never appears.
+        assert!(watched(done, true).seen);
+        assert!(!watched(done, false).seen);
+    }
+
+    /// Visibility only ever grants "seen"; it never takes it back, and it never
+    /// touches the rest of the status.
+    #[test]
+    fn watching_a_pane_marks_it_read_and_changes_nothing_else() {
+        let done = AgentStatus {
+            agent: Some(AgentKind::Claude),
+            state: AgentState::Idle,
+            seen: false,
+            run_started_at: None,
+        };
+
+        assert_eq!(
+            watched(done, true),
+            AgentStatus { seen: true, ..done },
+            "only the read flag moves"
+        );
+
+        let working = AgentStatus {
+            state: AgentState::Working,
+            seen: true,
+            run_started_at: Some(1000),
+            ..done
+        };
+        assert_eq!(watched(working, false), working);
     }
 
     #[test]
