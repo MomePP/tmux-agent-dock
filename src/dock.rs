@@ -7,6 +7,8 @@
 //! re-reads.
 
 use std::process::Command;
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::OnceLock;
 
 use anyhow::Result;
 
@@ -344,6 +346,47 @@ pub fn follow() -> Result<()> {
         unset_global(DOCK_MOVING_OPTION);
     }
     moved
+}
+
+/// Holds the dock at its configured width.
+///
+/// `move-pane -l` sets the width once, when the dock arrives, and nothing
+/// re-asserts it afterwards. tmux rescales a window's panes whenever the window
+/// itself changes size — and windows change size constantly, because each one is
+/// sized to the last client that looked at it. A 30-column dock in a window
+/// squeezed to 120 columns and back came out 41 columns wide in a direct test;
+/// on the way down it was crushed to 1. That is the sidebar the user sees
+/// "resizing by itself", wider in some windows than others.
+///
+/// The dock is the one process that always knows how wide it is — the terminal
+/// it just drew into *is* the pane — so it corrects itself rather than adding a
+/// resize hook that fires on every client event.
+///
+/// `current` is that drawn width. Best-effort: a window with no room to spare
+/// keeps whatever tmux gave it.
+pub(crate) fn keep_width(current: u16) {
+    static CONFIGURED: OnceLock<u16> = OnceLock::new();
+    static LAST_SEEN: AtomicU16 = AtomicU16::new(0);
+
+    // Only act when the width has just changed. A window too narrow to give the
+    // dock its columns would otherwise be asked to resize on every tick for
+    // ever, because the answer never becomes the one being asked for.
+    let changed = LAST_SEEN.swap(current, Ordering::Relaxed) != current;
+    let configured = *CONFIGURED.get_or_init(width);
+    if !changed || current == configured {
+        return;
+    }
+
+    let Some(pane) = crate::tmux::env_tmux_value("TMUX_PANE") else {
+        return;
+    };
+    let _ = run(&[
+        "resize-pane".to_owned(),
+        "-t".to_owned(),
+        pane,
+        "-x".to_owned(),
+        configured.to_string(),
+    ]);
 }
 
 /// Keeps the dock's own working directory matching the pane it sits beside.

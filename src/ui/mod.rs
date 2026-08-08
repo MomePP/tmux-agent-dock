@@ -1310,10 +1310,12 @@ fn run_tui_loop(
                 let navigation_height = ui.navigation_height(terminal.size()?);
                 ui.refresh_cards(cards, navigation_height);
             }
-            // Cheap, and it has to be re-done after every follow: the dock has
-            // moved to a new window with a different work pane by then.
+            // Both cheap, and both have to be re-done after every follow: the
+            // dock has moved to a new window by then, with a different work pane
+            // beside it and whatever width that window's layout gave it.
             if surface == Surface::Dock {
                 crate::dock::match_host_cwd();
+                crate::dock::keep_width(terminal.size()?.width);
             }
             last_card_refresh = now;
         }
