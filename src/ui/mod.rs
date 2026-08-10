@@ -69,12 +69,12 @@ const CARD_REFRESH_INTERVAL: Duration = Duration::from_millis(300);
 /// change. A periodic full redraw self-heals within half a second.
 const FULL_REDRAW_INTERVAL: Duration = Duration::from_millis(500);
 const TUI_TICK_INTERVAL: Duration = Duration::from_millis(50);
-const VIEW_MODE_OPTION: &str = "@tmux_agent_switcher_view";
-const INPUT_MODE_OPTION: &str = "@tmux_agent_switcher_input";
-const EXPANDED_OPTION: &str = "@tmux_agent_switcher_expanded";
+const VIEW_MODE_OPTION: &str = "@tmux_agent_dock_view";
+const INPUT_MODE_OPTION: &str = "@tmux_agent_dock_input";
+const EXPANDED_OPTION: &str = "@tmux_agent_dock_expanded";
 /// Every session the switcher had an opinion about when it last closed.
-const KNOWN_OPTION: &str = "@tmux_agent_switcher_known";
-const EXPAND_DEFAULT_OPTION: &str = "@agent_switcher_expand_default";
+const KNOWN_OPTION: &str = "@tmux_agent_dock_known";
+const EXPAND_DEFAULT_OPTION: &str = "@agent_dock_expand_default";
 
 pub fn run_tui(cards: Vec<WindowCard>) -> Result<Option<SwitcherAction>> {
     if cards.is_empty() {
@@ -132,9 +132,9 @@ pub fn run_dock(cards: Vec<WindowCard>) -> Result<()> {
 
 /// An initial list move to apply as soon as the switcher opens, so a key binding
 /// can drop the user straight into navigating (e.g. Ctrl+j opens moved one down).
-/// Driven by the `TMUX_AGENT_SWITCHER_INITIAL_MOVE` env var set by the launcher.
+/// Driven by the `TMUX_AGENT_DOCK_INITIAL_MOVE` env var set by the launcher.
 fn initial_move_direction() -> Option<Direction> {
-    match env_tmux_value("TMUX_AGENT_SWITCHER_INITIAL_MOVE").as_deref() {
+    match env_tmux_value("TMUX_AGENT_DOCK_INITIAL_MOVE").as_deref() {
         Some("down") => Some(Direction::Down),
         Some("up") => Some(Direction::Up),
         _ => None,
@@ -142,10 +142,10 @@ fn initial_move_direction() -> Option<Direction> {
 }
 
 /// The view style the switcher opens with. The launcher passes the configured
-/// (`@agent_switcher_view`) or last-toggled style via the
-/// `TMUX_AGENT_SWITCHER_VIEW` env var.
+/// (`@agent_dock_view`) or last-toggled style via the
+/// `TMUX_AGENT_DOCK_VIEW` env var.
 fn initial_view_mode() -> ViewMode {
-    env_tmux_value("TMUX_AGENT_SWITCHER_VIEW")
+    env_tmux_value("TMUX_AGENT_DOCK_VIEW")
         .as_deref()
         .and_then(parse_view_mode)
         .unwrap_or(ViewMode::Sidebar)
@@ -158,7 +158,7 @@ fn initial_view_mode() -> ViewMode {
 /// `v`, `S-tab`, `h`/`l` — against a `SwitcherUi` built from fixtures, so left
 /// ungated a plain `cargo test` rewrites the developer's own live tmux globals
 /// with fixture data. It really does: a test run set
-/// `@tmux_agent_switcher_known` to `dotfiles`, a session that exists only in
+/// `@tmux_agent_dock_known` to `dotfiles`, a session that exists only in
 /// `sections::tests::fixture`.
 fn set_global_options(pairs: &[(&str, &str)]) {
     if cfg!(test) {
@@ -183,9 +183,9 @@ fn persist_view_mode(view: ViewMode) {
 }
 
 /// The input mode the switcher opens with: the launcher passes the configured
-/// (`@agent_switcher_input`) or last-toggled mode via `TMUX_AGENT_SWITCHER_INPUT`.
+/// (`@agent_dock_input`) or last-toggled mode via `TMUX_AGENT_DOCK_INPUT`.
 fn initial_input_mode() -> InputMode {
-    env_tmux_value("TMUX_AGENT_SWITCHER_INPUT")
+    env_tmux_value("TMUX_AGENT_DOCK_INPUT")
         .as_deref()
         .and_then(parse_input_mode)
         .unwrap_or(InputMode::Keys)
@@ -207,7 +207,7 @@ fn persist_input_mode(input: InputMode) {
 /// about at all — remembered for the tmux server's lifetime the same way the
 /// view and input modes are. See [`initial_expanded_set`] for why both are
 /// needed; an empty pair simply means nothing is remembered yet, so every
-/// session follows `@agent_switcher_expand_default`.
+/// session follows `@agent_dock_expand_default`.
 fn initial_expanded() -> (HashSet<String>, HashSet<String>) {
     let read = |option| parse_expanded(&tmux_output(&["show-option", "-gqv", option]).unwrap_or_default());
     (read(EXPANDED_OPTION), read(KNOWN_OPTION))

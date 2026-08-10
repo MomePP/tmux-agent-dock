@@ -39,7 +39,7 @@ const MAX_ANCESTRY_HOPS: usize = 64;
 /// — and which therefore has no client left to trace — stays folded. One
 /// `session\tpane` per line; session names are already assumed tab-free by
 /// [`parse_clients`].
-const EMBEDDED_HOSTS_OPTION: &str = "@tmux_agent_switcher_embedded";
+const EMBEDDED_HOSTS_OPTION: &str = "@tmux_agent_dock_embedded";
 
 /// Maps each embedded session's name to the `pane_id` it is running inside.
 pub fn embedded_session_hosts(

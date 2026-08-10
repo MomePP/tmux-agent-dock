@@ -1,5 +1,5 @@
 use anyhow::Result;
-use tmux_agent_switcher::{
+use tmux_agent_dock::{
     dock_follow, dock_toggle, execute_action, load_cards, run_dock, run_status_daemon, run_tui,
 };
 

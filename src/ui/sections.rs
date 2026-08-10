@@ -271,7 +271,7 @@ fn attached_session_name(
         .map(|session| session.session_name.clone())
 }
 
-/// What a fresh tmux server starts with, from `@agent_switcher_expand_default`.
+/// What a fresh tmux server starts with, from `@agent_dock_expand_default`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
 pub(crate) enum ExpandDefault {
     /// Every session expanded — the whole tree at once, and the default. The
@@ -304,7 +304,7 @@ pub(crate) fn parse_expand_default(value: &str) -> ExpandDefault {
 /// session that is *not* in `known` is new since then, and follows `default`.
 ///
 /// Remembering only `expanded` conflated "you collapsed this" with "this did
-/// not exist yet", so `@agent_switcher_expand_default = all` never applied to a
+/// not exist yet", so `@agent_dock_expand_default = all` never applied to a
 /// session created after the first close — and a server whose remembered set
 /// had gone empty stayed fully collapsed forever, with no way back short of
 /// unsetting the option by hand.
@@ -856,7 +856,7 @@ mod tests {
         );
     }
 
-    /// `@agent_switcher_expand_default` decides what a fresh server shows.
+    /// `@agent_dock_expand_default` decides what a fresh server shows.
     #[test]
     fn the_expand_default_decides_a_fresh_servers_tree() {
         let sessions = fixture();

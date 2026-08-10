@@ -15,12 +15,12 @@ use anyhow::Result;
 
 use crate::tmux::{tmux_output, tmux_status};
 
-pub(crate) const DOCK_PANE_OPTION: &str = "@tmux_agent_switcher_dock_pane";
-pub(crate) const DOCK_MOVING_OPTION: &str = "@tmux_agent_switcher_dock_moving";
-pub(crate) const DOCK_LAYOUT_OPTION: &str = "@tmux_agent_switcher_dock_layout";
-pub(crate) const DOCK_WIDTH_OPTION: &str = "@agent_switcher_dock_width";
+pub(crate) const DOCK_PANE_OPTION: &str = "@tmux_agent_dock_pane";
+pub(crate) const DOCK_MOVING_OPTION: &str = "@tmux_agent_dock_moving";
+pub(crate) const DOCK_LAYOUT_OPTION: &str = "@tmux_agent_dock_layout";
+pub(crate) const DOCK_WIDTH_OPTION: &str = "@agent_dock_width";
 /// The outer client the dock belongs to, resolved once when it opens.
-pub(crate) const DOCK_CLIENT_OPTION: &str = "@tmux_agent_switcher_dock_client";
+pub(crate) const DOCK_CLIENT_OPTION: &str = "@tmux_agent_dock_client";
 pub(crate) const DEFAULT_DOCK_WIDTH: u16 = 30;
 
 /// Creates the dock pane on the left of `target_window`. `-d` leaves the user
@@ -317,10 +317,10 @@ pub fn toggle() -> Result<()> {
 /// Chaining the mutations also means tmux redraws once rather than after each.
 pub fn follow() -> Result<()> {
     const CLIENT_PROBE: &str = concat!(
-        "#{@tmux_agent_switcher_dock_pane}\t",
-        "#{@tmux_agent_switcher_dock_moving}\t",
-        "#{@agent_switcher_dock_width}\t",
-        "#{@tmux_agent_switcher_dock_client}"
+        "#{@tmux_agent_dock_pane}\t",
+        "#{@tmux_agent_dock_moving}\t",
+        "#{@agent_dock_width}\t",
+        "#{@tmux_agent_dock_client}"
     );
 
     // Globals only, so this is client-independent and safe to ask of whichever
@@ -736,7 +736,7 @@ mod tests {
 
     #[test]
     fn split_puts_the_dock_left_without_taking_focus() {
-        let args = split_args(30, "/opt/bin/tmux-agent-switcher", "@7");
+        let args = split_args(30, "/opt/bin/tmux-agent-dock", "@7");
 
         assert_eq!(
             args,
@@ -754,7 +754,7 @@ mod tests {
                 "#{pane_id}",
                 // `exec`, or the pane's process is the shell and the dock's
                 // directory — the one tmux names the window after — never moves.
-                "exec /opt/bin/tmux-agent-switcher dock",
+                "exec /opt/bin/tmux-agent-dock dock",
             ]
         );
     }

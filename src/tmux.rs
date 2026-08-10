@@ -128,7 +128,7 @@ fn parse_codex_hook_status(state: &str, unread: &str) -> Option<AgentStatus> {
 }
 
 pub fn current_window_id() -> Option<String> {
-    if let Some(window_id) = env_tmux_value("TMUX_AGENT_SWITCHER_CURRENT") {
+    if let Some(window_id) = env_tmux_value("TMUX_AGENT_DOCK_CURRENT") {
         return Some(window_id);
     }
 
@@ -413,15 +413,15 @@ mod tests {
 
     #[test]
     fn env_tmux_value_ignores_unexpanded_tmux_formats() {
-        std::env::set_var("TMUX_AGENT_SWITCHER_TEST_LITERAL", "#{window_id}");
-        assert_eq!(env_tmux_value("TMUX_AGENT_SWITCHER_TEST_LITERAL"), None);
+        std::env::set_var("TMUX_AGENT_DOCK_TEST_LITERAL", "#{window_id}");
+        assert_eq!(env_tmux_value("TMUX_AGENT_DOCK_TEST_LITERAL"), None);
 
-        std::env::set_var("TMUX_AGENT_SWITCHER_TEST_LITERAL", "@42");
+        std::env::set_var("TMUX_AGENT_DOCK_TEST_LITERAL", "@42");
         assert_eq!(
-            env_tmux_value("TMUX_AGENT_SWITCHER_TEST_LITERAL"),
+            env_tmux_value("TMUX_AGENT_DOCK_TEST_LITERAL"),
             Some("@42".to_owned())
         );
 
-        std::env::remove_var("TMUX_AGENT_SWITCHER_TEST_LITERAL");
+        std::env::remove_var("TMUX_AGENT_DOCK_TEST_LITERAL");
     }
 }

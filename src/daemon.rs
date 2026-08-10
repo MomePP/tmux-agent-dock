@@ -37,15 +37,15 @@ const IDLE_DEBOUNCE_POLLS: u32 = 4;
 /// state, so a single stray Working/Blocked sample can't wipe a committed "done"
 /// or restart its timer. Kept short so real work still shows promptly.
 pub(crate) const BUSY_DEBOUNCE_POLLS: u32 = 2;
-const STATUS_DAEMON_PID_OPTION: &str = "@tmux_agent_switcher_status_daemon_pid";
-const STATUS_AGENT_OPTION: &str = "@tmux_agent_switcher_agent";
-const STATUS_STATE_OPTION: &str = "@tmux_agent_switcher_state";
-pub(crate) const STATUS_SEEN_OPTION: &str = "@tmux_agent_switcher_seen";
-const STATUS_RUN_STARTED_OPTION: &str = "@tmux_agent_switcher_run_started_at";
-const STATUS_UPDATED_OPTION: &str = "@tmux_agent_switcher_updated";
-const STATUS_WINDOW_ICON_OPTION: &str = "@tmux_agent_switcher_window_icon";
-const TICK_COMMAND_OPTION: &str = "@agent_switcher_tick_command";
-const TICK_INTERVAL_OPTION: &str = "@agent_switcher_tick_interval";
+const STATUS_DAEMON_PID_OPTION: &str = "@tmux_agent_dock_status_daemon_pid";
+const STATUS_AGENT_OPTION: &str = "@tmux_agent_dock_agent";
+const STATUS_STATE_OPTION: &str = "@tmux_agent_dock_state";
+pub(crate) const STATUS_SEEN_OPTION: &str = "@tmux_agent_dock_seen";
+const STATUS_RUN_STARTED_OPTION: &str = "@tmux_agent_dock_run_started_at";
+const STATUS_UPDATED_OPTION: &str = "@tmux_agent_dock_updated";
+const STATUS_WINDOW_ICON_OPTION: &str = "@tmux_agent_dock_window_icon";
+const TICK_COMMAND_OPTION: &str = "@agent_dock_tick_command";
+const TICK_INTERVAL_OPTION: &str = "@agent_dock_tick_interval";
 const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(60);
 
 pub fn ensure_status_daemon() -> Result<()> {
@@ -122,8 +122,8 @@ pub fn run_status_daemon() -> Result<()> {
 /// lending that heartbeat out costs one option read per interval:
 ///
 /// ```text
-/// set -g @agent_switcher_tick_command '~/.tmux/plugins/tmux-continuum/scripts/continuum_save.sh'
-/// set -g @agent_switcher_tick_interval '60'   # seconds; default 60
+/// set -g @agent_dock_tick_command '~/.tmux/plugins/tmux-continuum/scripts/continuum_save.sh'
+/// set -g @agent_dock_tick_interval '60'   # seconds; default 60
 /// ```
 ///
 /// The command is started and not waited for, so a slow one cannot stall status
@@ -186,7 +186,7 @@ pub fn poll_agent_status_once(debounce: &mut HashMap<String, Debounce>) -> Resul
         "list-panes",
         "-a",
         "-F",
-        "#{pane_id}\t#{window_id}\t#{pane_active}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_title}\t#{pane_pid}\t#{@tmux_agent_switcher_agent}\t#{@tmux_agent_switcher_state}\t#{@tmux_agent_switcher_seen}\t#{@tmux_agent_switcher_run_started_at}",
+        "#{pane_id}\t#{window_id}\t#{pane_active}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_title}\t#{pane_pid}\t#{@tmux_agent_dock_agent}\t#{@tmux_agent_dock_state}\t#{@tmux_agent_dock_seen}\t#{@tmux_agent_dock_run_started_at}",
     ])?)?;
 
     let now = unix_timestamp();
@@ -586,7 +586,7 @@ fn write_window_status_icons(
         "list-windows",
         "-a",
         "-F",
-        "#{window_id}\t#{@tmux_agent_switcher_window_icon}",
+        "#{window_id}\t#{@tmux_agent_dock_window_icon}",
     ])?;
 
     for line in current.lines() {

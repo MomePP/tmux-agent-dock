@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# TPM entry point for tmux-agent-switcher.
+# TPM entry point for tmux-agent-dock.
 #
 # Binds a key that opens the agent sidebar in a full-screen tmux popup, plus
 # optional vim-aware pane/window navigation. Sourced by TPM at tmux start, so it
@@ -7,13 +7,14 @@
 # first use, from the launcher script).
 #
 # Options (set before this plugin is loaded):
-#   set -g @agent_switcher_key 'C-n'   # key that opens the sidebar (default C-n)
-#   set -g @agent_switcher_nav 'on'    # vim-aware C-h/C-j/C-k/C-l nav (default on)
-#   set -g @agent_switcher_tab_status 'on' # agent indicator in window tabs (default on)
+#   set -g @agent_dock_popup_key 'C-n'  # key that opens the popup (default C-n)
+#   set -g @agent_dock_toggle_key 'b'   # prefix key toggling the dock (default b)
+#   set -g @agent_dock_nav 'on'    # vim-aware C-h/C-j/C-k/C-l nav (default on)
+#   set -g @agent_dock_tab_status 'on' # agent indicator in window tabs (default on)
 set -euo pipefail
 
 CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-POPUP="$CURRENT_DIR/bin/tmux-agent-switcher-popup"
+POPUP="$CURRENT_DIR/bin/tmux-agent-dock-popup"
 
 tmux_option() {
   local value
@@ -27,18 +28,18 @@ if [[ -n "$version" ]]; then
   major="${version%%.*}"
   minor="${version##*.}"
   if (( major < 3 || (major == 3 && minor < 3) )); then
-    tmux display-message "tmux-agent-switcher: requires tmux >= 3.3 (found $(tmux -V))"
+    tmux display-message "tmux-agent-dock: requires tmux >= 3.3 (found $(tmux -V))"
     exit 0
   fi
 fi
 
-open_key="$(tmux_option @agent_switcher_key C-n)"
-nav="$(tmux_option @agent_switcher_nav on)"
-tab_status="$(tmux_option @agent_switcher_tab_status on)"
+open_key="$(tmux_option @agent_dock_popup_key C-n)"
+nav="$(tmux_option @agent_dock_nav on)"
+tab_status="$(tmux_option @agent_dock_tab_status on)"
 
 configure_tab_status() {
   local option="$1"
-  local marker='#{@tmux_agent_switcher_window_icon}'
+  local marker='#{@tmux_agent_dock_window_icon}'
   local current
   current="$(tmux show-option -gqv "$option")"
 
@@ -100,8 +101,8 @@ fi
 
 # --- docked sidebar -------------------------------------------------------
 # A pane, not a popup: it stays while you work and follows you between windows.
-dock_key="$(tmux_option @agent_switcher_dock_key b)"
-LAUNCHER="$CURRENT_DIR/bin/tmux-agent-switcher"
+dock_key="$(tmux_option @agent_dock_toggle_key b)"
+LAUNCHER="$CURRENT_DIR/bin/tmux-agent-dock"
 
 if [[ -n "$dock_key" ]]; then
   tmux bind-key "$dock_key" run-shell -b "$LAUNCHER dock-toggle"

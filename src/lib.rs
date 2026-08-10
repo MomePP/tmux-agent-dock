@@ -1,4 +1,4 @@
-//! tmux-agent-switcher: a tmux sidebar that switches windows and monitors
+//! tmux-agent-dock: a tmux sidebar that switches windows and monitors
 //! running AI coding agents by passive observation.
 //!
 //! Module map:

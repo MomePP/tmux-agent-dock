@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Opens the agent sidebar in a full-screen tmux popup.
 #
-# Usage: tmux-agent-switcher-popup <window_id> <session_name> [down|up]
+# Usage: tmux-agent-dock-popup <window_id> <session_name> [down|up]
 #
 # The optional direction is kept for custom bindings that want to pre-move the
 # list selection. The default tmux entrypoint opens without a pre-move so the
@@ -15,29 +15,29 @@ direction="${3:-}"
 
 # View style / input mode: the last toggled value (stored by the switcher for
 # the tmux server's lifetime) wins over the configured default.
-view="$(tmux show-option -gqv '@tmux_agent_switcher_view')"
+view="$(tmux show-option -gqv '@tmux_agent_dock_view')"
 if [[ -z "${view}" ]]; then
-  view="$(tmux show-option -gqv '@agent_switcher_view')"
+  view="$(tmux show-option -gqv '@agent_dock_view')"
 fi
-input="$(tmux show-option -gqv '@tmux_agent_switcher_input')"
+input="$(tmux show-option -gqv '@tmux_agent_dock_input')"
 if [[ -z "${input}" ]]; then
-  input="$(tmux show-option -gqv '@agent_switcher_input')"
+  input="$(tmux show-option -gqv '@agent_dock_input')"
 fi
 
 args=(
   -B -E -w 100% -h 100%
-  -e "TMUX_AGENT_SWITCHER_CURRENT=${window_id}"
-  -e "TMUX_AGENT_SWITCHER_SESSION=${session_name}"
+  -e "TMUX_AGENT_DOCK_CURRENT=${window_id}"
+  -e "TMUX_AGENT_DOCK_SESSION=${session_name}"
 )
 if [[ -n "${direction}" ]]; then
-  args+=(-e "TMUX_AGENT_SWITCHER_INITIAL_MOVE=${direction}")
+  args+=(-e "TMUX_AGENT_DOCK_INITIAL_MOVE=${direction}")
 fi
 if [[ -n "${view}" ]]; then
-  args+=(-e "TMUX_AGENT_SWITCHER_VIEW=${view}")
+  args+=(-e "TMUX_AGENT_DOCK_VIEW=${view}")
 fi
 if [[ -n "${input}" ]]; then
-  args+=(-e "TMUX_AGENT_SWITCHER_INPUT=${input}")
+  args+=(-e "TMUX_AGENT_DOCK_INPUT=${input}")
 fi
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec tmux display-popup "${args[@]}" "${script_dir}/tmux-agent-switcher"
+exec tmux display-popup "${args[@]}" "${script_dir}/tmux-agent-dock"
