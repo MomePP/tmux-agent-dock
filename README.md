@@ -4,25 +4,9 @@ A tmux sidebar that shows every session and window **and** the live state of the
 AI coding agents running in them — as a docked pane that stays open while you
 work, or as a full-screen popup.
 
-```
-┌────────────────────────────────┬───────────────────────────────────────────┐
-│ Sessions                       │                                           │
-│                                │                                           │
-│   default              5 ▾     │   your work pane, unchanged               │
-│ ○   ├─> 1: momeppkt            │                                           │
-│ ○   └─> 2: Developer           │   the dock follows you between windows    │
-│   dotfiles-config      3 ▾     │   and sessions; it is a real pane, so     │
-│ ● ● ├─> 1: .config             │   nothing is drawn over your work         │
-│ ○   └─> 2: nvim                │                                           │
-│                                │                                           │
-│ ────────────────────────────── │                                           │
-│ Agents                         │                                           │
-│                                │                                           │
-│ ● .config                      │                                           │
-│   idle · claude_1              │                                           │
-└────────────────────────────────┴───────────────────────────────────────────┘
-      prefix + b                                   Ctrl+n for the popup
-```
+![The docked sidebar: a Sessions tree and an Agents list beside a full-height work pane](assets/dock.png)
+
+*The dock on the left — every session and window, agents and their state — beside the pane you are actually working in.*
 
 > [!NOTE]
 > Detection is **fully passive** (see [How it works](#how-it-works)). The plugin
