@@ -136,9 +136,9 @@ set -g @agent_dock_toggle_key 'b'   # prefix key that toggles the dock (default:
 set -g @agent_dock_width '30'       # dock width in columns (default: 30)
 set -g @agent_dock_nav 'on'         # vim-aware C-h/C-j/C-k/C-l nav (default: on)
 set -g @agent_dock_view 'sidebar'   # 'sidebar' (left), 'sidebar-right', or 'palette'
-set -g @agent_dock_input 'keys'     # 'keys' (default) or 'search'
+set -g @agent_dock_input 'keys'     # 'keys' (default), 'search', or 'numbers' (palette only)
 set -g @agent_dock_tab_status 'on'  # show agent state in tmux window tabs
-set -g @agent_dock_expand_default 'on'  # expand sessions the first time they are seen
+set -g @agent_dock_expand_default 'all' # 'all' (default), 'attached', or 'none'
 ```
 
 Set `@agent_dock_nav 'off'` if you already bind
