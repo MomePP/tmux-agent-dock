@@ -6,6 +6,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::Path,
     process::Command,
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -47,6 +48,8 @@ const STATUS_WINDOW_ICON_OPTION: &str = "@tmux_agent_dock_window_icon";
 const TICK_COMMAND_OPTION: &str = "@agent_dock_tick_command";
 const TICK_INTERVAL_OPTION: &str = "@agent_dock_tick_interval";
 const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(60);
+/// How long a `ps -A` snapshot is reused. Four polls' worth.
+const PROCESS_TREE_MAX_AGE: Duration = Duration::from_millis(1200);
 
 pub fn ensure_status_daemon() -> Result<()> {
     let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
@@ -194,7 +197,7 @@ pub fn poll_agent_status_once(debounce: &mut HashMap<String, Debounce>) -> Resul
     let visible = visible_panes();
     // Built lazily, at most once per poll: needed whenever a pane's foreground
     // command is not itself an agent, to look for one deeper in the pane.
-    let mut processes: Option<ProcessTree> = None;
+    let mut processes: Option<Arc<ProcessTree>> = None;
 
     for pane in &mut panes {
         let previous = pane.agent_status;
@@ -210,7 +213,7 @@ pub fn poll_agent_status_once(debounce: &mut HashMap<String, Debounce>) -> Resul
             // keep the previous agent — a transient `ps` failure shouldn't drop a
             // live agent to unknown.
             None => {
-                let tree = processes.get_or_insert_with(ProcessTree::snapshot);
+                let tree = processes.get_or_insert_with(ProcessTree::cached);
                 if tree.is_empty() {
                     previous.agent
                 } else {
@@ -250,7 +253,7 @@ pub fn poll_agent_status_once(debounce: &mut HashMap<String, Debounce>) -> Resul
         "-F",
         "#{window_id}\t#{session_name}\t#{window_index}\t#{window_name}\t#{window_flags}",
     ])?)?;
-    let processes = processes.get_or_insert_with(ProcessTree::snapshot);
+    let processes = processes.get_or_insert_with(ProcessTree::cached);
     let embedded = embedded_session_hosts(&windows, &panes, processes.parents());
     write_window_status_icons(&panes, &folded_panes(&windows, &panes, &embedded))?;
 
@@ -302,6 +305,35 @@ pub(crate) struct ProcessTree {
 }
 
 impl ProcessTree {
+    /// A snapshot no older than [`PROCESS_TREE_MAX_AGE`], shared by every caller
+    /// in this process.
+    ///
+    /// `ps -A` costs ~38ms — measured, and by far the most expensive thing a
+    /// poll does. Taking one every 300ms spends an eighth of a core asking a
+    /// question whose answer barely moves: agents are started and killed by
+    /// hand, seconds apart at best. Staleness costs at most one poll's delay in
+    /// noticing an agent under a wrapper shell, against a poll loop that already
+    /// debounces state changes over four polls.
+    pub(crate) fn cached() -> Arc<Self> {
+        static CACHE: Mutex<Option<(Instant, Arc<ProcessTree>)>> = Mutex::new(None);
+
+        let mut cache = match CACHE.lock() {
+            Ok(cache) => cache,
+            // A panic in another thread poisoned it; the contents are still a
+            // valid snapshot, just possibly stale, and a fresh one follows.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some((taken, tree)) = cache.as_ref() {
+            if taken.elapsed() < PROCESS_TREE_MAX_AGE {
+                return Arc::clone(tree);
+            }
+        }
+
+        let tree = Arc::new(Self::snapshot());
+        *cache = Some((Instant::now(), Arc::clone(&tree)));
+        tree
+    }
+
     pub(crate) fn snapshot() -> Self {
         let output = Command::new("ps")
             .args(["-Ao", "pid=,ppid=,comm="])
@@ -781,6 +813,20 @@ mod tests {
     /// The heartbeat's interval comes from a tmux option, so every way a person
     /// can get that wrong has to land somewhere safe — and "0 seconds" would be
     /// a busy loop spawning processes for the life of the server.
+    /// The cache is what keeps `ps -A` off the 300ms poll. Two calls inside the
+    /// window must be the same snapshot, or the saving is imaginary.
+    #[test]
+    fn the_process_tree_is_shared_within_its_window() {
+        let first = ProcessTree::cached();
+        let second = ProcessTree::cached();
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a second caller inside the window must get the same snapshot, not a new ps"
+        );
+        assert!(!first.is_empty(), "the snapshot should have read some processes");
+    }
+
     #[test]
     fn an_unusable_tick_interval_falls_back_to_the_default() {
         assert_eq!(parse_tick_interval("15"), Duration::from_secs(15));

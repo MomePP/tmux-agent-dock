@@ -11,10 +11,10 @@ use std::{
 use anyhow::Result;
 
 use crate::{
-    daemon::{ensure_status_daemon, ProcessTree},
+    daemon::ensure_status_daemon,
     detect::detect_agent_from_process_name,
     model::format_agent_kind,
-    embed::{embedded_session_hosts, folded_panes},
+    embed::folded_panes,
     model::{
         AgentKind, AgentState, AgentStatus, FoldedAgent, SessionGroup, TmuxPane, TmuxWindow,
         WindowCard,
@@ -265,8 +265,14 @@ pub fn load_cards() -> Result<Vec<WindowCard>> {
         "-F",
         "#{pane_id}\t#{window_id}\t#{pane_active}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_title}\t#{pane_pid}\t#{@tmux_agent_dock_agent}\t#{@tmux_agent_dock_state}\t#{@tmux_agent_dock_seen}\t#{@tmux_agent_dock_run_started_at}\t#{@codex_status_state}\t#{@codex_status_unread}",
     ])?)?;
-    let processes = ProcessTree::snapshot();
-    let embedded = embedded_session_hosts(&windows, &panes, processes.parents());
+    // Read the map rather than work it out. Resolving embedded sessions needs a
+    // `ps -A` snapshot, which costs ~38ms, and the status daemon already takes
+    // one every poll and writes the answer where anyone can read it. Both
+    // processes doing it independently spent a quarter of a core between them on
+    // the same question. If the daemon is not running yet the map is empty and
+    // sidekick sessions list as peers for one poll, which is what they did
+    // before any of this existed.
+    let embedded = crate::embed::remembered_embedded();
     Ok(build_cards_with_previews(
         &windows,
         &panes,
