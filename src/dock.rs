@@ -7,9 +7,12 @@
 //! re-reads.
 
 use std::collections::HashMap;
+use std::fs;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use anyhow::Result;
 
@@ -255,6 +258,67 @@ fn restore_layout(window_id: &str) {
     ]);
 }
 
+/// Held for the length of one follow, by exactly one process.
+///
+/// A cross-session switch fires **two** hooks — `client-session-changed` and
+/// `session-window-changed` — so two `follow` processes start microseconds
+/// apart. [`DOCK_MOVING_OPTION`] cannot separate them: it is read and written as
+/// two separate tmux commands, so both read it as unset before either sets it,
+/// and both go on to move the dock. The second `move-pane` re-inserts a pane
+/// that is already where it belongs, and tmux settles that by giving the dock
+/// the space its old slot left behind. Measured on a 198-column window: the dock
+/// arrived 61 columns wide instead of 30 and was corrected a frame later, which
+/// is the flash.
+///
+/// `create_dir` is the fix because it is atomic — it succeeds for exactly one
+/// caller and fails for the rest, which no pair of tmux commands can promise.
+/// The option guard stays: it does a different job, stopping the hooks that our
+/// own `move-pane` fires from acting on it.
+struct FollowLock {
+    path: PathBuf,
+}
+
+impl FollowLock {
+    /// `None` when another follow already holds it — that caller is about to do
+    /// the same work, so there is nothing for this one to do.
+    fn acquire() -> Option<Self> {
+        Self::acquire_at(
+            std::env::temp_dir().join("tmux-agent-dock-follow.lock"),
+            STALE_LOCK_AFTER,
+        )
+    }
+
+    /// Path and threshold are parameters so the tests can exercise the takeover
+    /// without waiting out the real threshold, and without racing each other
+    /// over the one real lock.
+    fn acquire_at(path: PathBuf, stale_after: Duration) -> Option<Self> {
+        if fs::create_dir(&path).is_ok() {
+            return Some(Self { path });
+        }
+
+        // A process killed mid-follow would otherwise wedge following for the
+        // rest of the server's life. A follow is three round trips and a batch,
+        // so anything this old is dead rather than slow.
+        let stale = fs::metadata(&path)
+            .and_then(|meta| meta.modified())
+            .map(|modified| modified.elapsed().unwrap_or_default() > stale_after)
+            .unwrap_or(false);
+        if !stale {
+            return None;
+        }
+        let _ = fs::remove_dir(&path);
+        fs::create_dir(&path).ok().map(|()| Self { path })
+    }
+}
+
+impl Drop for FollowLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir(&self.path);
+    }
+}
+
+const STALE_LOCK_AFTER: Duration = Duration::from_secs(5);
+
 /// `prefix + b`: opens the dock beside the current window, or closes it.
 pub fn toggle() -> Result<()> {
     match dock_host() {
@@ -322,6 +386,12 @@ pub fn follow() -> Result<()> {
         "#{@agent_dock_width}\t",
         "#{@tmux_agent_dock_client}"
     );
+
+    // Before anything is read: two hooks fire on a cross-session switch, and the
+    // loser of this race has nothing to do that the winner is not already doing.
+    let Some(_lock) = FollowLock::acquire() else {
+        return Ok(());
+    };
 
     // Globals only, so this is client-independent and safe to ask of whichever
     // client triggered the hook.
@@ -949,6 +1019,46 @@ mod tests {
         let no_width = parse_client_views("/dev/ttys022\tsess\t@5\t%6\t\tlayout\n");
         assert_eq!(no_width[0].width, 0);
         assert!(!has_room(no_width[0].width, DEFAULT_DOCK_WIDTH));
+    }
+
+    /// The property the tmux option could not provide: with two follows racing,
+    /// exactly one proceeds. Both used to, and the second move re-inserted a
+    /// pane already in place — 61 columns instead of 30, corrected a frame later.
+    #[test]
+    fn only_one_follow_holds_the_lock_at_a_time() {
+        let path = std::env::temp_dir().join("tmux-agent-dock-follow-exclusion.test");
+        let _ = fs::remove_dir(&path);
+        let take = || FollowLock::acquire_at(path.clone(), STALE_LOCK_AFTER);
+
+        let first = take().expect("the first caller takes it");
+        assert!(
+            take().is_none(),
+            "a second follow must find it held and stand down"
+        );
+
+        drop(first);
+        let again = take().expect("released on drop, so the next one takes it");
+        drop(again);
+        assert!(!path.exists(), "dropping the lock removes it");
+    }
+
+    /// A process killed mid-follow must not wedge following for the rest of the
+    /// tmux server's life, so a lock too old to be a live follow is taken over.
+    #[test]
+    fn a_stale_lock_is_taken_over() {
+        let path = std::env::temp_dir().join("tmux-agent-dock-follow-stale.test");
+        let _ = fs::remove_dir(&path);
+        fs::create_dir(&path).expect("plant an abandoned lock");
+
+        // Fresh: left alone, because a live follow is only a few round trips.
+        assert!(FollowLock::acquire_at(path.clone(), STALE_LOCK_AFTER).is_none());
+
+        // With a zero threshold the same lock is old enough: taken over.
+        let stolen = FollowLock::acquire_at(path.clone(), Duration::ZERO)
+            .expect("a stale lock should be taken over");
+        drop(stolen);
+
+        assert!(!path.exists(), "dropping the lock removes it");
     }
 
     #[test]
