@@ -108,6 +108,19 @@ if [[ -n "$dock_key" ]]; then
   tmux bind-key "$dock_key" run-shell -b "$LAUNCHER dock-toggle"
 fi
 
+# The hooks run the binary directly when there is one, rather than the launcher.
+#
+# The launcher is a bash script that finds, downloads or builds the binary before
+# exec'ing it — right for an interactive open, pure overhead on a hook. Measured:
+# 40ms through the launcher against 20ms straight to the binary. That time is the
+# destination window being drawn *without* the sidebar, before the follow moves it
+# in, so every millisecond of it is on screen.
+#
+# Falls back to the launcher when nothing is built yet, so a fresh install still
+# works; the next config reload picks the binary up.
+FOLLOWER="$CURRENT_DIR/target/release/tmux-agent-dock"
+[[ -x "$FOLLOWER" ]] || FOLLOWER="$LAUNCHER"
+
 # Hooks are arrays. Writing at a reserved index is idempotent across the config
 # reloads that re-run this file, and leaves any other plugin's entry at another
 # index alone — a plain `set-hook -g` would replace it silently.
@@ -115,5 +128,5 @@ fi
 # `session-window-changed` covers prefix+n, select-window and tree mode;
 # `client-session-changed` covers session switches. tmux has no
 # `after-switch-client` hook, so that pair is the whole surface.
-tmux set-hook -g "session-window-changed[50]" "run-shell -b '$LAUNCHER dock-follow'"
-tmux set-hook -g "client-session-changed[50]" "run-shell -b '$LAUNCHER dock-follow'"
+tmux set-hook -g "session-window-changed[50]" "run-shell -b '$FOLLOWER dock-follow'"
+tmux set-hook -g "client-session-changed[50]" "run-shell -b '$FOLLOWER dock-follow'"
