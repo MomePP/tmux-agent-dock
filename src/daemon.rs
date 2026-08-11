@@ -50,6 +50,9 @@ const TICK_INTERVAL_OPTION: &str = "@agent_dock_tick_interval";
 const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(60);
 /// How long a `ps -A` snapshot is reused. Four polls' worth.
 const PROCESS_TREE_MAX_AGE: Duration = Duration::from_millis(1200);
+/// The cadence once nothing has changed for a while, and how long that is.
+const IDLE_DAEMON_INTERVAL: Duration = Duration::from_millis(1000);
+const QUIET_POLLS_BEFORE_BACKOFF: u32 = 20;
 
 pub fn ensure_status_daemon() -> Result<()> {
     let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
@@ -65,6 +68,46 @@ pub fn ensure_status_daemon() -> Result<()> {
     tmux_status(Command::new("tmux").args(["run-shell", "-b", &command]))
 }
 
+/// How fast the poll loop runs, which is not a constant because the answer is
+/// almost always "nothing happened".
+///
+/// Polling every 300ms costs the same whether three agents are mid-run or the
+/// machine has been idle since lunch, and idle is most of the day. Backing off
+/// to a second between polls when nothing has moved for a while cuts that
+/// steady-state cost roughly threefold.
+///
+/// The first change snaps it straight back to fast, so nothing waits on the slow
+/// cadence twice. That matters more than the backoff itself: the debounce
+/// windows are counted in *polls*, so a settle that takes four polls would take
+/// four seconds at the slow rate. It only ever counts them at the fast one,
+/// because any sample that differs is itself a change.
+struct Pace {
+    interval: Duration,
+    quiet_polls: u32,
+}
+
+impl Pace {
+    fn new() -> Self {
+        Self {
+            interval: STATUS_DAEMON_INTERVAL,
+            quiet_polls: 0,
+        }
+    }
+
+    fn after(&mut self, changed: bool) -> Duration {
+        if changed {
+            self.quiet_polls = 0;
+            self.interval = STATUS_DAEMON_INTERVAL;
+        } else {
+            self.quiet_polls = self.quiet_polls.saturating_add(1);
+            if self.quiet_polls >= QUIET_POLLS_BEFORE_BACKOFF {
+                self.interval = IDLE_DAEMON_INTERVAL;
+            }
+        }
+        self.interval
+    }
+}
+
 pub fn run_status_daemon() -> Result<()> {
     let pid = std::process::id().to_string();
     tmux_status(Command::new("tmux").args([
@@ -78,17 +121,18 @@ pub fn run_status_daemon() -> Result<()> {
     let mut debounce: HashMap<String, Debounce> = HashMap::new();
     let mut ownership_check = 0;
     let mut tick = Tick::new();
+    let mut pace = Pace::new();
     loop {
         if ownership_check == 0 && current_status_daemon_pid() != pid {
             break;
         }
         ownership_check = (ownership_check + 1) % STATUS_DAEMON_OWNERSHIP_CHECK_POLLS;
 
-        if poll_agent_status_once(&mut debounce).is_err() {
+        let Ok(changed) = poll_agent_status_once(&mut debounce) else {
             break;
-        }
+        };
         tick.run_if_due();
-        thread::sleep(STATUS_DAEMON_INTERVAL);
+        thread::sleep(pace.after(changed));
     }
 
     // Relinquish the option only while it is still ours. A daemon that lost the
@@ -184,7 +228,9 @@ fn tmux_option(name: &str) -> String {
         .to_owned()
 }
 
-pub fn poll_agent_status_once(debounce: &mut HashMap<String, Debounce>) -> Result<()> {
+/// Returns whether any pane's status actually changed, which is what the loop
+/// paces itself on — see [`Pace`].
+pub fn poll_agent_status_once(debounce: &mut HashMap<String, Debounce>) -> Result<bool> {
     let mut panes = parse_panes(&tmux_output(&[
         "list-panes",
         "-a",
@@ -195,6 +241,7 @@ pub fn poll_agent_status_once(debounce: &mut HashMap<String, Debounce>) -> Resul
     let now = unix_timestamp();
     let live: HashSet<String> = panes.iter().map(|pane| pane.pane_id.clone()).collect();
     let visible = visible_panes();
+    let mut changed = false;
     // Built lazily, at most once per poll: needed whenever a pane's foreground
     // command is not itself an agent, to look for one deeper in the pane.
     let mut processes: Option<Arc<ProcessTree>> = None;
@@ -241,6 +288,7 @@ pub fn poll_agent_status_once(debounce: &mut HashMap<String, Debounce>) -> Resul
             AgentStatus::unknown()
         };
         write_agent_status(&pane.pane_id, previous, next)?;
+        changed |= next != previous;
         pane.agent_status = next;
     }
 
@@ -258,7 +306,7 @@ pub fn poll_agent_status_once(debounce: &mut HashMap<String, Debounce>) -> Resul
     write_window_status_icons(&panes, &folded_panes(&windows, &panes, &embedded))?;
 
     debounce.retain(|pane_id, _| live.contains(pane_id));
-    Ok(())
+    Ok(changed)
 }
 
 fn current_status_daemon_pid() -> String {
@@ -815,6 +863,33 @@ mod tests {
     /// a busy loop spawning processes for the life of the server.
     /// The cache is what keeps `ps -A` off the 300ms poll. Two calls inside the
     /// window must be the same snapshot, or the saving is imaginary.
+    /// The property that keeps the backoff safe: one change snaps straight back
+    /// to the fast cadence. Without it the debounce windows, which are counted
+    /// in polls, would stretch to seconds at the slow rate.
+    #[test]
+    fn the_pace_backs_off_when_quiet_and_snaps_back_on_the_first_change() {
+        let mut pace = Pace::new();
+
+        // Quiet, but not for long enough yet.
+        for _ in 0..QUIET_POLLS_BEFORE_BACKOFF - 1 {
+            assert_eq!(pace.after(false), STATUS_DAEMON_INTERVAL);
+        }
+        assert_eq!(
+            pace.after(false),
+            IDLE_DAEMON_INTERVAL,
+            "quiet for long enough, so back off"
+        );
+        assert_eq!(pace.after(false), IDLE_DAEMON_INTERVAL, "and stay there");
+
+        assert_eq!(
+            pace.after(true),
+            STATUS_DAEMON_INTERVAL,
+            "one change is enough to go fast again, immediately"
+        );
+        // And the count restarts, so it does not fall back after a single poll.
+        assert_eq!(pace.after(false), STATUS_DAEMON_INTERVAL);
+    }
+
     #[test]
     fn the_process_tree_is_shared_within_its_window() {
         let first = ProcessTree::cached();
