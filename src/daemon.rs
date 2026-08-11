@@ -53,8 +53,35 @@ const PROCESS_TREE_MAX_AGE: Duration = Duration::from_millis(1200);
 /// The cadence once nothing has changed for a while, and how long that is.
 const IDLE_DAEMON_INTERVAL: Duration = Duration::from_millis(1000);
 const QUIET_POLLS_BEFORE_BACKOFF: u32 = 20;
+/// How often a switcher re-confirms the daemon is alive.
+const DAEMON_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Checked on a timer, not on every card refresh.
+///
+/// The dock asks three times a second and the answer changes about once a day:
+/// the daemon is running, or it is not. Each check is two round trips — an
+/// option read and a `ps` — which was a third of the dock's per-tick work spent
+/// re-confirming something that was true 300ms ago. A daemon that dies is now
+/// noticed within [`DAEMON_CHECK_INTERVAL`] rather than immediately, against a
+/// poll loop whose whole job is to keep running.
+///
+/// The first call in a process always checks, so an opening dock or popup still
+/// starts one at once.
 pub fn ensure_status_daemon() -> Result<()> {
+    static LAST_CHECK: Mutex<Option<Instant>> = Mutex::new(None);
+
+    let mut last = match LAST_CHECK.lock() {
+        Ok(last) => last,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(checked) = *last {
+        if checked.elapsed() < DAEMON_CHECK_INTERVAL {
+            return Ok(());
+        }
+    }
+    *last = Some(Instant::now());
+    drop(last);
+
     let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
     let pid = current_status_daemon_pid();
     if !pid.is_empty() && status_daemon_process_matches(&pid, &current_exe) {
