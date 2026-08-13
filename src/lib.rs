@@ -43,7 +43,7 @@ pub use cards::{
     build_cards, build_cards_with_previews, codex_unread_dir, codex_unread_file,
     group_cards_by_session, load_cards,
 };
-pub use daemon::{ensure_status_daemon, poll_agent_status_once, run_status_daemon, Debounce};
+pub use daemon::{ensure_status_daemon, poll_agent_status_once, run_status_daemon, Debounce, Poll};
 pub use detect::{detect_agent_from_process_name, detect_agent_state};
 pub use dock::{follow as dock_follow, toggle as dock_toggle};
 pub use embed::embedded_session_hosts;

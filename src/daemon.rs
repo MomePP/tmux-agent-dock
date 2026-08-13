@@ -58,6 +58,9 @@ const TAB_STATUS_MAX_AGE: Duration = Duration::from_secs(30);
 /// The cadence once nothing has changed for a while, and how long that is.
 const IDLE_DAEMON_INTERVAL: Duration = Duration::from_millis(1000);
 const QUIET_POLLS_BEFORE_BACKOFF: u32 = 20;
+/// The cadence when no pane holds an agent at all. Also the longest an agent can
+/// go unnoticed after it starts, which is why it isn't longer.
+const DORMANT_DAEMON_INTERVAL: Duration = Duration::from_millis(5000);
 /// How often a switcher re-confirms the daemon is alive.
 const DAEMON_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -113,6 +116,14 @@ pub fn ensure_status_daemon() -> Result<()> {
 /// windows are counted in *polls*, so a settle that takes four polls would take
 /// four seconds at the slow rate. It only ever counts them at the fast one,
 /// because any sample that differs is itself a change.
+///
+/// With no agent anywhere the loop drops further still, and without waiting out
+/// the quiet count: there is no state to miss, only an agent's *arrival* to
+/// notice, and that is one appearing process rather than a run that could start
+/// and finish between two polls. What it cannot do is stop, however long the
+/// quiet lasts — a dock that opens on an idle pane is only correct because the
+/// daemon watched it go idle, and the tick this daemon lends out (session saves,
+/// for one) has no other heartbeat to ride.
 struct Pace {
     interval: Duration,
     quiet_polls: u32,
@@ -126,10 +137,12 @@ impl Pace {
         }
     }
 
-    fn after(&mut self, changed: bool) -> Duration {
-        if changed {
+    fn after(&mut self, poll: Poll) -> Duration {
+        if poll.changed {
             self.quiet_polls = 0;
             self.interval = STATUS_DAEMON_INTERVAL;
+        } else if !poll.agents {
+            self.interval = DORMANT_DAEMON_INTERVAL;
         } else {
             self.quiet_polls = self.quiet_polls.saturating_add(1);
             if self.quiet_polls >= QUIET_POLLS_BEFORE_BACKOFF {
@@ -160,11 +173,11 @@ pub fn run_status_daemon() -> Result<()> {
         }
         ownership_check = (ownership_check + 1) % STATUS_DAEMON_OWNERSHIP_CHECK_POLLS;
 
-        let Ok(changed) = poll_agent_status_once(&mut debounce) else {
+        let Ok(poll) = poll_agent_status_once(&mut debounce) else {
             break;
         };
         tick.run_if_due();
-        thread::sleep(pace.after(changed));
+        thread::sleep(pace.after(poll));
     }
 
     // Relinquish the option only while it is still ours. A daemon that lost the
@@ -289,9 +302,17 @@ fn tmux_option(name: &str) -> String {
         .to_owned()
 }
 
-/// Returns whether any pane's status actually changed, which is what the loop
+/// What a poll learned besides the statuses it wrote, which is what the loop
 /// paces itself on — see [`Pace`].
-pub fn poll_agent_status_once(debounce: &mut HashMap<String, Debounce>) -> Result<bool> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Poll {
+    /// Any pane's status differs from the one already cached.
+    pub changed: bool,
+    /// Some pane holds an agent, whatever it is doing.
+    pub agents: bool,
+}
+
+pub fn poll_agent_status_once(debounce: &mut HashMap<String, Debounce>) -> Result<Poll> {
     let mut panes = parse_panes(&tmux_output(&[
         "list-panes",
         "-a",
@@ -303,6 +324,7 @@ pub fn poll_agent_status_once(debounce: &mut HashMap<String, Debounce>) -> Resul
     let live: HashSet<String> = panes.iter().map(|pane| pane.pane_id.clone()).collect();
     let visible = visible_panes();
     let mut changed = false;
+    let mut agents = false;
     // Built lazily, at most once per poll: needed whenever a pane's foreground
     // command is not itself an agent, to look for one deeper in the pane.
     let mut processes: Option<Arc<ProcessTree>> = None;
@@ -329,6 +351,7 @@ pub fn poll_agent_status_once(debounce: &mut HashMap<String, Debounce>) -> Resul
                 }
             }
         };
+        agents |= agent.is_some();
         let next = if let Some(agent) = agent {
             let raw = detect_agent_state_from_title(agent, &pane.pane_title).unwrap_or_else(|| {
                 let evidence = AgentEvidence {
@@ -376,7 +399,7 @@ pub fn poll_agent_status_once(debounce: &mut HashMap<String, Debounce>) -> Resul
     }
 
     debounce.retain(|pane_id, _| live.contains(pane_id));
-    Ok(changed)
+    Ok(Poll { changed, agents })
 }
 
 fn current_status_daemon_pid() -> String {
@@ -936,28 +959,83 @@ mod tests {
     /// The property that keeps the backoff safe: one change snaps straight back
     /// to the fast cadence. Without it the debounce windows, which are counted
     /// in polls, would stretch to seconds at the slow rate.
+    /// A poll that saw an agent sitting still.
+    const QUIET: Poll = Poll {
+        changed: false,
+        agents: true,
+    };
+    /// A poll that saw one move.
+    const MOVED: Poll = Poll {
+        changed: true,
+        agents: true,
+    };
+    /// A poll that found no agent anywhere.
+    const EMPTY: Poll = Poll {
+        changed: false,
+        agents: false,
+    };
+
     #[test]
     fn the_pace_backs_off_when_quiet_and_snaps_back_on_the_first_change() {
         let mut pace = Pace::new();
 
         // Quiet, but not for long enough yet.
         for _ in 0..QUIET_POLLS_BEFORE_BACKOFF - 1 {
-            assert_eq!(pace.after(false), STATUS_DAEMON_INTERVAL);
+            assert_eq!(pace.after(QUIET), STATUS_DAEMON_INTERVAL);
         }
         assert_eq!(
-            pace.after(false),
+            pace.after(QUIET),
             IDLE_DAEMON_INTERVAL,
             "quiet for long enough, so back off"
         );
-        assert_eq!(pace.after(false), IDLE_DAEMON_INTERVAL, "and stay there");
+        assert_eq!(pace.after(QUIET), IDLE_DAEMON_INTERVAL, "and stay there");
 
         assert_eq!(
-            pace.after(true),
+            pace.after(MOVED),
             STATUS_DAEMON_INTERVAL,
             "one change is enough to go fast again, immediately"
         );
         // And the count restarts, so it does not fall back after a single poll.
-        assert_eq!(pace.after(false), STATUS_DAEMON_INTERVAL);
+        assert_eq!(pace.after(QUIET), STATUS_DAEMON_INTERVAL);
+    }
+
+    /// Nothing to watch is a stronger statement than nothing happening, so it
+    /// does not wait out the quiet count — and an agent appearing is itself a
+    /// change, which is what brings the loop straight back.
+    #[test]
+    fn the_pace_goes_dormant_with_no_agents_and_wakes_when_one_appears() {
+        let mut pace = Pace::new();
+
+        assert_eq!(
+            pace.after(EMPTY),
+            DORMANT_DAEMON_INTERVAL,
+            "no agents, so drop to dormant at once rather than after 20 polls"
+        );
+        assert_eq!(pace.after(EMPTY), DORMANT_DAEMON_INTERVAL, "and stay there");
+
+        assert_eq!(
+            pace.after(MOVED),
+            STATUS_DAEMON_INTERVAL,
+            "an agent showing up is a change, and changes always go fast"
+        );
+        assert_eq!(
+            pace.after(QUIET),
+            STATUS_DAEMON_INTERVAL,
+            "a settled agent holds the fast cadence for the debounce windows"
+        );
+    }
+
+    /// The dormant cadence bounds how long an agent can start unnoticed, and the
+    /// debounce windows are counted in polls at the fast cadence. Both stop
+    /// being true if these drift.
+    #[test]
+    fn the_cadences_stay_ordered() {
+        assert!(STATUS_DAEMON_INTERVAL < IDLE_DAEMON_INTERVAL);
+        assert!(IDLE_DAEMON_INTERVAL < DORMANT_DAEMON_INTERVAL);
+        assert!(
+            DORMANT_DAEMON_INTERVAL <= Duration::from_secs(5),
+            "an agent should never wait longer than this to be seen"
+        );
     }
 
     #[test]
