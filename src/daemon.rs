@@ -45,11 +45,16 @@ pub(crate) const STATUS_SEEN_OPTION: &str = "@tmux_agent_dock_seen";
 const STATUS_RUN_STARTED_OPTION: &str = "@tmux_agent_dock_run_started_at";
 const STATUS_UPDATED_OPTION: &str = "@tmux_agent_dock_updated";
 const STATUS_WINDOW_ICON_OPTION: &str = "@tmux_agent_dock_window_icon";
+const TAB_STATUS_OPTION: &str = "@agent_dock_tab_status";
 const TICK_COMMAND_OPTION: &str = "@agent_dock_tick_command";
 const TICK_INTERVAL_OPTION: &str = "@agent_dock_tick_interval";
 const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(60);
 /// How long a `ps -A` snapshot is reused. Four polls' worth.
 const PROCESS_TREE_MAX_AGE: Duration = Duration::from_millis(1200);
+/// How long the `@agent_dock_tab_status` answer is reused. The option is set
+/// once at config load and read on a loop, so this is cheap to keep fresh;
+/// flipping it takes effect within the interval rather than needing a restart.
+const TAB_STATUS_MAX_AGE: Duration = Duration::from_secs(30);
 /// The cadence once nothing has changed for a while, and how long that is.
 const IDLE_DAEMON_INTERVAL: Duration = Duration::from_millis(1000);
 const QUIET_POLLS_BEFORE_BACKOFF: u32 = 20;
@@ -248,6 +253,35 @@ fn parse_tick_interval(value: &str) -> Duration {
         .unwrap_or(DEFAULT_TICK_INTERVAL)
 }
 
+/// Whether the per-window agent indicators are wanted, cached for
+/// [`TAB_STATUS_MAX_AGE`] so the poll loop doesn't ask tmux the same question
+/// three times a second.
+fn window_icons_wanted() -> bool {
+    static CACHE: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
+
+    let mut cache = match CACHE.lock() {
+        Ok(cache) => cache,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some((read, wanted)) = *cache {
+        if read.elapsed() < TAB_STATUS_MAX_AGE {
+            return wanted;
+        }
+    }
+
+    let wanted = tab_status_enabled(&tmux_option(TAB_STATUS_OPTION));
+    *cache = Some((Instant::now(), wanted));
+    wanted
+}
+
+/// Mirrors what `tmux-agent-dock.tmux` does with the same option: unset means
+/// on, and only a literal `on` keeps it on. Reading it any other way would let
+/// the daemon write icons the tab format was never taught to show.
+fn tab_status_enabled(value: &str) -> bool {
+    let value = value.trim();
+    value.is_empty() || value == "on"
+}
+
 fn tmux_option(name: &str) -> String {
     tmux_output(&["show-option", "-gqv", name])
         .unwrap_or_default()
@@ -322,15 +356,24 @@ pub fn poll_agent_status_once(debounce: &mut HashMap<String, Debounce>) -> Resul
     // The status line reads these per window, so an embedded session's agent has
     // to be attributed to the window hosting it — nothing else shows the window
     // it actually runs in.
-    let windows = parse_windows(&tmux_output(&[
-        "list-windows",
-        "-a",
-        "-F",
-        "#{window_id}\t#{session_name}\t#{window_index}\t#{window_name}\t#{window_flags}",
-    ])?)?;
-    let processes = processes.get_or_insert_with(ProcessTree::cached);
-    let embedded = embedded_session_hosts(&windows, &panes, processes.parents());
-    write_window_status_icons(&panes, &folded_panes(&windows, &panes, &embedded))?;
+    //
+    // All of it is skipped when the tab indicators are off, because then nothing
+    // renders `@tmux_agent_dock_window_icon` and the work is invisible by
+    // construction. It is not small work: two `list-windows -a` (one here, one
+    // inside the writer) plus a `ps -A` that no pane asked for, every poll, for
+    // the life of the tmux server. Skipping it roughly halves the daemon's
+    // per-poll subprocess count on a config that doesn't want the icons.
+    if window_icons_wanted() {
+        let windows = parse_windows(&tmux_output(&[
+            "list-windows",
+            "-a",
+            "-F",
+            "#{window_id}\t#{session_name}\t#{window_index}\t#{window_name}\t#{window_flags}",
+        ])?)?;
+        let processes = processes.get_or_insert_with(ProcessTree::cached);
+        let embedded = embedded_session_hosts(&windows, &panes, processes.parents());
+        write_window_status_icons(&panes, &folded_panes(&windows, &panes, &embedded))?;
+    }
 
     debounce.retain(|pane_id, _| live.contains(pane_id));
     Ok(changed)
@@ -927,6 +970,19 @@ mod tests {
             "a second caller inside the window must get the same snapshot, not a new ps"
         );
         assert!(!first.is_empty(), "the snapshot should have read some processes");
+    }
+
+    /// The shell half of the plugin only turns the indicators on for a literal
+    /// `on`, defaulting an unset option to it. The daemon has to agree, or it
+    /// writes icons into a tab format that never reads them.
+    #[test]
+    fn tab_status_matches_what_the_tmux_script_does_with_the_option() {
+        assert!(tab_status_enabled(""), "unset means on");
+        assert!(tab_status_enabled("on"));
+        assert!(tab_status_enabled("  on  "));
+        assert!(!tab_status_enabled("off"));
+        assert!(!tab_status_enabled("yes"), "only `on` is on, as in the script");
+        assert!(!tab_status_enabled("On"));
     }
 
     #[test]
