@@ -61,9 +61,9 @@ pub(crate) fn detect_agent_state_from_title(agent: AgentKind, title: &str) -> Op
     let title = title.trim();
     match agent {
         AgentKind::Codex if title.contains("Action Required") => Some(AgentState::Blocked),
-        AgentKind::Codex if starts_with_braille_status(title) => Some(AgentState::Working),
+        AgentKind::Codex if starts_with_spinner_status(title) => Some(AgentState::Working),
         AgentKind::Codex if !title.is_empty() => Some(AgentState::Idle),
-        AgentKind::Claude if starts_with_braille_status(title) => Some(AgentState::Working),
+        AgentKind::Claude if starts_with_spinner_status(title) => Some(AgentState::Working),
         // OpenCode's title is a static session label ("OpenCode" or "OC | …")
         // and does not encode activity, so always fall through to screen-tail
         // detection for it.
@@ -92,7 +92,7 @@ fn detect_codex_state(evidence: &AgentEvidence) -> AgentState {
         return AgentState::Blocked;
     }
 
-    if starts_with_braille_status(title) {
+    if starts_with_spinner_status(title) {
         return AgentState::Working;
     }
 
@@ -122,8 +122,8 @@ fn detect_claude_state(evidence: &AgentEvidence) -> AgentState {
         return AgentState::Blocked;
     }
 
-    // Working: Claude prefixes its OSC title with a braille spinner while active.
-    if starts_with_braille_status(title) {
+    // Working: Claude prefixes its OSC title with a spinner frame while active.
+    if starts_with_spinner_status(title) {
         return AgentState::Working;
     }
 
@@ -230,10 +230,23 @@ fn recent_screen(text: &str, lines: usize) -> String {
     all[start..].join("\n")
 }
 
-fn starts_with_braille_status(value: &str) -> bool {
+/// A title that opens with a spinner frame and a space, which is how both Codex
+/// and Claude Code say "still working" in the one place that costs nothing to
+/// read.
+///
+/// The frame is whatever glyph the agent's spinner happens to animate, and that
+/// is not a stable interface: Claude Code used braille (`⠋ …`) and now cycles
+/// the quarter-filled circles (`◐ ◑ ◒ ◓`), which silently pinned every Claude
+/// pane to Idle — the dock showed a finished tick while the agent was mid-run,
+/// because nothing else in the Claude path ever votes Working. Both sets count,
+/// and a new one showing up looks exactly like this again.
+fn starts_with_spinner_status(value: &str) -> bool {
     let mut chars = value.chars();
-    matches!(chars.next(), Some(ch) if ('\u{2800}'..='\u{28ff}').contains(&ch))
-        && matches!(chars.next(), Some(' '))
+    matches!(chars.next(), Some(ch) if is_spinner_frame(ch)) && matches!(chars.next(), Some(' '))
+}
+
+fn is_spinner_frame(ch: char) -> bool {
+    matches!(ch, '\u{2800}'..='\u{28ff}' | '\u{25d0}'..='\u{25d3}')
 }
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
@@ -354,6 +367,36 @@ mod tests {
         assert_eq!(
             detect_agent_state_from_title(AgentKind::OpenCode, "OC | working or idle"),
             None
+        );
+    }
+
+    /// Captured off a live Claude Code pane mid-run: the title spinner is no
+    /// longer braille. Matching only the old frames read every working Claude as
+    /// idle, and the dock showed a green tick for an agent that was still going.
+    #[test]
+    fn the_quarter_circle_spinner_is_a_working_title_too() {
+        for title in ["◐ Optimize sidebar performance", "◑ x", "◒ x", "◓ x"] {
+            assert_eq!(
+                detect_agent_state_from_title(AgentKind::Claude, title),
+                Some(AgentState::Working),
+                "{title:?} should read as working"
+            );
+        }
+
+        // Still only a *leading* frame followed by a space — a circle anywhere
+        // else in the title is just text.
+        assert_eq!(
+            detect_agent_state_from_title(AgentKind::Claude, "◐fix"),
+            None
+        );
+        assert_eq!(
+            detect_agent_state_from_title(AgentKind::Claude, "review ◐ this"),
+            None
+        );
+        assert_eq!(
+            detect_agent_state_from_title(AgentKind::Claude, "✳ review this"),
+            None,
+            "the idle marker must not be mistaken for a spinner frame"
         );
     }
 
