@@ -376,25 +376,26 @@ pub fn poll_agent_status_once(debounce: &mut HashMap<String, Debounce>) -> Resul
         pane.agent_status = next;
     }
 
-    // The status line reads these per window, so an embedded session's agent has
-    // to be attributed to the window hosting it — nothing else shows the window
-    // it actually runs in.
-    //
-    // All of it is skipped when the tab indicators are off, because then nothing
-    // renders `@tmux_agent_dock_window_icon` and the work is invisible by
-    // construction. It is not small work: two `list-windows -a` (one here, one
-    // inside the writer) plus a `ps -A` that no pane asked for, every poll, for
-    // the life of the tmux server. Skipping it roughly halves the daemon's
-    // per-poll subprocess count on a config that doesn't want the icons.
+    // Resolving embedded sessions is not optional work, however little of the UI
+    // is switched on: `embedded_session_hosts` is what *writes*
+    // `@tmux_agent_dock_embedded`, and that memory is the only thing that still
+    // folds a sidekick session once its float is shut and its client is gone.
+    // The daemon is the only writer that runs while the dock is closed, which is
+    // exactly when a float is opened, used and closed.
+    let windows = parse_windows(&tmux_output(&[
+        "list-windows",
+        "-a",
+        "-F",
+        "#{window_id}\t#{session_name}\t#{window_index}\t#{window_name}\t#{window_flags}",
+    ])?)?;
+    let processes = processes.get_or_insert_with(ProcessTree::cached);
+    let embedded = embedded_session_hosts(&windows, &panes, processes.parents());
+
+    // Writing the per-window icons *is* optional: with the tab indicators off
+    // nothing renders `@tmux_agent_dock_window_icon`, so the second
+    // `list-windows -a` inside the writer and the `set-option` per changed
+    // window are invisible by construction.
     if window_icons_wanted() {
-        let windows = parse_windows(&tmux_output(&[
-            "list-windows",
-            "-a",
-            "-F",
-            "#{window_id}\t#{session_name}\t#{window_index}\t#{window_name}\t#{window_flags}",
-        ])?)?;
-        let processes = processes.get_or_insert_with(ProcessTree::cached);
-        let embedded = embedded_session_hosts(&windows, &panes, processes.parents());
         write_window_status_icons(&panes, &folded_panes(&windows, &panes, &embedded))?;
     }
 
