@@ -128,7 +128,7 @@ set -g @agent_dock_expand_default 'all' # 'all' (default), 'attached', or 'none'
 Set `@agent_dock_nav 'off'` if you already bind
 <kbd>Ctrl</kbd>+<kbd>h/j/k/l</kbd> yourself. Set `@agent_dock_tab_status 'off'`
 to leave tmux's window status formats untouched — which also stops the daemon
-computing the per-window icons, about half its work on every poll.
+writing the per-window icons nothing would render.
 
 ### Borrowing the daemon's heartbeat
 
