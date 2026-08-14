@@ -1,17 +1,31 @@
 #!/usr/bin/env bash
 # Opens the agent sidebar in a full-screen tmux popup.
 #
-# Usage: tmux-agent-dock-popup <window_id> <session_name> [down|up]
+# Usage: tmux-agent-dock-popup <window_id> <session_name> [down|up] [--view <mode>]
 #
 # The optional direction is kept for custom bindings that want to pre-move the
 # list selection. The default tmux entrypoint opens without a pre-move so the
 # current window remains selected. window_id/session_name are passed in already
 # expanded by tmux so the popup highlights the window the key was pressed from.
+#
+# `--view` pins one opening to a layout, so a binding can mean "the palette"
+# rather than "whatever the last toggle left behind". Without it the stored and
+# configured view still decide, as before.
 set -euo pipefail
 
-window_id="${1:-}"
-session_name="${2:-}"
-direction="${3:-}"
+view_override=""
+positional=()
+while (( $# )); do
+  case "$1" in
+    --view) view_override="${2:-}"; shift 2 ;;
+    --view=*) view_override="${1#--view=}"; shift ;;
+    *) positional+=("$1"); shift ;;
+  esac
+done
+
+window_id="${positional[0]:-}"
+session_name="${positional[1]:-}"
+direction="${positional[2]:-}"
 
 # View style / input mode: the last toggled value (stored by the switcher for
 # the tmux server's lifetime) wins over the configured default.
@@ -22,6 +36,11 @@ fi
 input="$(tmux show-option -gqv '@tmux_agent_dock_input')"
 if [[ -z "${input}" ]]; then
   input="$(tmux show-option -gqv '@agent_dock_input')"
+fi
+
+# An explicit --view outranks both, so the key that asked for a palette gets one.
+if [[ -n "${view_override}" ]]; then
+  view="${view_override}"
 fi
 
 args=(
