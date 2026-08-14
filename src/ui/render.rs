@@ -5,7 +5,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
     Frame,
 };
 
@@ -85,18 +85,23 @@ pub(crate) fn draw(
     if surface == Surface::Popup {
         render_selected_preview(frame, layout.preview, preview);
         frame.render_widget(Clear, layout.list_overlay);
-        // The palette is a solid float in the snacks.nvim sense: its edge is the
-        // cleared cells around the content, not a drawn rule. The sidebar views
-        // keep theirs — there the line is not decoration but the seam between
-        // the list column and the preview beside it.
-        if view != ViewMode::Palette {
-            frame.render_widget(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .style(Style::default().fg(Color::DarkGray)),
-                layout.list_overlay,
-            );
-        }
+        // Cleared cells alone did not read as a float — with a preview behind it
+        // the palette needs a drawn edge to say it is on top of something. It is
+        // rounded where the sidebar views are square: theirs is a seam against
+        // the preview beside them, of a piece with the pane divider, while the
+        // palette's is the outline of a card lying over the screen.
+        let border_type = if view == ViewMode::Palette {
+            BorderType::Rounded
+        } else {
+            BorderType::Plain
+        };
+        frame.render_widget(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(border_type)
+                .style(Style::default().fg(Color::DarkGray)),
+            layout.list_overlay,
+        );
         render_modal_top_bar(frame, layout.list_overlay);
     }
     render_search_bar(frame, layout.search, query, input, view);
@@ -1388,18 +1393,16 @@ mod tests {
         // The preview fills the screen behind the palette, from the top-left.
         assert_eq!(buffer.get(0, 0).symbol(), "p");
         // The palette floats centered, bottom edge anchored above mid-screen,
-        // and draws no rule around itself: its corners are cleared cells, which
-        // is what makes it read as a solid float rather than a framed one.
-        for (x, y) in [(22, 16), (76, 16), (22, 21), (76, 21)] {
+        // inside a rounded rule — square would read as a pane seam, and no rule
+        // at all did not read as floating over the preview behind it.
+        for ((x, y), corner) in [((22, 16), "╭"), ((76, 16), "╮"), ((22, 21), "╰"), ((76, 21), "╯")]
+        {
             assert_eq!(
                 buffer.get(x, y).symbol(),
-                " ",
-                "palette corner ({x},{y}) should be blank, not a border glyph"
+                corner,
+                "palette corner at ({x},{y})"
             );
         }
-        // ...and the cleared edge really is covering the preview, rather than
-        // letting it show through where a border used to be.
-        assert_eq!(buffer.get(23, 21).symbol(), " ");
         // List content on top: session header, then window row.
         assert_eq!(buffer.get(23, 17).symbol(), "w");
         assert_eq!(buffer.get(24, 18).symbol(), "0");
