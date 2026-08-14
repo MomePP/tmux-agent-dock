@@ -90,10 +90,9 @@ pub fn run_tui(cards: Vec<WindowCard>) -> Result<Option<SwitcherAction>> {
     // Capture the mouse so wheel scrolls drive the list instead of tmux
     // scrolling (and redrawing) whatever sits behind the popup.
     //
-    // `Hide` goes in the same write as the switch. Entering the alternate screen
-    // clears it and homes the cursor, and until the first frame lands that
-    // cursor is the only thing on an empty screen — the visible half of the
-    // "it blinks when I press the key" report.
+    // `Hide` goes in the same write as the switch: entering the alternate screen
+    // clears it and homes the cursor, so until the first frame lands that cursor
+    // is the only thing on an empty screen.
     execute!(stdout, EnterAlternateScreen, Hide, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -1398,15 +1397,11 @@ fn run_tui_loop(
     let mut last_card_refresh = Instant::now();
     let mut last_full_redraw = Instant::now();
     let mut preview = PreviewMirror::default();
-    // The first pass draws before it captures anything.
-    //
-    // Entering the alternate screen clears the terminal, and the popup's first
-    // preview is a full-screen `capture-pane` — so the old order put a tmux
-    // round trip between the clear and the first frame, and the screen sat empty
-    // for it. The list is already in hand by then and needs nothing from tmux,
-    // so it can be on screen immediately; the preview fills in one tick later
-    // (`TUI_TICK_INTERVAL`), which reads as the box filling rather than the
-    // screen blanking.
+    // The first pass draws before it captures anything. Entering the alternate
+    // screen clears the terminal and the popup's first preview is a full-screen
+    // `capture-pane`, so capturing first leaves a tmux round trip's worth of
+    // empty screen between the two. The list needs nothing from tmux and can be
+    // on screen at once; the preview fills a tick later.
     let mut first_pass = true;
 
     loop {

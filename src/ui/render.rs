@@ -85,11 +85,10 @@ pub(crate) fn draw(
     if surface == Surface::Popup {
         render_selected_preview(frame, layout.preview, preview);
         frame.render_widget(Clear, layout.list_overlay);
-        // Cleared cells alone did not read as a float — with a preview behind it
-        // the palette needs a drawn edge to say it is on top of something. It is
-        // rounded where the sidebar views are square: theirs is a seam against
-        // the preview beside them, of a piece with the pane divider, while the
-        // palette's is the outline of a card lying over the screen.
+        // Rounded for the palette, square for the sidebar views. The sidebar's
+        // rule is a seam against the preview beside it, of a piece with the pane
+        // divider; the palette's is the outline of a card lying over the screen,
+        // and without one it does not read as floating at all.
         let border_type = if view == ViewMode::Palette {
             BorderType::Rounded
         } else {
@@ -1393,8 +1392,7 @@ mod tests {
         // The preview fills the screen behind the palette, from the top-left.
         assert_eq!(buffer.get(0, 0).symbol(), "p");
         // The palette floats centered, bottom edge anchored above mid-screen,
-        // inside a rounded rule — square would read as a pane seam, and no rule
-        // at all did not read as floating over the preview behind it.
+        // inside a rounded rule — square there would read as a pane seam.
         for ((x, y), corner) in [((22, 16), "╭"), ((76, 16), "╮"), ((22, 21), "╰"), ((76, 21), "╯")]
         {
             assert_eq!(
