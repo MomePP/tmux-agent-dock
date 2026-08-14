@@ -29,14 +29,18 @@ direction="${positional[2]:-}"
 
 # View style / input mode: the last toggled value (stored by the switcher for
 # the tmux server's lifetime) wins over the configured default.
-view="$(tmux show-option -gqv '@tmux_agent_dock_view')"
-if [[ -z "${view}" ]]; then
-  view="$(tmux show-option -gqv '@agent_dock_view')"
-fi
-input="$(tmux show-option -gqv '@tmux_agent_dock_input')"
-if [[ -z "${input}" ]]; then
-  input="$(tmux show-option -gqv '@agent_dock_input')"
-fi
+#
+# Read in one round trip rather than four. Every `tmux` invocation here sits
+# between the keypress and the popup's first frame, and the popup is *blank*
+# until that frame lands — so each round trip is 7ms of visible flash. Measured
+# on 3.7b: four `show-option` calls cost 30ms, this one costs 8ms.
+IFS='|' read -r stored_view configured_view stored_input configured_input <<<"$(
+  tmux display-message -p \
+    '#{@tmux_agent_dock_view}|#{@agent_dock_view}|#{@tmux_agent_dock_input}|#{@agent_dock_input}'
+)" || true
+
+view="${stored_view:-${configured_view}}"
+input="${stored_input:-${configured_input}}"
 
 # An explicit --view outranks both, so the key that asked for a palette gets one.
 if [[ -n "${view_override}" ]]; then
@@ -44,7 +48,11 @@ if [[ -n "${view_override}" ]]; then
 fi
 
 args=(
-  -B -E -w 100% -h 100%
+  # `-s bg=default` is what keeps the opening from flashing: a popup is drawn
+  # the moment tmux creates it, but the TUI's first frame is ~50ms later, and in
+  # between it is a solid rectangle in the popup's own colour. Painting it in the
+  # terminal's background instead makes that gap invisible rather than a flash.
+  -B -E -w 100% -h 100% -s bg=default
   -e "TMUX_AGENT_DOCK_CURRENT=${window_id}"
   -e "TMUX_AGENT_DOCK_SESSION=${session_name}"
 )
