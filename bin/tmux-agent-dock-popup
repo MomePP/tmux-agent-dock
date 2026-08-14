@@ -47,12 +47,24 @@ if [[ -n "${view_override}" ]]; then
   view="${view_override}"
 fi
 
+# A popup that covers the whole client makes tmux repaint the whole client to
+# open it, and on a terminal with a background image that repaint is the flash.
+# Measured by hand: `display-popup -E -w 100% -h 100% 'sleep 2'` flashes with no
+# program output at all, and the same popup at 60% does not.
+#
+# The sidebar views earn the full screen — their preview is the other half of
+# the layout. The palette does not: it is a floating list, so it takes a popup
+# its own size and leaves the screen alone.
+if [[ "${view}" == "palette" ]]; then
+  size=(-w 80 -h 60%)
+else
+  size=(-w 100% -h 100%)
+fi
+
 args=(
-  # `-s bg=default` is what keeps the opening from flashing: a popup is drawn
-  # the moment tmux creates it, but the TUI's first frame is ~50ms later, and in
-  # between it is a solid rectangle in the popup's own colour. Painting it in the
-  # terminal's background instead makes that gap invisible rather than a flash.
-  -B -E -w 100% -h 100% -s bg=default
+  # `-s bg=default` paints the popup in the terminal's own background, so the
+  # gap before the TUI's first frame is invisible rather than a lit rectangle.
+  -B -E "${size[@]}" -s bg=default
   -e TMUX_AGENT_DOCK_NO_STALE_CHECK=1
   -e "TMUX_AGENT_DOCK_CURRENT=${window_id}"
   -e "TMUX_AGENT_DOCK_SESSION=${session_name}"
