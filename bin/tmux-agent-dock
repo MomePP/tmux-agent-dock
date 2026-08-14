@@ -17,6 +17,12 @@ unset NO_COLOR
 sources_newer() {
   # True when the checked-out sources are newer than the compiled binary
   # (a developer edited the crate, or `git pull` brought a new version).
+  #
+  # This walks the source tree on the path between a keypress and the switcher's
+  # first frame — 12ms measured on a warm cache, spent while the popup is open
+  # and blank. `TMUX_AGENT_DOCK_NO_STALE_CHECK=1` skips it for people who build
+  # deliberately and would rather have the frame.
+  [[ -z "${TMUX_AGENT_DOCK_NO_STALE_CHECK:-}" ]] || return 1
   find "$repo_dir/src" "$repo_dir/Cargo.toml" -newer "$binary" -print -quit 2>/dev/null | grep -q .
 }
 

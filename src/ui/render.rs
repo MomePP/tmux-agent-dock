@@ -85,12 +85,18 @@ pub(crate) fn draw(
     if surface == Surface::Popup {
         render_selected_preview(frame, layout.preview, preview);
         frame.render_widget(Clear, layout.list_overlay);
-        frame.render_widget(
-            Block::default()
-                .borders(Borders::ALL)
-                .style(Style::default().fg(Color::DarkGray)),
-            layout.list_overlay,
-        );
+        // The palette is a solid float in the snacks.nvim sense: its edge is the
+        // cleared cells around the content, not a drawn rule. The sidebar views
+        // keep theirs — there the line is not decoration but the seam between
+        // the list column and the preview beside it.
+        if view != ViewMode::Palette {
+            frame.render_widget(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .style(Style::default().fg(Color::DarkGray)),
+                layout.list_overlay,
+            );
+        }
         render_modal_top_bar(frame, layout.list_overlay);
     }
     render_search_bar(frame, layout.search, query, input, view);
@@ -963,7 +969,10 @@ fn render_modal_top_bar(frame: &mut Frame, area: Rect) {
         truncate_chars(HELP_LABEL, inner_width)
     };
     let left_budget = inner_width.saturating_sub(right.chars().count());
-    let left = truncate_chars(SWITCHER_NAME, left_budget);
+    // Padded on both sides: against a drawn border the name used to sit flush
+    // against the corner rule, and on the palette's borderless edge it wants the
+    // same breathing room the rest of the float has.
+    let left = truncate_chars(&format!(" {SWITCHER_NAME} "), left_budget);
 
     frame.render_widget(
         Paragraph::new(left.clone()).style(
@@ -1251,6 +1260,11 @@ mod tests {
         assert!(modal_top.contains("agent-switcher"));
         assert!(!footer.contains("agent-switcher"));
         assert!(!footer.contains("j/k=window"));
+        // The sidebar keeps its rule. Dropping it here would erase the seam
+        // between the list column and the preview beside it, which is the one
+        // place the border is structural rather than decorative.
+        assert_eq!(buffer.get(0, 0).symbol(), "┌");
+        assert_eq!(buffer.get(0, 39).symbol(), "└");
     }
 
     #[test]
@@ -1373,22 +1387,33 @@ mod tests {
         let buffer = terminal.backend().buffer();
         // The preview fills the screen behind the palette, from the top-left.
         assert_eq!(buffer.get(0, 0).symbol(), "p");
-        // The palette floats centered, bottom edge anchored above mid-screen.
-        assert_eq!(buffer.get(22, 14).symbol(), "┌");
-        assert_eq!(buffer.get(76, 14).symbol(), "┐");
-        assert_eq!(buffer.get(22, 21).symbol(), "└");
-        assert_eq!(buffer.get(76, 21).symbol(), "┘");
+        // The palette floats centered, bottom edge anchored above mid-screen,
+        // and draws no rule around itself: its corners are cleared cells, which
+        // is what makes it read as a solid float rather than a framed one.
+        for (x, y) in [(22, 16), (76, 16), (22, 21), (76, 21)] {
+            assert_eq!(
+                buffer.get(x, y).symbol(),
+                " ",
+                "palette corner ({x},{y}) should be blank, not a border glyph"
+            );
+        }
+        // ...and the cleared edge really is covering the preview, rather than
+        // letting it show through where a border used to be.
+        assert_eq!(buffer.get(23, 21).symbol(), " ");
         // List content on top: session header, then window row.
-        assert_eq!(buffer.get(24, 16).symbol(), "w");
-        assert_eq!(buffer.get(25, 17).symbol(), "0");
+        assert_eq!(buffer.get(23, 17).symbol(), "w");
+        assert_eq!(buffer.get(24, 18).symbol(), "0");
         // Search bar at the bottom: separator rule, then the prompt.
-        assert_eq!(buffer.get(24, 18).symbol(), "─");
-        assert_eq!(buffer.get(24, 19).symbol(), "❯");
+        assert_eq!(buffer.get(23, 19).symbol(), "─");
+        assert_eq!(buffer.get(23, 20).symbol(), "❯");
 
         let box_top = (22..77)
-            .map(|x| buffer.get(x, 14).symbol())
+            .map(|x| buffer.get(x, 16).symbol())
             .collect::<String>();
-        assert!(box_top.contains("agent-switcher"));
+        assert!(
+            box_top.contains(" agent-switcher "),
+            "the title carries a space each side: {box_top:?}"
+        );
     }
 
     #[test]

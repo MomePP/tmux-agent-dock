@@ -53,6 +53,7 @@ args=(
   # between it is a solid rectangle in the popup's own colour. Painting it in the
   # terminal's background instead makes that gap invisible rather than a flash.
   -B -E -w 100% -h 100% -s bg=default
+  -e TMUX_AGENT_DOCK_NO_STALE_CHECK=1
   -e "TMUX_AGENT_DOCK_CURRENT=${window_id}"
   -e "TMUX_AGENT_DOCK_SESSION=${session_name}"
 )

@@ -9,6 +9,19 @@ const SIDEBAR_WIDTH_PERCENT: u16 = 25;
 const SIDEBAR_MIN_WIDTH: u16 = 28;
 const SIDEBAR_MAX_WIDTH: u16 = 64;
 pub(crate) const FLOATING_LIST_INSET: u16 = 2;
+/// The palette's inset. One cell, not two: with no border drawn there is no
+/// rule for the content to stand off from, so the second cell reads as a gap
+/// above the first session rather than as padding.
+const PALETTE_LIST_INSET: u16 = 1;
+
+/// Cells between a floating list's edge and its content, which differs by view
+/// only because only some views draw a border to sit inside of.
+fn list_inset(view: ViewMode) -> u16 {
+    match view {
+        ViewMode::Palette => PALETTE_LIST_INSET,
+        _ => FLOATING_LIST_INSET,
+    }
+}
 const PALETTE_WIDTH_PERCENT: u16 = 55;
 const PALETTE_MIN_WIDTH: u16 = 44;
 const PALETTE_MAX_WIDTH: u16 = 80;
@@ -75,7 +88,7 @@ pub(crate) fn switcher_layout(
     };
     // Bottom-up inside the box: search prompt at the very bottom (fzf-style),
     // help above it, the session list on top.
-    let list = inset_rect(list_overlay, FLOATING_LIST_INSET);
+    let list = inset_rect(list_overlay, list_inset(view));
     let search_height = list.height.min(SEARCH_BAR_ROWS);
     let body_height = list.height.saturating_sub(search_height);
     let help_height = if show_help {
@@ -153,7 +166,7 @@ fn palette_overlay(area: Rect, show_help: bool, line_count: usize) -> Rect {
         PALETTE_MAX_WIDTH.min(area.width),
     );
     let anchor_bottom = percentage_length(area.height, PALETTE_BOTTOM_PERCENT);
-    let inset = FLOATING_LIST_INSET.saturating_mul(2);
+    let inset = PALETTE_LIST_INSET.saturating_mul(2);
     let help_height = if show_help { HELP_LINE_COUNT } else { 0 };
     // At least one body row so the "no matching windows" hint has a home.
     let height = (line_count.max(1).min(u16::MAX as usize) as u16)
@@ -348,21 +361,23 @@ mod tests {
         let layout = switcher_layout(area, false, ViewMode::Palette, 2);
 
         assert_eq!(layout.preview, area);
+        // One cell of inset, not two: the palette draws no border, so content
+        // starts directly under the row carrying the title.
         assert_eq!(
             layout.list_overlay,
             Rect {
                 x: 22,
-                y: 14,
+                y: 16,
                 width: 55,
-                height: 8,
+                height: 6,
             }
         );
         assert_eq!(
             layout.sessions,
             Rect {
-                x: 24,
-                y: 16,
-                width: 51,
+                x: 23,
+                y: 17,
+                width: 53,
                 height: 2,
             }
         );
@@ -370,11 +385,19 @@ mod tests {
         assert_eq!(
             layout.search,
             Rect {
-                x: 24,
-                y: 18,
-                width: 51,
+                x: 23,
+                y: 19,
+                width: 53,
                 height: 2,
             }
+        );
+        // The bottom edge is still the anchor — the box lost two rows off its
+        // top, not off the prompt, which is what keeps the prompt still while
+        // the list grows and shrinks.
+        assert_eq!(
+            layout.list_overlay.y + layout.list_overlay.height,
+            22,
+            "bottom edge stays at 55% of the height"
         );
     }
 
@@ -392,7 +415,9 @@ mod tests {
         // Capped one row below the bottom anchor (55% of 40 = 22).
         assert_eq!(layout.list_overlay.height, 21);
         assert_eq!(layout.list_overlay.y, 1);
-        assert_eq!(layout.sessions.height, 15);
+        // Two rows of inset became one, so the capped box spends two fewer rows
+        // on padding and two more on the list.
+        assert_eq!(layout.sessions.height, 17);
     }
 
     #[test]
