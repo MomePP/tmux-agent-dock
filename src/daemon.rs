@@ -50,6 +50,20 @@ const STATUS_WINDOW_ICON_OPTION: &str = "@tmux_agent_dock_window_icon";
 const STATUS_WINDOW_AGENTS_OPTION: &str = "@tmux_agent_dock_window_agents";
 /// The agents running in the window, named — `claude`, or `claude codex`.
 const STATUS_WINDOW_CLI_OPTION: &str = "@tmux_agent_dock_window_cli";
+/// The same dots at a constant *visible* width, for a status line's left or
+/// right section.
+///
+/// Those sections cannot carry anything that changes width. With
+/// `status-justify centre` tmux centres the window list in the space between
+/// them, so a field that grows by a column when an agent starts drags the whole
+/// middle sideways — and it cannot be fixed in the format either, because
+/// tmux's `#{pN:}` counts `#[...]` style tags toward its budget and the dots
+/// carry one tag pair per dot. Padding has to happen where the visible width is
+/// known, which is here.
+const STATUS_WINDOW_AGENTS_FIXED_OPTION: &str = "@tmux_agent_dock_window_agents_fixed";
+/// Dots shown in the fixed-width field, and so also the width it pads to:
+/// `AGENTS_FIXED_SLOTS` glyphs with a space between each.
+const AGENTS_FIXED_SLOTS: usize = 3;
 const TAB_STATUS_OPTION: &str = "@agent_dock_tab_status";
 const TICK_COMMAND_OPTION: &str = "@agent_dock_tick_command";
 const TICK_INTERVAL_OPTION: &str = "@agent_dock_tick_interval";
@@ -398,7 +412,7 @@ pub fn poll_agent_status_once(debounce: &mut HashMap<String, Debounce>) -> Resul
         "-F",
         "#{window_id}\t#{session_name}\t#{window_index}\t#{window_name}\t#{window_flags}\
          \t#{@tmux_agent_dock_window_icon}\t#{@tmux_agent_dock_window_agents}\
-         \t#{@tmux_agent_dock_window_cli}",
+         \t#{@tmux_agent_dock_window_agents_fixed}\t#{@tmux_agent_dock_window_cli}",
     ])?;
     let windows = parse_windows(&windows_output)?;
     let current = parse_window_status(&windows_output);
@@ -758,7 +772,8 @@ pub(crate) fn window_statuses(
                 } else {
                     String::new()
                 },
-                agents: agent_dots(&statuses),
+                agents: agent_dots(&statuses, None),
+                agents_fixed: agent_dots(&statuses, Some(AGENTS_FIXED_SLOTS)),
                 cli: agent_names(&statuses),
             };
             (window_id.to_owned(), status)
@@ -771,8 +786,12 @@ pub(crate) fn window_statuses(
 /// Not the rollup the tab icon uses: a window running two agents is exactly the
 /// case a single glyph cannot describe, and the status line has the room to say
 /// "one of these is working and the other wants you".
-fn agent_dots(statuses: &[AgentStatus]) -> String {
-    statuses
+/// With `slots`, the result is padded — and truncated — to exactly that many
+/// glyphs, separators included, so it can sit in a status-line edge without
+/// moving what is beside it. A window past the cap loses its quietest dots
+/// first: the ones that would have been shown are the ones that want you.
+fn agent_dots(statuses: &[AgentStatus], slots: Option<usize>) -> String {
+    let mut dots: Vec<&str> = statuses
         .iter()
         .filter(|status| status.agent.is_some())
         .map(|status| match status.state {
@@ -782,8 +801,24 @@ fn agent_dots(statuses: &[AgentStatus]) -> String {
             AgentState::Idle => "#[fg=green]✓#[default]",
             AgentState::Unknown => "#[fg=colour8]○#[default]",
         })
-        .collect::<Vec<_>>()
-        .join(" ")
+        .collect();
+
+    let Some(slots) = slots else {
+        return dots.join(" ");
+    };
+
+    dots.truncate(slots);
+    let padding = slots.saturating_sub(dots.len());
+    let mut rendered = dots.join(" ");
+    if padding > 0 {
+        if !rendered.is_empty() {
+            rendered.push(' ');
+        }
+        // Two columns per missing dot — the glyph and the space that would have
+        // followed it — less the trailing space the field does not need.
+        rendered.push_str(&" ".repeat(padding * 2 - 1));
+    }
+    rendered
 }
 
 /// The distinct agents in the window, in first-seen order — two `claude` clones
@@ -825,6 +860,8 @@ pub(crate) struct WindowStatus {
     pub(crate) icon: String,
     /// One dot per agent, in pane order.
     pub(crate) agents: String,
+    /// The same dots, padded to a constant visible width.
+    pub(crate) agents_fixed: String,
     /// The agents by name, deduplicated: `claude`, or `claude codex`.
     pub(crate) cli: String,
 }
@@ -846,7 +883,8 @@ pub(crate) fn parse_window_status(output: &str) -> HashMap<String, WindowStatus>
                 WindowStatus {
                     icon: field(5),
                     agents: field(6),
-                    cli: field(7),
+                    agents_fixed: field(7),
+                    cli: field(8),
                 },
             ))
         })
@@ -869,6 +907,10 @@ fn write_window_status(
         for (option, value) in [
             (STATUS_WINDOW_ICON_OPTION, &desired_status.icon),
             (STATUS_WINDOW_AGENTS_OPTION, &desired_status.agents),
+            (
+                STATUS_WINDOW_AGENTS_FIXED_OPTION,
+                &desired_status.agents_fixed,
+            ),
             (STATUS_WINDOW_CLI_OPTION, &desired_status.cli),
         ] {
             let mut args = vec!["set-option", "-w"];
@@ -1064,7 +1106,7 @@ mod tests {
     #[test]
     fn window_status_columns_parse_and_tolerate_short_rows() {
         let parsed = parse_window_status(
-            "@1\tsession\t1\tname\tflags\ticon\tdots\tclaude\n\
+            "@1\tsession\t1\tname\tflags\ticon\tdots\tfixed\tclaude\n\
              @2\tsession\t2\tname\tflags\n",
         );
 
@@ -1073,10 +1115,58 @@ mod tests {
             Some(&WindowStatus {
                 icon: "icon".to_owned(),
                 agents: "dots".to_owned(),
+                agents_fixed: "fixed".to_owned(),
                 cli: "claude".to_owned(),
             })
         );
         assert_eq!(parsed.get("@2"), Some(&WindowStatus::default()));
+    }
+
+    /// A status-line edge cannot carry a field that changes width, so this one
+    /// is the same number of columns whatever the window is doing. Measured
+    /// with the style tags stripped, which is what the terminal shows.
+    #[test]
+    fn the_fixed_dots_field_is_one_width_whatever_is_running() {
+        let visible = |rendered: &str| {
+            let mut out = String::new();
+            let mut rest = rendered;
+            while let Some(start) = rest.find("#[") {
+                out.push_str(&rest[..start]);
+                let end = rest[start..].find(']').map(|at| start + at + 1).unwrap();
+                rest = &rest[end..];
+            }
+            out.push_str(rest);
+            out.chars().count()
+        };
+
+        let working = AgentStatus {
+            agent: Some(AgentKind::Claude),
+            state: AgentState::Working,
+            seen: true,
+            run_started_at: None,
+        };
+        let idle = AgentStatus::unknown();
+        let expected = AGENTS_FIXED_SLOTS * 2 - 1;
+
+        for count in 0..=AGENTS_FIXED_SLOTS + 2 {
+            let statuses = vec![working; count];
+            let rendered = agent_dots(&statuses, Some(AGENTS_FIXED_SLOTS));
+            assert_eq!(
+                visible(&rendered),
+                expected,
+                "{count} agents rendered {rendered:?}, which is not {expected} columns"
+            );
+        }
+
+        // A pane with no agent contributes no dot, so a window full of shells
+        // still pads rather than collapsing.
+        assert_eq!(
+            visible(&agent_dots(&[idle, idle], Some(AGENTS_FIXED_SLOTS))),
+            expected
+        );
+        // Unpadded, the same input is exactly as wide as it needs to be — that
+        // is the variant the window list uses.
+        assert!(agent_dots(&[idle, idle], None).is_empty());
     }
 
     #[test]
