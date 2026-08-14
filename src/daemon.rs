@@ -45,6 +45,11 @@ pub(crate) const STATUS_SEEN_OPTION: &str = "@tmux_agent_dock_seen";
 const STATUS_RUN_STARTED_OPTION: &str = "@tmux_agent_dock_run_started_at";
 const STATUS_UPDATED_OPTION: &str = "@tmux_agent_dock_updated";
 const STATUS_WINDOW_ICON_OPTION: &str = "@tmux_agent_dock_window_icon";
+/// One dot per agent in the window, for a status line that wants to say what is
+/// happening where you are rather than everywhere at once.
+const STATUS_WINDOW_AGENTS_OPTION: &str = "@tmux_agent_dock_window_agents";
+/// The agents running in the window, named — `claude`, or `claude codex`.
+const STATUS_WINDOW_CLI_OPTION: &str = "@tmux_agent_dock_window_cli";
 const TAB_STATUS_OPTION: &str = "@agent_dock_tab_status";
 const TICK_COMMAND_OPTION: &str = "@agent_dock_tick_command";
 const TICK_INTERVAL_OPTION: &str = "@agent_dock_tick_interval";
@@ -382,22 +387,29 @@ pub fn poll_agent_status_once(debounce: &mut HashMap<String, Debounce>) -> Resul
     // folds a sidekick session once its float is shut and its client is gone.
     // The daemon is the only writer that runs while the dock is closed, which is
     // exactly when a float is opened, used and closed.
-    let windows = parse_windows(&tmux_output(&[
+    // The window options this poll may rewrite are read back in the same call
+    // that lists the windows. `split_tmux_fields` takes "at least" its field
+    // count, so the extra columns cost nothing but the bytes — where a second
+    // `list-windows -a` to diff against would cost a round trip per poll for
+    // the life of the server.
+    let windows_output = tmux_output(&[
         "list-windows",
         "-a",
         "-F",
-        "#{window_id}\t#{session_name}\t#{window_index}\t#{window_name}\t#{window_flags}",
-    ])?)?;
+        "#{window_id}\t#{session_name}\t#{window_index}\t#{window_name}\t#{window_flags}\
+         \t#{@tmux_agent_dock_window_icon}\t#{@tmux_agent_dock_window_agents}\
+         \t#{@tmux_agent_dock_window_cli}",
+    ])?;
+    let windows = parse_windows(&windows_output)?;
+    let current = parse_window_status(&windows_output);
     let processes = processes.get_or_insert_with(ProcessTree::cached);
     let embedded = embedded_session_hosts(&windows, &panes, processes.parents());
 
-    // Writing the per-window icons *is* optional: with the tab indicators off
-    // nothing renders `@tmux_agent_dock_window_icon`, so the second
-    // `list-windows -a` inside the writer and the `set-option` per changed
-    // window are invisible by construction.
-    if window_icons_wanted() {
-        write_window_status_icons(&panes, &folded_panes(&windows, &panes, &embedded))?;
-    }
+    write_window_status(
+        &panes,
+        &folded_panes(&windows, &panes, &embedded),
+        &current,
+    )?;
 
     debounce.retain(|pane_id, _| live.contains(pane_id));
     Ok(Poll { changed, agents })
@@ -715,10 +727,18 @@ fn status_option_updates(
     updates
 }
 
-fn window_status_icons(
+/// Everything a window has to say about its agents, derived once from the panes
+/// already in hand.
+///
+/// The embedded agents are folded in with their host's window, for the reason
+/// [`crate::embed`] exists: a sidekick session runs inside a Neovim pane, and
+/// the window a user thinks it belongs to is that pane's, not the top-level
+/// session tmux reports it as.
+pub(crate) fn window_statuses(
     panes: &[TmuxPane],
     folded: &HashMap<&str, Vec<&TmuxPane>>,
-) -> HashMap<String, &'static str> {
+    want_icon: bool,
+) -> HashMap<String, WindowStatus> {
     let mut statuses: HashMap<&str, Vec<AgentStatus>> = HashMap::new();
     for pane in panes {
         let window = statuses.entry(&pane.window_id).or_default();
@@ -731,10 +751,55 @@ fn window_status_icons(
     statuses
         .into_iter()
         .map(|(window_id, statuses)| {
-            let status = rollup_agent_status(statuses.into_iter());
-            (window_id.to_owned(), tmux_window_status_icon(status))
+            let rollup = rollup_agent_status(statuses.iter().copied());
+            let status = WindowStatus {
+                icon: if want_icon {
+                    tmux_window_status_icon(rollup).to_owned()
+                } else {
+                    String::new()
+                },
+                agents: agent_dots(&statuses),
+                cli: agent_names(&statuses),
+            };
+            (window_id.to_owned(), status)
         })
         .collect()
+}
+
+/// One dot per agent, space separated, in the order the panes came back.
+///
+/// Not the rollup the tab icon uses: a window running two agents is exactly the
+/// case a single glyph cannot describe, and the status line has the room to say
+/// "one of these is working and the other wants you".
+fn agent_dots(statuses: &[AgentStatus]) -> String {
+    statuses
+        .iter()
+        .filter(|status| status.agent.is_some())
+        .map(|status| match status.state {
+            AgentState::Blocked => "#[fg=red,bold]◉#[default]",
+            AgentState::Working => "#[fg=yellow,bold]●#[default]",
+            AgentState::Idle if !status.seen => "#[fg=cyan,bold]●#[default]",
+            AgentState::Idle => "#[fg=green]✓#[default]",
+            AgentState::Unknown => "#[fg=colour8]○#[default]",
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The distinct agents in the window, in first-seen order — two `claude` clones
+/// in one window are still one name.
+fn agent_names(statuses: &[AgentStatus]) -> String {
+    let mut names: Vec<&str> = Vec::new();
+    for status in statuses {
+        let Some(agent) = status.agent else {
+            continue;
+        };
+        let name = format_agent_kind(Some(agent));
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names.join(" ")
 }
 
 fn tmux_window_status_icon(status: AgentStatus) -> &'static str {
@@ -751,47 +816,70 @@ fn tmux_window_status_icon(status: AgentStatus) -> &'static str {
     }
 }
 
-fn write_window_status_icons(
+/// What the status line and the window tabs can read about one window.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct WindowStatus {
+    /// The window's rollup, for `window-status-format`. Empty when the tab
+    /// indicators are off — the one field that is a display preference rather
+    /// than a fact.
+    pub(crate) icon: String,
+    /// One dot per agent, in pane order.
+    pub(crate) agents: String,
+    /// The agents by name, deduplicated: `claude`, or `claude codex`.
+    pub(crate) cli: String,
+}
+
+/// Reads back the three options from the `list-windows` output that already
+/// listed the windows. Missing columns parse as empty, which is also what an
+/// unset option gives, so an older format string degrades to "everything
+/// differs" rather than to an error.
+pub(crate) fn parse_window_status(output: &str) -> HashMap<String, WindowStatus> {
+    output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split('\t').collect();
+            let window_id = (*fields.first()?).to_owned();
+            let field = |index: usize| fields.get(index).copied().unwrap_or_default().to_owned();
+            Some((
+                window_id,
+                WindowStatus {
+                    icon: field(5),
+                    agents: field(6),
+                    cli: field(7),
+                },
+            ))
+        })
+        .collect()
+}
+
+fn write_window_status(
     panes: &[TmuxPane],
     folded: &HashMap<&str, Vec<&TmuxPane>>,
+    current: &HashMap<String, WindowStatus>,
 ) -> Result<()> {
-    let desired = window_status_icons(panes, folded);
-    let current = tmux_output(&[
-        "list-windows",
-        "-a",
-        "-F",
-        "#{window_id}\t#{@tmux_agent_dock_window_icon}",
-    ])?;
+    let desired = window_statuses(panes, folded, window_icons_wanted());
 
-    for line in current.lines() {
-        let Some((window_id, current_icon)) = line.split_once('\t') else {
-            continue;
-        };
-        let desired_icon = desired.get(window_id).copied().unwrap_or_default();
-        if desired_icon == current_icon {
+    for (window_id, current_status) in current {
+        let desired_status = desired.get(window_id).cloned().unwrap_or_default();
+        if &desired_status == current_status {
             continue;
         }
 
-        if desired_icon.is_empty() {
-            tmux_status(Command::new("tmux").args([
-                "set-option",
-                "-w",
-                "-u",
-                "-q",
-                "-t",
-                window_id,
-                STATUS_WINDOW_ICON_OPTION,
-            ]))?;
-        } else {
-            tmux_status(Command::new("tmux").args([
-                "set-option",
-                "-w",
-                "-q",
-                "-t",
-                window_id,
-                STATUS_WINDOW_ICON_OPTION,
-                desired_icon,
-            ]))?;
+        for (option, value) in [
+            (STATUS_WINDOW_ICON_OPTION, &desired_status.icon),
+            (STATUS_WINDOW_AGENTS_OPTION, &desired_status.agents),
+            (STATUS_WINDOW_CLI_OPTION, &desired_status.cli),
+        ] {
+            let mut args = vec!["set-option", "-w"];
+            if value.is_empty() {
+                args.push("-u");
+            }
+            args.extend(["-q", "-t", window_id, option]);
+            if !value.is_empty() {
+                args.push(value);
+            }
+            tmux_status(Command::new("tmux").args(&args))?;
         }
     }
     Ok(())
@@ -912,9 +1000,83 @@ mod tests {
         )
         .unwrap();
 
-        let icons = window_status_icons(&panes, &HashMap::new());
-        assert_eq!(icons.get("@1"), Some(&" #[fg=red,bold]◉#[default]"));
-        assert_eq!(icons.get("@2"), Some(&""));
+        let windows = window_statuses(&panes, &HashMap::new(), true);
+        assert_eq!(
+            windows.get("@1").map(|window| window.icon.as_str()),
+            Some(" #[fg=red,bold]◉#[default]")
+        );
+        assert_eq!(windows.get("@2").map(|window| window.icon.as_str()), Some(""));
+
+        // The status-line fields describe the same window without rolling it
+        // up: two agents, two dots, both names.
+        let one = windows.get("@1").unwrap();
+        assert_eq!(
+            one.agents,
+            "#[fg=yellow,bold]●#[default] #[fg=red,bold]◉#[default]"
+        );
+        assert_eq!(one.cli, "codex claude");
+        // A window with no agent says nothing at all, rather than saying zero.
+        let two = windows.get("@2").unwrap();
+        assert!(two.agents.is_empty() && two.cli.is_empty());
+    }
+
+    /// The icon is a display preference; the dots and the names are facts. Only
+    /// the first is silenced when the tab indicators are off, or a status line
+    /// reading the other two would freeze the moment tabs were switched off.
+    #[test]
+    fn tab_indicators_off_silences_the_icon_and_nothing_else() {
+        let panes = parse_panes("%1\t@1\t1\tclaude\t/tmp\tone\t101\tclaude\tworking\t1\t1000\n")
+            .unwrap();
+
+        let windows = window_statuses(&panes, &HashMap::new(), false);
+        let window = windows.get("@1").unwrap();
+
+        assert_eq!(window.icon, "");
+        assert_eq!(window.agents, "#[fg=yellow,bold]●#[default]");
+        assert_eq!(window.cli, "claude");
+    }
+
+    /// Two clones of one agent are one name — `claude claude` reads as two
+    /// tools rather than two sessions of the same one.
+    #[test]
+    fn repeated_agents_are_named_once_but_dotted_each() {
+        let panes = parse_panes(
+            "%1\t@1\t1\tclaude\t/tmp\tone\t101\tclaude\tworking\t1\t1000\n\
+             %2\t@1\t0\tclaude\t/tmp\ttwo\t102\tclaude\tidle\t0\t1000\n",
+        )
+        .unwrap();
+
+        let window = window_statuses(&panes, &HashMap::new(), false)
+            .remove("@1")
+            .unwrap();
+
+        assert_eq!(window.cli, "claude");
+        assert_eq!(
+            window.agents,
+            "#[fg=yellow,bold]●#[default] #[fg=cyan,bold]●#[default]",
+            "one dot each, and the unread one keeps its own colour"
+        );
+    }
+
+    /// The columns are read back from the same `list-windows` that lists the
+    /// windows, so a row from an older format string must degrade to "unset"
+    /// rather than to a parse error.
+    #[test]
+    fn window_status_columns_parse_and_tolerate_short_rows() {
+        let parsed = parse_window_status(
+            "@1\tsession\t1\tname\tflags\ticon\tdots\tclaude\n\
+             @2\tsession\t2\tname\tflags\n",
+        );
+
+        assert_eq!(
+            parsed.get("@1"),
+            Some(&WindowStatus {
+                icon: "icon".to_owned(),
+                agents: "dots".to_owned(),
+                cli: "claude".to_owned(),
+            })
+        );
+        assert_eq!(parsed.get("@2"), Some(&WindowStatus::default()));
     }
 
     #[test]
@@ -928,8 +1090,13 @@ mod tests {
         // and @9, which nobody can see, keeps reporting for itself.
         let folded = HashMap::from([("%6", vec![&panes[1]])]);
 
-        let icons = window_status_icons(&panes, &folded);
-        assert_eq!(icons.get("@1"), Some(&" #[fg=yellow,bold]⠋#[default]"));
+        let windows = window_statuses(&panes, &folded, true);
+        assert_eq!(
+            windows.get("@1").map(|window| window.icon.as_str()),
+            Some(" #[fg=yellow,bold]⠋#[default]")
+        );
+        // The host window names the agent it is carrying, not its own `nvim`.
+        assert_eq!(windows.get("@1").map(|window| window.cli.as_str()), Some("claude"));
     }
 
     #[test]

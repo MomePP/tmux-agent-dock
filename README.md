@@ -130,6 +130,31 @@ Set `@agent_dock_nav 'off'` if you already bind
 to leave tmux's window status formats untouched — which also stops the daemon
 writing the per-window icons nothing would render.
 
+### Agent status in the status line
+
+The daemon keeps two window options describing the agents in each window, which
+the status line can interpolate directly — no `#()` shell-out, no second
+process:
+
+| Option | Contents |
+| --- | --- |
+| `@tmux_agent_dock_window_agents` | one coloured dot per agent, in pane order |
+| `@tmux_agent_dock_window_cli` | the agents by name, deduplicated (`claude codex`) |
+
+```tmux
+set -g status-left-length 80
+set -g status-left ' working on #[bold]#S#[default] #{@tmux_agent_dock_window_agents} #{@tmux_agent_dock_window_cli}'
+```
+
+Both describe the *current* window, which is what a status line is for; press the
+switcher for everything else. They are written whatever `@agent_dock_tab_status`
+is set to — that option silences the tab icon, which is a display preference,
+and not these, which are facts.
+
+Agents running in an embedded session are attributed to the window hosting
+them, so a sidekick.nvim agent shows on its Neovim's window rather than on a
+session you cannot see.
+
 ### Borrowing the daemon's heartbeat
 
 **tmux has no timer.** Anything periodic has to hang off something tmux redraws,
