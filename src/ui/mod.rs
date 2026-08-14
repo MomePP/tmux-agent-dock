@@ -16,6 +16,7 @@ use std::{
 
 use anyhow::Result;
 use crossterm::{
+    cursor::Hide,
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
         MouseButton, MouseEvent, MouseEventKind,
@@ -88,7 +89,12 @@ pub fn run_tui(cards: Vec<WindowCard>) -> Result<Option<SwitcherAction>> {
     enable_raw_mode()?;
     // Capture the mouse so wheel scrolls drive the list instead of tmux
     // scrolling (and redrawing) whatever sits behind the popup.
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    //
+    // `Hide` goes in the same write as the switch. Entering the alternate screen
+    // clears it and homes the cursor, and until the first frame lands that
+    // cursor is the only thing on an empty screen — the visible half of the
+    // "it blinks when I press the key" report.
+    execute!(stdout, EnterAlternateScreen, Hide, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let result = run_tui_loop(&mut terminal, cards, current_window_id.as_deref(), Surface::Popup);
@@ -111,7 +117,7 @@ pub fn run_dock(cards: Vec<WindowCard>) -> Result<()> {
 
     let mut stdout = io::stdout();
     enable_raw_mode()?;
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen, Hide, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let result = run_tui_loop(
@@ -1392,6 +1398,16 @@ fn run_tui_loop(
     let mut last_card_refresh = Instant::now();
     let mut last_full_redraw = Instant::now();
     let mut preview = PreviewMirror::default();
+    // The first pass draws before it captures anything.
+    //
+    // Entering the alternate screen clears the terminal, and the popup's first
+    // preview is a full-screen `capture-pane` — so the old order put a tmux
+    // round trip between the clear and the first frame, and the screen sat empty
+    // for it. The list is already in hand by then and needs nothing from tmux,
+    // so it can be on screen immediately; the preview fills in one tick later
+    // (`TUI_TICK_INTERVAL`), which reads as the box filling rather than the
+    // screen blanking.
+    let mut first_pass = true;
 
     loop {
         let now = Instant::now();
@@ -1420,7 +1436,7 @@ fn run_tui_loop(
         // would render, stalling the draw loop mid-navigation. The area it
         // measured came from `switcher_layout` — the *popup's* geometry — so the
         // dock was sizing captures to a rect it does not even have.
-        if surface == Surface::Popup {
+        if surface == Surface::Popup && !first_pass {
             let preview_area = switcher_layout(
                 terminal.size()?,
                 ui.show_help,
@@ -1437,6 +1453,12 @@ fn run_tui_loop(
         let spinner_frame = spinner_started_at.elapsed().as_millis() as usize / 120;
         keep_sections_visible(&mut ui, terminal.size()?);
         render(terminal, &ui, &preview, spinner_frame)?;
+
+        // Only now, with a frame on screen, is the preview worth waiting for.
+        if first_pass {
+            first_pass = false;
+            continue;
+        }
 
         if !event::poll(TUI_TICK_INTERVAL)? {
             continue;
