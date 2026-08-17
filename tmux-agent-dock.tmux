@@ -118,8 +118,37 @@ fi
 #
 # Falls back to the launcher when nothing is built yet, so a fresh install still
 # works; the next config reload picks the binary up.
-FOLLOWER="$CURRENT_DIR/target/release/tmux-agent-dock"
+BINARY="$CURRENT_DIR/target/release/tmux-agent-dock"
+FOLLOWER="$BINARY"
 [[ -x "$FOLLOWER" ]] || FOLLOWER="$LAUNCHER"
+
+# --- status daemon --------------------------------------------------------
+# The daemon writes the per-window options the status line and tab icons read,
+# and lends its tick to whatever borrows the heartbeat. Nothing else starts it:
+# `ensure_status_daemon` is called from `load_cards`, which only runs when the
+# dock or the popup opens. So on a fresh server the agent section of the status
+# line stays blank — and continuum stops saving — until you happen to open the
+# sidebar once. Start it here, where the server already is.
+#
+# Guarded rather than fired blind: `run_status_daemon` claims the pid option
+# unconditionally, so an unguarded spawn on every config reload would hand the
+# job from a healthy daemon to a new one for no gain. The pid is matched against
+# `ps` rather than merely signalled, because a daemon that was killed leaves the
+# option behind — it only clears it on a clean exit — so "pid set, process gone"
+# is the ordinary recovery path, not an edge case.
+#
+# Only ever the built binary: $FOLLOWER falls back to the launcher, which builds
+# before it execs, and a config reload is not the moment to start a compile.
+status_daemon_alive() {
+  local pid="$1"
+  [[ -n "$pid" ]] || return 1
+  ps -o command= -p "$pid" 2>/dev/null | grep -q -- ' status-daemon'
+}
+
+if [[ -x "$BINARY" ]] &&
+  ! status_daemon_alive "$(tmux show-option -gqv @tmux_agent_dock_status_daemon_pid)"; then
+  tmux run-shell -b "$(printf '%q' "$BINARY") status-daemon"
+fi
 
 # Hooks are arrays. Writing at a reserved index is idempotent across the config
 # reloads that re-run this file, and leaves any other plugin's entry at another
