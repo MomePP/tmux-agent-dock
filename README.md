@@ -185,6 +185,44 @@ started and not waited for, so a slow one cannot stall status polling — and
 nothing throttles it beyond the interval, so a command that must not run too
 often should keep its own timestamp, as continuum's save script already does.
 
+### Reading the embedded-session map
+
+Working out which tmux sessions are editor-embedded is harder than it looks, and
+the dock has already done it. It publishes the answer in a global tmux option,
+one `session<TAB>host-pane` per line:
+
+```sh
+$ tmux show-option -gqv @tmux_agent_dock_embedded
+claude_1 5c5b07e2	%11
+claude_1 b9f9f91c	%4
+```
+
+This is a **read-only, supported interface** — the name and the format will not
+change without a note here. The dock resolves it by tracing each client's pid
+through the process tree, not by pattern-matching session names, and it keeps an
+entry while the session exists, its host pane exists, and that pane belongs to
+some other session. So an agent whose float is currently *shut* is still listed,
+which is usually the state a tool wants to ask about.
+
+The use that motivated publishing it: **teaching tmux-resurrect not to restore
+them.** Embedded sessions are owned by an editor float that is long gone by the
+next boot, so they come back as empty shells and clutter the session list.
+Filtering resurrect's save file on this option is exact, where matching on the
+session-name shape means re-deriving the editor plugin's private naming
+arithmetic and breaking silently when it changes:
+
+```sh
+embedded="$(tmux show-option -gqv @tmux_agent_dock_embedded 2>/dev/null | cut -f1 || true)"
+```
+
+Two things that bite. Pass the value to `awk` through the environment, not `-v`:
+it is one record per line, and `-v` runs the assignment through escape
+processing, where an embedded newline is an error rather than a newline. And
+keep the `|| true` — under `set -e` a failed query aborts the script before it
+filters anything, and a hook whose exit status the caller discards fails
+silently. Treat an empty result as "no information" and fall back; a fresh
+server that has not opened an agent yet has nothing to say.
+
 ## How it works
 
 The plugin observes; it never intercepts. Agent state comes from:

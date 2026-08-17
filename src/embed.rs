@@ -39,6 +39,12 @@ const MAX_ANCESTRY_HOPS: usize = 64;
 /// — and which therefore has no client left to trace — stays folded. One
 /// `session\tpane` per line; session names are already assumed tab-free by
 /// [`parse_clients`].
+///
+/// PUBLISHED INTERFACE — outside tooling reads this (README, "Reading the
+/// embedded-session map"); tmux-resurrect filters embedded sessions out of its
+/// save file on it. Renaming the option or changing the line format breaks such
+/// readers *silently*, because their natural fallback is the session-name
+/// guessing this exists to replace. Change it here and in the README together.
 const EMBEDDED_HOSTS_OPTION: &str = "@tmux_agent_dock_embedded";
 
 /// Maps each embedded session's name to the `pane_id` it is running inside.
