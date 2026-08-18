@@ -23,7 +23,7 @@ use crate::{
     },
     tmux::{
         parse_panes, parse_windows, set_pane_option, shell_quote, tmux_output, tmux_status,
-        unix_timestamp,
+        unix_timestamp, NOT_FLOATING,
     },
 };
 
@@ -337,6 +337,8 @@ pub fn poll_agent_status_once(debounce: &mut HashMap<String, Debounce>) -> Resul
         "-a",
         "-F",
         "#{pane_id}\t#{window_id}\t#{pane_active}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_title}\t#{pane_pid}\t#{@tmux_agent_dock_agent}\t#{@tmux_agent_dock_state}\t#{@tmux_agent_dock_seen}\t#{@tmux_agent_dock_run_started_at}",
+        "-f",
+        NOT_FLOATING,
     ])?)?;
 
     let now = unix_timestamp();

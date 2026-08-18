@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-use crate::tmux::{tmux_output, tmux_status};
+use crate::tmux::{tmux_output, tmux_status, NOT_FLOATING};
 
 pub(crate) const DOCK_PANE_OPTION: &str = "@tmux_agent_dock_pane";
 pub(crate) const DOCK_MOVING_OPTION: &str = "@tmux_agent_dock_moving";
@@ -742,6 +742,8 @@ pub(crate) fn observe() -> DockContext {
         &dock,
         "-F",
         "#{pane_id}\t#{pane_active}\t#{pane_current_path}\t#{window_id}",
+        "-f",
+        NOT_FLOATING,
     ]) else {
         return context;
     };

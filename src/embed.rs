@@ -29,7 +29,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::daemon::ProcessTree;
 use crate::model::{TmuxPane, TmuxWindow};
-use crate::tmux::{parse_panes, parse_windows, tmux_output};
+use crate::tmux::{parse_panes, parse_windows, tmux_output, NOT_FLOATING};
 
 /// Depth cap for the ancestry walk. A client sits a handful of processes below
 /// its pane; anything deeper is a cycle in a malformed `ps` snapshot.
@@ -236,6 +236,8 @@ fn resolve_embedded_now() -> Option<HashMap<String, String>> {
             "-a",
             "-F",
             "#{pane_id}\t#{window_id}\t#{pane_active}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_title}\t#{pane_pid}",
+            "-f",
+            NOT_FLOATING,
         ])
         .ok()?,
     )

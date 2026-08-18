@@ -15,7 +15,7 @@ use ratatui::{
 
 use crate::{
     model::WindowCard,
-    tmux::{split_tmux_fields, tmux_output},
+    tmux::{split_tmux_fields, tmux_output, NOT_FLOATING},
     ACCENT,
 };
 
@@ -115,6 +115,8 @@ fn capture_window_preview_text(window_id: &str, area: Rect) -> Result<Text<'stat
         window_id,
         "-F",
         "#{pane_id}\t#{pane_index}\t#{pane_active}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{pane_title}\t#{pane_current_command}",
+        "-f",
+        NOT_FLOATING,
     ])?)?;
 
     if panes.is_empty() {

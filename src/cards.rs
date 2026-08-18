@@ -19,7 +19,7 @@ use crate::{
         AgentKind, AgentState, AgentStatus, FoldedAgent, SessionGroup, TmuxPane, TmuxWindow,
         WindowCard,
     },
-    tmux::{parse_panes, parse_windows, tmux_output, tmux_status},
+    tmux::{parse_panes, parse_windows, tmux_output, tmux_status, NOT_FLOATING},
 };
 
 const SESSION_ORDER_OPTION: &str = "@tmux_agent_dock_order";
@@ -264,6 +264,8 @@ pub fn load_cards() -> Result<Vec<WindowCard>> {
         "-a",
         "-F",
         "#{pane_id}\t#{window_id}\t#{pane_active}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_title}\t#{pane_pid}\t#{@tmux_agent_dock_agent}\t#{@tmux_agent_dock_state}\t#{@tmux_agent_dock_seen}\t#{@tmux_agent_dock_run_started_at}\t#{@codex_status_state}\t#{@codex_status_unread}",
+        "-f",
+        NOT_FLOATING,
     ])?)?;
     // Read the map rather than work it out. Resolving embedded sessions needs a
     // `ps -A` snapshot, which costs ~38ms, and the status daemon already takes

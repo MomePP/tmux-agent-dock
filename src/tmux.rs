@@ -306,6 +306,22 @@ pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+/// `list-panes -f` filter that drops floating panes (tmux >= 3.7's `new-pane`,
+/// bound to `*` by default).
+///
+/// The dock has nowhere to put them: tmux lists them alongside tiled panes, so a
+/// floater would claim a card row of its own and then land on top of its
+/// neighbours in the window preview, whose map is built from `pane_left` and
+/// `pane_top`. The cost of excluding them is that an agent running in a floating
+/// pane is invisible to the dock and to the status line.
+///
+/// Written as `!=,1` rather than `==,0` on purpose. `pane_floating_flag` does
+/// not exist before 3.7, an unknown variable expands to the empty string, and
+/// empty `!=` 1 is true, so every pane is kept. `==` 0 would compare empty
+/// against 0, fail, and filter the pane list down to nothing on every older
+/// tmux the dock still supports.
+pub(crate) const NOT_FLOATING: &str = "#{!=:#{pane_floating_flag},1}";
+
 pub(crate) fn tmux_output(args: &[&str]) -> Result<String> {
     let output = Command::new("tmux")
         .args(args)
