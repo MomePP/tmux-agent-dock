@@ -127,6 +127,11 @@ fn detect_claude_state(evidence: &AgentEvidence) -> AgentState {
         return AgentState::Working;
     }
 
+    // Working: Claude's live run status line is on screen above the input box.
+    if has_run_status(&recent) {
+        return AgentState::Working;
+    }
+
     // Otherwise Claude is idle at its input prompt (title starts with ✳). The `❯`
     // input box is present while working too, so it is not an idle signal on its own.
     AgentState::Idle
@@ -222,6 +227,68 @@ fn strip_border(line: &str) -> &str {
     line.trim_start_matches(|ch: char| {
         ch.is_whitespace() || matches!(ch, '│' | '┃' | '║' | '╎' | '┆' | '┊' | '|')
     })
+}
+
+/// How far above the input box the run status line can sit. Claude keeps it
+/// adjacent, but a tip line, a blank and any messages queued during the run are
+/// drawn in between.
+const RUN_STATUS_LOOKBACK: usize = 8;
+
+/// True when Claude's live run status line — `✻ Beboppin'… (6m 10s · ↓ 9.7k tokens)`
+/// — is on screen just above the input box.
+///
+/// This is the only remaining signal that Claude is busy: as of 2.1.236 the OSC
+/// title is a static `✳ <topic>` in every state, identical whether the pane is
+/// mid-run or settled, so [`starts_with_spinner_status`] never fires for Claude.
+///
+/// Neither half of the line is matched on its own. The leading glyph is the
+/// spinner frame, and that has now changed three times (braille, quarter
+/// circles, and now the asterisks `· ✢ ✳ ✻ ✽`); the elapsed time is not
+/// exclusive to a live run either, because the summary Claude leaves behind
+/// keeps both the glyph and the time (`✻ Cooked for 2m 49s`). What separates
+/// them is the parentheses — a running timer is bracketed, a finished one is
+/// prose — plus the margin: the live line starts at column 0, while a status
+/// line quoted back inside a transcript is indented under its tool result.
+fn has_run_status(text: &str) -> bool {
+    let lines: Vec<&str> = text.lines().collect();
+    let Some(input_box) = lines.iter().rposition(|line| line.starts_with('❯')) else {
+        return false;
+    };
+    let from = input_box.saturating_sub(RUN_STATUS_LOOKBACK);
+    lines[from..input_box]
+        .iter()
+        .any(|line| !line.starts_with(' ') && has_bracketed_elapsed(line))
+}
+
+/// True when the line brackets an elapsed time: `(31s · …)`, `(2m 34s · …)`,
+/// `(1h 4m …)`. The units are the stable part — `(1M context)` and any other
+/// parenthetical that does not open with a digit-and-unit pair is not a timer.
+fn has_bracketed_elapsed(line: &str) -> bool {
+    line.match_indices('(')
+        .any(|(at, _)| opens_with_elapsed(&line[at + 1..]))
+}
+
+fn opens_with_elapsed(text: &str) -> bool {
+    let mut rest = text;
+    let mut units = 0;
+    loop {
+        let digits = rest.chars().take_while(char::is_ascii_digit).count();
+        if digits == 0 {
+            break;
+        }
+        let mut after = rest[digits..].chars();
+        if !matches!(after.next(), Some('h' | 'm' | 's')) {
+            break;
+        }
+        units += 1;
+        rest = after.as_str();
+        // `2m 34s` continues; `31s · …` and `2m 49s)` do not.
+        match rest.strip_prefix(' ') {
+            Some(next) if next.starts_with(|ch: char| ch.is_ascii_digit()) => rest = next,
+            _ => break,
+        }
+    }
+    units > 0 && matches!(rest.chars().next(), Some(' ' | ')'))
 }
 
 fn recent_screen(text: &str, lines: usize) -> String {
@@ -559,5 +626,85 @@ mod tests {
         assert!(!has_selection_prompt("❯ 1. fix the parser and then rebase"));
         // A plain numbered list in output (no cursor) is not a menu.
         assert!(!has_selection_prompt("1. first\n2. second"));
+    }
+
+    #[test]
+    fn claude_run_status_line_is_working_under_a_static_title() {
+        // Real capture, Claude Code 2.1.236: the title no longer animates, so the
+        // run status line above the input box is the only thing that says "busy".
+        let evidence = AgentEvidence {
+            screen_tail: [
+                "✢ Beboppin'… (6m 10s · ↓ 9.7k tokens)",
+                "  ⎿  Tip: Use /btw to ask a quick side question without interrupting Claude's current work",
+                "",
+                "────────────────",
+                "❯ ",
+                "────────────────",
+                "   Opus 5 (1M context) on  main    6m   ∿ thinking",
+                "  -- INSERT -- ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent",
+            ]
+            .join("\n"),
+            osc_title: "✳ Sidebar status and tmux statusline not updating".to_owned(),
+            osc_progress: String::new(),
+            process_exited: false,
+        };
+        assert_eq!(
+            detect_agent_state(AgentKind::Claude, &evidence),
+            AgentState::Working
+        );
+    }
+
+    #[test]
+    fn claude_finished_run_summary_is_idle() {
+        // Real capture of a settled session. The summary keeps the spinner glyph
+        // and an elapsed time, so only the parentheses separate it from a live run.
+        let evidence = AgentEvidence {
+            screen_tail: [
+                "  The 4.0.0 scope is now four branches: mic, broadcast, IR, image diagnostics.",
+                "",
+                "✻ Cooked for 2m 49s",
+                "",
+                "※ recap: We're planning the 4.0.0 release; I've been updating the status artifact.",
+                "",
+                "────────────────",
+                "❯ ",
+                "────────────────",
+                "   Opus 5 (1M context) on  feature/ir-sony-protocol* with +77 -9 changes    159h 10m",
+            ]
+            .join("\n"),
+            osc_title: "✳ Review ongoing works".to_owned(),
+            osc_progress: String::new(),
+            process_exited: false,
+        };
+        assert_eq!(
+            detect_agent_state(AgentKind::Claude, &evidence),
+            AgentState::Idle
+        );
+    }
+
+    #[test]
+    fn run_status_needs_a_parenthesised_timer_at_the_margin() {
+        // Live run: status line at the margin, elapsed time in parentheses.
+        assert!(has_run_status(
+            "✻ Hullaballooing… (31s · ↓ 1.5k tokens · thinking with high effort)\n────\n❯ "
+        ));
+        // Finished: same glyph, same elapsed time, no parentheses.
+        assert!(!has_run_status(
+            "✻ Worked for 2m 59s · 1 shell still running\n────\n❯ done webapp"
+        ));
+        // A queued message can sit between the run line and the box; still Working.
+        assert!(has_run_status(
+            "· Spelunking… (16s · ↓ 872 tokens)\n\n  ❯ and use pinia for it\n\n────\n❯ Press up to edit queued messages"
+        ));
+        // The status line's own "(1M context)" is not a timer, and sits below the box.
+        assert!(!has_run_status(
+            "❯ \n────\n   Opus 5 (1M context) on  main    6m"
+        ));
+        // Quoted into a transcript, indented under a tool result: not the live line.
+        assert!(!has_run_status(
+            "  ⎿  ✻ Beboppin'… (6m 10s · ↓ 9.7k tokens)\n────\n❯ "
+        ));
+        // Nothing to anchor on.
+        assert!(!has_run_status("✻ Beboppin'… (6m 10s)"));
     }
 }
