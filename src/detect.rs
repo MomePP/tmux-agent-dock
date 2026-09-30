@@ -9,6 +9,8 @@ pub fn detect_agent_from_process_name(name: &str) -> Option<AgentKind> {
         Some(AgentKind::Codex)
     } else if is_agent_binary(basename, "opencode") {
         Some(AgentKind::OpenCode)
+    } else if is_agent_binary(basename, "omp") {
+        Some(AgentKind::Omp)
     } else if is_agent_binary(basename, "claude") || is_claude_version_name(basename) {
         Some(AgentKind::Claude)
     } else {
@@ -54,6 +56,7 @@ pub fn detect_agent_state(agent: AgentKind, evidence: &AgentEvidence) -> AgentSt
         AgentKind::Codex => detect_codex_state(evidence),
         AgentKind::Claude => detect_claude_state(evidence),
         AgentKind::OpenCode => detect_opencode_state(evidence),
+        AgentKind::Omp => detect_omp_state(evidence),
     }
 }
 
@@ -68,6 +71,7 @@ pub(crate) fn detect_agent_state_from_title(agent: AgentKind, title: &str) -> Op
         // and does not encode activity, so always fall through to screen-tail
         // detection for it.
         AgentKind::OpenCode => None,
+        AgentKind::Omp => omp_title_state(title),
         _ => None,
     }
 }
@@ -184,6 +188,41 @@ fn detect_opencode_state(evidence: &AgentEvidence) -> AgentState {
         (_, Some(_)) => AgentState::Working,
         _ => AgentState::Idle,
     }
+}
+
+/// OMP owns its terminal title and writes its state into it on every change:
+/// `π <marker> <session label>` (or `π <marker>` before the session has a
+/// label). The marker is `>` when idle, `!` when a tool is waiting on the user
+/// (an `ask` question or an approval prompt), and otherwise the current frame of
+/// the working spinner -- or a static `:` where OMP cannot animate the title.
+///
+/// With the title status turned off OMP writes `π: <label>` instead, which
+/// says nothing about activity. There is no screen-side signal as stable as the
+/// title, so that configuration reads as Idle rather than guessing.
+fn detect_omp_state(evidence: &AgentEvidence) -> AgentState {
+    omp_title_state(evidence.osc_title.trim()).unwrap_or(AgentState::Idle)
+}
+
+fn omp_title_state(title: &str) -> Option<AgentState> {
+    let rest = title.strip_prefix("π ")?;
+    let mut chars = rest.chars();
+    let marker = chars.next()?;
+    if !matches!(chars.next(), None | Some(' ')) {
+        return None;
+    }
+    match marker {
+        '>' => Some(AgentState::Idle),
+        '!' => Some(AgentState::Blocked),
+        ':' => Some(AgentState::Working),
+        ch if is_omp_spinner_frame(ch) => Some(AgentState::Working),
+        _ => None,
+    }
+}
+
+/// Every frame of OMP's selectable title spinners: `braille` and `dots` are
+/// braille cells, `pulse` cycles `○ ◔ ◑ ◕ ●`, and `line` cycles `- \ | /`.
+fn is_omp_spinner_frame(ch: char) -> bool {
+    is_spinner_frame(ch) || matches!(ch, '○' | '◔' | '◑' | '◕' | '●' | '-' | '\\' | '|' | '/')
 }
 
 /// True when the screen shows a Claude selection menu: the cursor (`❯`) rests on
@@ -368,6 +407,12 @@ mod tests {
             detect_agent_from_process_name("opencode_2"),
             Some(AgentKind::OpenCode)
         );
+        assert_eq!(
+            detect_agent_from_process_name("/opt/homebrew/bin/omp"),
+            Some(AgentKind::Omp)
+        );
+        assert_eq!(detect_agent_from_process_name("omp_1"), Some(AgentKind::Omp));
+        assert_eq!(detect_agent_from_process_name("ompa"), None);
         // Non-semver commands must not be mistaken for Claude.
         assert_eq!(detect_agent_from_process_name("zsh"), None);
         // A prefix match without a separator is a different program.
@@ -435,6 +480,30 @@ mod tests {
             detect_agent_state_from_title(AgentKind::OpenCode, "OC | working or idle"),
             None
         );
+        assert_eq!(
+            detect_agent_state_from_title(AgentKind::Omp, "π > dotfiles"),
+            Some(AgentState::Idle)
+        );
+        assert_eq!(
+            detect_agent_state_from_title(AgentKind::Omp, "π ! dotfiles"),
+            Some(AgentState::Blocked)
+        );
+        assert_eq!(
+            detect_agent_state_from_title(AgentKind::Omp, "π ⠏ Tmux save session keys"),
+            Some(AgentState::Working)
+        );
+        assert_eq!(
+            detect_agent_state_from_title(AgentKind::Omp, "π ◕ dotfiles"),
+            Some(AgentState::Working)
+        );
+        assert_eq!(
+            detect_agent_state_from_title(AgentKind::Omp, "π |"),
+            Some(AgentState::Working)
+        );
+        // Title status off: the label alone says nothing about activity.
+        assert_eq!(detect_agent_state_from_title(AgentKind::Omp, "π: dotfiles"), None);
+        // A label that merely starts with a marker-like word is not a marker.
+        assert_eq!(detect_agent_state_from_title(AgentKind::Omp, "π -dotfiles"), None);
     }
 
     /// Captured off a live Claude Code pane mid-run: the title spinner is no

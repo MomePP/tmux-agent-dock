@@ -247,6 +247,7 @@ pub(crate) fn compact_tab_process_text(card: &WindowCard) -> String {
         Some(AgentKind::Codex) => "codex".to_owned(),
         Some(AgentKind::Claude) => "claude".to_owned(),
         Some(AgentKind::OpenCode) => "opencode".to_owned(),
+        Some(AgentKind::Omp) => "omp".to_owned(),
         None => card.command.clone(),
     }
 }

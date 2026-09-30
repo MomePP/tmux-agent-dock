@@ -23,7 +23,7 @@ work, or as a full-screen popup.
   full screen and a live preview of the highlighted window.
 - **Two sections.** *Sessions* is a collapsible tree of every session and its
   windows; *Agents* lists each running agent with what it is doing.
-- **Agent monitoring**: every pane running Claude Code, Codex, or OpenCode is
+- **Agent monitoring**: every pane running Claude Code, Codex, OpenCode, or OMP is
   tagged Working / Blocked / Idle with a run timer. An agent that finishes
   **out of sight** raises an unread dot; one you watched finish does not.
 - **Agents inside editor floats are folded into their host.**
@@ -244,7 +244,7 @@ list, so the destination is drawn with the sidebar already in it.
 
 > [!WARNING]
 > Because detection reads the agents' on-screen output, it is **heuristic and
-> version-sensitive**: a Claude/Codex/OpenCode UI change, a custom theme, or a
+> version-sensitive**: a Claude/Codex/OpenCode/OMP UI change, a custom theme, or a
 > non-English locale can throw off state classification. It is best-effort and
 > expected to need occasional upkeep as the agent CLIs evolve.
 
